@@ -14,7 +14,23 @@
 #  limitations under the License.
 #
 
+import os
+import unicodedata
+
 import infinity.rag_tokenizer
+
+# Opt-in diacritics folding (see docs/slovak_support_spec.md). The upstream
+# SPLIT_CHAR regex only captures ASCII letter runs, so accented words are
+# fragmented before indexing ('škola' -> 'š kola'); folding keeps words
+# whole and makes index/query tokens identical regardless of accents.
+_FOLD_DIACRITICS = os.environ.get("RAG_TOKENIZER_FOLD_DIACRITICS", "").lower() in ("1", "true", "yes")
+
+
+def _fold_diacritics(text: str) -> str:
+    if not _FOLD_DIACRITICS or not text or text.isascii():
+        return text
+    return "".join(c for c in unicodedata.normalize("NFD", text) if not unicodedata.combining(c))
+
 
 
 class RagTokenizer(infinity.rag_tokenizer.RagTokenizer):
@@ -24,7 +40,7 @@ class RagTokenizer(infinity.rag_tokenizer.RagTokenizer):
         if settings.DOC_ENGINE_INFINITY:
             return line
         else:
-            return super().tokenize(line)
+            return super().tokenize(_fold_diacritics(line))
 
     def fine_grained_tokenize(self, tks: str) -> str:
         from common import settings  # moved from the top of the file to avoid circular import
