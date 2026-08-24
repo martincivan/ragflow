@@ -1,0 +1,140 @@
+name: deploy-ghcr
+
+# Fork-only workflow: builds a RAGFlow image from one or more feature branches
+# and pushes it to GitHub Container Registry, without merging anything to main.
+#
+# The feature branches stay untouched and upstreamable - they are merged into a
+# throwaway commit inside the runner, never pushed back.
+#
+# Trigger by pushing to the `deploy` branch:
+#   git commit --allow-empty -m "rebuild" && git push origin deploy
+# `workflow_dispatch` is also declared, but GitHub only surfaces it once the
+# workflow file exists on the repository's default branch.
+
+on:
+  push:
+    branches:
+      - deploy
+  workflow_dispatch:
+    inputs:
+      base:
+        description: "Base ref to merge onto"
+        default: "origin/main"
+      branches:
+        description: "Space-separated branches to merge in"
+        default: "feat/slovak-czech-language-support feat/postgres-model-provider-migration"
+      tag:
+        description: "Image tag"
+        default: "deploy"
+      platform:
+        description: "Target platform"
+        default: "linux/amd64"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    env:
+      BASE_REF: ${{ inputs.base || 'origin/main' }}
+      MERGE_BRANCHES: ${{ inputs.branches || 'feat/slovak-czech-language-support feat/postgres-model-provider-migration' }}
+      IMAGE_TAG: ${{ inputs.tag || 'deploy' }}
+      PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
+
+    steps:
+      # The RAGFlow image is large (texlive + JDK + models + venv + node_modules).
+      # A stock ubuntu-24.04 runner does not have enough free disk to build it.
+      - name: Reclaim runner disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+                      /usr/local/share/boost /usr/share/swift
+          sudo docker image prune --all --force || true
+          df -h /
+
+      # fetch-depth: 0 so the merge below has common history for every branch.
+      # fetch-tags so the Dockerfile's `git describe` can stamp VERSION.
+      - name: Check out code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Merge feature branches into a throwaway build commit
+        id: merge
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          echo "Base:     ${BASE_REF}"
+          echo "Merging:  ${MERGE_BRANCHES}"
+
+          git checkout -B __build "${BASE_REF}"
+
+          for branch in ${MERGE_BRANCHES}; do
+            ref="origin/${branch}"
+            if ! git rev-parse -q --verify "${ref}" >/dev/null; then
+              echo "::error::Branch not found on origin: ${branch}"
+              exit 1
+            fi
+            echo "::group::merge ${branch} ($(git rev-parse --short "${ref}"))"
+            if ! git merge --no-ff --no-edit -m "build: merge ${branch}" "${ref}"; then
+              echo "::error::Merge conflict merging ${branch}. Resolve it on a real branch and pass that branch instead."
+              git merge --abort || true
+              exit 1
+            fi
+            echo "::endgroup::"
+          done
+
+          echo "sha=$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
+          git --no-pager log --oneline "${BASE_REF}"..HEAD
+
+      - name: Compute image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ragflow" >> "${GITHUB_OUTPUT}"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          platforms: ${{ env.PLATFORM }}
+          push: true
+          provenance: false
+          build-args: |
+            NEED_MIRROR=0
+          tags: |
+            ${{ steps.image.outputs.name }}:${{ env.IMAGE_TAG }}
+            ${{ steps.image.outputs.name }}:${{ env.IMAGE_TAG }}-${{ steps.merge.outputs.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+
+      - name: Summary
+        run: |
+          {
+            echo "### Pushed"
+            echo '```'
+            echo "${{ steps.image.outputs.name }}:${{ env.IMAGE_TAG }}"
+            echo "${{ steps.image.outputs.name }}:${{ env.IMAGE_TAG }}-${{ steps.merge.outputs.sha }}"
+            echo '```'
+            echo "Built from \`${BASE_REF}\` + \`${MERGE_BRANCHES}\`"
+          } >> "${GITHUB_STEP_SUMMARY}"
