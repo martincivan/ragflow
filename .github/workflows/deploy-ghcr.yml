@@ -22,7 +22,7 @@ on:
         default: "origin/main"
       branches:
         description: "Space-separated branches to merge in"
-        default: "feat/slovak-czech-language-support feat/postgres-model-provider-migration fix/empty-tools-array"
+        default: "feat/slovak-czech-language-support feat/postgres-model-provider-migration fix/empty-tools-array fix/agentic-search-honours-dialog-retrieval-settings"
       tag:
         description: "Image tag"
         default: "deploy"
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       BASE_REF: ${{ inputs.base || 'origin/main' }}
-      MERGE_BRANCHES: ${{ inputs.branches || 'feat/slovak-czech-language-support feat/postgres-model-provider-migration fix/empty-tools-array' }}
+      MERGE_BRANCHES: ${{ inputs.branches || 'feat/slovak-czech-language-support feat/postgres-model-provider-migration fix/empty-tools-array fix/agentic-search-honours-dialog-retrieval-settings' }}
       IMAGE_TAG: ${{ inputs.tag || 'deploy' }}
       PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
 
