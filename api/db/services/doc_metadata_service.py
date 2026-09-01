@@ -34,6 +34,13 @@ from common.metadata_utils import dedupe_list
 
 METADATA_ID_BATCH_SIZE = 10000
 
+# ES rejects a search that would build more than search.max_buckets buckets
+# (65,536 by default). One terms aggregation per metadata key shares that
+# budget, so the per-key bucket count is derived from it rather than fixed --
+# see get_meta_value_space_by_kbs. Nothing here caps the value space itself:
+# a key's values are returned in full.
+ES_MAX_BUCKETS = 65536
+
 
 def _es_response_total(response: Any) -> int | None:
     """Extract the exact total hit count from an ES search response.
@@ -757,6 +764,116 @@ class DocMetadataService:
         except Exception as e:
             logging.error(f"Error getting metadata for document {doc_id}: {e}")
             return {}
+
+    @classmethod
+    def _agg_fields_from_mapping_es(cls, index_name: str) -> dict[str, str]:
+        """Map each metadata key to the ES field path that can be aggregated on.
+
+        ``meta_fields`` is mapped ``dynamic: true``, so the index mapping already
+        enumerates every key ever indexed for the tenant. Reading it costs one
+        cheap metadata call and -- unlike scanning documents -- cannot miss a key
+        just because the documents carrying it happen to sort late.
+
+        Returns {} when the backend is not ES or the mapping cannot be read, so
+        the caller can fall back to the document scan.
+        """
+        es = getattr(settings.docStoreConn, "es", None)
+        if es is None:
+            return {}
+        try:
+            mapping = es.indices.get_mapping(index=index_name)
+        except Exception as e:
+            logging.warning(f"Cannot read mapping of {index_name}: {e}")
+            return {}
+
+        raw = getattr(mapping, "body", mapping)
+        props = {}
+        for body in raw.values():
+            props = body.get("mappings", {}).get("properties", {}).get("meta_fields", {}).get("properties", {})
+            if props:
+                break
+
+        fields = {}
+        for key, spec in props.items():
+            typ = spec.get("type")
+            if typ == "text" and "keyword" in (spec.get("fields") or {}):
+                # text is analysed and not aggregatable; its keyword subfield is
+                fields[key] = f"meta_fields.{key}.keyword"
+            elif typ in ("keyword", "long", "integer", "short", "byte", "double", "float", "boolean", "date"):
+                fields[key] = f"meta_fields.{key}"
+        return fields
+
+    @classmethod
+    @DB.connection_context()
+    def get_meta_value_space_by_kbs(cls, kb_ids: list[str]) -> dict:
+        """Every distinct metadata value per key: {key: [value, ...]}.
+
+        This is what the LLM filter generator needs, and it is deliberately NOT
+        get_flatted_meta_by_kbs(). That method pages the doc-meta index with
+        from/size and stops at the doc store's result window, so on a dataset
+        larger than ~10k documents it returns the metadata of an arbitrary
+        prefix. gen_meta_filter is then asked to pick a value it was never
+        shown, and either picks a wrong one (search scoped to the wrong
+        documents) or picks nothing (filter dropped, whole-corpus search).
+        Neither failure raises.
+
+        A terms aggregation is not bound by the result window: it sees every
+        matching document, in one round trip instead of one per thousand.
+
+        Complete regardless of how many documents the dataset holds: the size
+        of the result depends on the metadata's cardinality, not on the document
+        count, so a 10M-document dataset with three projects still returns three
+        values. The per-key bucket count is divided out of ES's
+        ``search.max_buckets`` budget so that a tenant with many metadata keys
+        cannot make the request illegal.
+
+        Falls back to flattening get_flatted_meta_by_kbs() on non-ES backends,
+        so behaviour there is unchanged.
+        """
+        if not kb_ids:
+            return {}
+
+        def _fallback() -> dict:
+            metas = cls.get_flatted_meta_by_kbs(kb_ids)
+            return {k: list(v.keys()) if isinstance(v, dict) else list(v) for k, v in metas.items()}
+
+        try:
+            kb = Knowledgebase.get_by_id(kb_ids[0])
+            if not kb:
+                return {}
+            index_name = cls._get_doc_meta_index_name(kb.tenant_id)
+            if not settings.docStoreConn.index_exist(index_name, ""):
+                return {}
+
+            fields = cls._agg_fields_from_mapping_es(index_name)
+            if not fields:
+                return _fallback()
+
+            es = settings.docStoreConn.es
+            # One terms aggregation per key, in a single request. They share ES's
+            # search.max_buckets budget, so divide it rather than hardcoding a
+            # per-key size: a fixed size large enough to be useful would make the
+            # request illegal on a tenant with many metadata keys.
+            per_key = max(1, ES_MAX_BUCKETS // max(1, len(fields)))
+            body = {
+                "size": 0,
+                "query": {"bool": {"filter": [{"terms": {"kb_id": list(kb_ids)}}]}},
+                "aggs": {f"vs_{k}": {"terms": {"field": f, "size": per_key}} for k, f in fields.items()},
+            }
+            res = es.search(index=index_name, body=body)
+            aggs = getattr(res, "body", res).get("aggregations", {})
+
+            space = {}
+            for key in fields:
+                buckets = (aggs.get(f"vs_{key}") or {}).get("buckets") or []
+                if not buckets:
+                    continue
+                space[key] = [str(b["key"]) for b in buckets]
+            return space
+
+        except Exception as e:
+            logging.exception(f"get_meta_value_space_by_kbs failed for {kb_ids}: {e}; falling back to the paged scan")
+            return _fallback()
 
     @classmethod
     @DB.connection_context()
