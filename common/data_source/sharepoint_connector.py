@@ -169,9 +169,12 @@ class SharePointConnector(CheckpointedConnectorWithPermSync, SlimConnectorWithPe
         modified = self._modified_dt(drive_item) or datetime.now(timezone.utc)
 
         metadata = {"drive": drive_name, "drive_id": str(drive_id), "drive_item_id": str(drive_item.id)}
-        web_url = getattr(drive_item, "web_url", None)
-        if web_url:
-            metadata["web_url"] = web_url
+        # web_url is deliberately NOT put in metadata: it is unique per
+        # document, so it can never narrow a metadata filter, and since
+        # v0.27 every metadata key and value is serialised into the
+        # gen_meta_filter prompt, where a value space the size of the
+        # corpus only spends context. The link is already carried by
+        # Document.document_link below.
 
         return Document(
             id=self._composite_doc_id(drive_id, drive_item),

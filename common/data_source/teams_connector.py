@@ -189,9 +189,12 @@ class TeamsConnector(CheckpointedConnectorWithPermSync, SlimConnectorWithPermSyn
         semantic_identifier = f"{channel_name}: {snippet}" if snippet else f"{channel_name} message"
 
         metadata = {"team": team_name, "channel": channel_name}
-        web_url = self._prop(message, "web_url") or self._prop(message, "webUrl")
-        if web_url:
-            metadata["web_url"] = web_url
+        # web_url is deliberately NOT put in metadata: it is unique per
+        # document, so it can never narrow a metadata filter, and since
+        # v0.27 every metadata key and value is serialised into the
+        # gen_meta_filter prompt, where a value space the size of the
+        # corpus only spends context. The link is already carried by
+        # Document.document_link below.
 
         return Document(
             id=f"{team_id}__{channel_id}__{message.id}",
