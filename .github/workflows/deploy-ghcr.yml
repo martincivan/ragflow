@@ -22,7 +22,7 @@ on:
         default: "origin/main"
       branches:
         description: "Space-separated branches to merge in"
-        default: "feat/slovak-czech-language-support feat/postgres-model-provider-migration fix/empty-tools-array fix/agentic-search-honours-dialog-retrieval-settings fix/es-deep-paging-id-sort fix/no-web-url-in-meta-fields"
+        default: "fix/es-deep-paging-id-sort fix/no-web-url-in-meta-fields"
       tag:
         description: "Image tag"
         default: "deploy"
@@ -42,21 +42,8 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     env:
-      # PINNED, not origin/main. feat/slovak-czech-language-support no longer
-      # merges onto current upstream main: six agentic-search refactors landed
-      # after 2026-08-26 (#18798, #18927, #19000, #19016, #19046, #19112) and
-      # collide with it in rag/advanced_rag/agentic_rag.py and
-      # rag/advanced_rag/harness/tools/{search,navigation}.py.
-      #
-      # da4a62b02 is the last upstream commit before the last image that built
-      # green (2026-08-26), so this pin reproduces the upstream code already
-      # running in production and adds only the feature branches below --
-      # the smallest possible delta from the deployed image.
-      #
-      # Unpin once the Slovak branch is rebased onto main; that rebase is the
-      # real fix and this line is the holding pattern.
-      BASE_REF: ${{ inputs.base || 'da4a62b027c71995f0f31095dc097511946d770b' }}
-      MERGE_BRANCHES: ${{ inputs.branches || 'feat/slovak-czech-language-support feat/postgres-model-provider-migration fix/empty-tools-array fix/agentic-search-honours-dialog-retrieval-settings fix/es-deep-paging-id-sort fix/no-web-url-in-meta-fields' }}
+      BASE_REF: ${{ inputs.base || 'origin/main' }}
+      MERGE_BRANCHES: ${{ inputs.branches || 'fix/es-deep-paging-id-sort fix/no-web-url-in-meta-fields' }}
       IMAGE_TAG: ${{ inputs.tag || 'deploy' }}
       PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
 
