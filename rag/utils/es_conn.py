@@ -289,7 +289,18 @@ class ESConnection(ESConnectionBase):
                 elif field.endswith("_int") or field.endswith("_flt"):
                     order_info = {"order": order, "unmapped_type": "float"}
                 elif field == "id":
-                    continue  # id as "text", not a "keyword", order by it will cause error
+                    # id is declared "keyword" in conf/doc_meta_es_mapping.json and
+                    # resolves to a keyword in the chunk index too, so it is sortable;
+                    # unmapped_type keeps this safe on an index where it is absent.
+                    #
+                    # Dropping it outright broke deep paging: has_explicit_sort below
+                    # is computed from the REQUESTED order_by, so it stayed True, the
+                    # query went out with no sort at all, and _search_with_search_after
+                    # found no `sort` value on the hits -- its skip loop breaks on the
+                    # first batch and returns zero hits. Callers read that as "no more
+                    # data" and silently stopped at max_result_window, which defeats
+                    # the pagination merged in #16095 for #16034.
+                    order_info = {"order": order, "unmapped_type": "keyword"}
                 else:
                     order_info = {"order": order, "unmapped_type": "keyword"}
                 orders.append({field: order_info})
@@ -299,7 +310,10 @@ class ESConnection(ESConnectionBase):
                 s.aggs.bucket(f"aggs_{fld}", "terms", field=fld, size=1000000)
 
         has_dense = any(isinstance(m, MatchDenseExpr) for m in match_expressions)
-        has_explicit_sort = bool(order_by and order_by.fields)
+        # The EFFECTIVE sort, not the requested one: search_after cannot page a
+        # query that carries no sort, so a dropped sort field must disable it
+        # rather than silently produce empty deep pages.
+        has_explicit_sort = bool(orders)
         use_search_after = limit > 0 and (offset + limit > MAX_RESULT_WINDOW) and has_explicit_sort and not has_dense
 
         if limit > 0 and not use_search_after:
