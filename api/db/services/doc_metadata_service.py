@@ -65,6 +65,18 @@ def _es_response_total(response: Any) -> int | None:
     return None
 
 
+# Ceiling on a metadata-derived document scope. The ids this push-down returns
+# are handed to retrieval as a `terms` filter, and ES rejects a terms query with
+# more clauses than index.max_terms_count (65,536 by default) -- so a larger
+# match set cannot be expressed as a scope no matter how it is fetched.
+META_PUSHDOWN_MAX_DOCS = 65536
+
+# Page size for enumerating that scope with search_after. Unlike from/size,
+# search_after is not bound by max_result_window, so the only cost of a bigger
+# match set is round trips: 10,989 documents came back in 3 pages / 0.21 s.
+META_PUSHDOWN_PAGE_SIZE = 5000
+
+
 class DocMetadataService:
     """Service for managing document metadata in ES/Infinity"""
 
@@ -860,7 +872,7 @@ class DocMetadataService:
         kb_ids: list[str],
         filters: list[dict],
         logic: str = "and",
-        limit: int = 10000,
+        limit: int = META_PUSHDOWN_MAX_DOCS,
     ) -> list[str] | None:
         """Run a metadata filter directly against ES or Infinity, returning matching doc IDs.
 
@@ -930,46 +942,71 @@ class DocMetadataService:
             logging.error(f"ES build query failed: {e.reason}, filters={filters}")
             return None
 
+        # Enumerate the whole match set with search_after rather than one
+        # size=limit request. A single request cannot exceed max_result_window
+        # (10k), and the previous code treated the overflow as "push down not
+        # viable" and handed over to the in-memory meta_filter -- whose comment
+        # calls it "correct, just slower". On Elasticsearch it is neither: it
+        # runs on get_flatted_meta_by_kbs(), which truncates at the same 10k.
+        # Measured here: a filter matching 10,989 documents produced a scope of
+        # 47, silently dropping 10,942 -- and the survivors were an arbitrary
+        # slice that shifts whenever the index is rewritten.
         request_body = {
             **query_body,
-            "size": limit,
+            "size": min(META_PUSHDOWN_PAGE_SIZE, limit),
             "_source": ["id"],
-            # Make hits.total.value exact. ES otherwise caps the tracked
-            # total at 10,000 with relation="gte", which would let
-            # overflow slip through undetected.
+            # Exact total: ES otherwise stops counting at 10,000 with
+            # relation="gte", which is what let the overflow go unnoticed.
             "track_total_hits": True,
+            "sort": [{"id": {"order": "asc", "unmapped_type": "keyword"}}],
         }
 
-        try:
-            response = es_client.search(index=index_name, body=request_body)
-        except Exception as e:
-            logging.error(f"ES metadata filter failed for {index_name}: {e}")
-            return None
-
-        doc_ids = extract_doc_ids(response if isinstance(response, dict) else dict(response))
         seen: set[str] = set()
         unique: list[str] = []
-        for did in doc_ids:
-            if did in seen:
-                continue
-            seen.add(did)
-            unique.append(did)
+        response = None
+        search_after = None
+        while True:
+            body = dict(request_body)
+            if search_after is not None:
+                body["search_after"] = search_after
+            try:
+                page = es_client.search(index=index_name, body=body)
+            except Exception as e:
+                logging.error(f"ES metadata filter failed for {index_name}: {e}")
+                return None
+            page = page if isinstance(page, dict) else dict(page)
+            if response is None:
+                response = page
+            hits = (page.get("hits") or {}).get("hits") or []
+            if not hits:
+                break
+            for did in extract_doc_ids(page):
+                if did not in seen:
+                    seen.add(did)
+                    unique.append(did)
+            if len(unique) > limit:
+                break
+            search_after = hits[-1].get("sort")
+            if not search_after or len(hits) < request_body["size"]:
+                break
 
-        if len(unique) >= limit:
-            logging.warning(f"ES metadata filter hit limit {limit} for KBs {kb_ids}")
 
-        # Detect silent truncation: the push-down is a fast path, not
-        # the system of record. When the query matched more than
-        # ``limit`` docs, the slice we built here is necessarily a
-        # strict subset of the truth, and the caller treats any
-        # non-None result as definitive. Bail out and let the caller
-        # fall back to the in-memory ``meta_filter`` (correct, just
-        # slower for very large result sets) instead of silently
-        # dropping docs.
+        # Past the ceiling the scope is not expressible: retrieval turns these
+        # ids into a `terms` filter, and ES caps that at index.max_terms_count.
+        # Falling back to the in-memory meta_filter here would be worse than
+        # useless -- it reads truncated metadata and would answer with an
+        # arbitrary subset presented as the whole. Return nothing instead, which
+        # apply_meta_data_filter's auto/semi_auto path reads as "no scope" and
+        # answers from the full corpus: a filter that does not narrow, rather
+        # than one that narrows to the wrong documents.
         total = _es_response_total(response)
-        if total is not None and total > limit:
-            logging.warning(f"ES metadata filter result exceeds push-down cap, falling back to in-memory: total={total}, cap={limit}, kb_ids={kb_ids}")
-            return None
+        if (total is not None and total > limit) or len(unique) > limit:
+            logging.warning(
+                "ES metadata filter matched %s documents for KBs %s, above the %d ceiling "
+                "(index.max_terms_count): dropping the scope instead of narrowing to a subset.",
+                total if total is not None else f">{limit}", kb_ids, limit,
+            )
+            return []
 
         logging.debug(f"ES metadata filter returned {len(unique)} matches for KBs {kb_ids}")
         return unique
