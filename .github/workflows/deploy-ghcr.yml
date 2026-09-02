@@ -22,7 +22,7 @@ on:
         default: "origin/main"
       branches:
         description: "Space-separated branches to merge in"
-        default: "fix/no-web-url-in-meta-fields fix/meta-value-space-aggregation"
+        default: "fix/no-web-url-in-meta-fields fix/meta-value-space-aggregation fix/meta-pushdown-enumerate"
       tag:
         description: "Image tag"
         default: "deploy"
@@ -43,7 +43,7 @@ jobs:
     runs-on: ubuntu-24.04
     env:
       BASE_REF: ${{ inputs.base || 'origin/main' }}
-      MERGE_BRANCHES: ${{ inputs.branches || 'fix/no-web-url-in-meta-fields fix/meta-value-space-aggregation' }}
+      MERGE_BRANCHES: ${{ inputs.branches || 'fix/no-web-url-in-meta-fields fix/meta-value-space-aggregation fix/meta-pushdown-enumerate' }}
       IMAGE_TAG: ${{ inputs.tag || 'deploy' }}
       PLATFORM: ${{ inputs.platform || 'linux/amd64' }}
 
