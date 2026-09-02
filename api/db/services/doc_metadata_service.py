@@ -827,6 +827,25 @@ class DocMetadataService:
         ``search.max_buckets`` budget so that a tenant with many metadata keys
         cannot make the request illegal.
 
+        Two optional per-dataset knobs, both unset by default so the value space
+        is returned in full unless someone asks otherwise:
+
+          parser_config["meta_filter_exclude_keys"]  list[str]
+              Keys never offered to the model. For metadata that is real and
+              useful elsewhere but cannot constrain a filter -- a per-document
+              filename, URL or hash matches exactly one document, so it only
+              spends prompt context.
+
+          parser_config["meta_filter_max_values"]    int
+              Drop any key with more than this many distinct values. A blunt
+              version of the same idea for datasets whose metadata keys are not
+              known up front.
+
+        Note that ``semi_auto`` already covers the common case without either:
+        it takes an explicit key list from the caller and passes only those keys
+        to gen_meta_filter. These knobs are for making that choice sticky per
+        dataset rather than per request.
+
         Falls back to flattening get_flatted_meta_by_kbs() on non-ES backends,
         so behaviour there is unchanged.
         """
@@ -845,9 +864,21 @@ class DocMetadataService:
             if not settings.docStoreConn.index_exist(index_name, ""):
                 return {}
 
-            fields = cls._agg_fields_from_mapping_es(index_name)
+            excluded: set[str] = set()
+            max_values: int | None = None
+            for kb_id in kb_ids:
+                row = Knowledgebase.get_by_id(kb_id)
+                cfg = (row.parser_config if row else None) or {}
+                excluded.update(str(k) for k in (cfg.get("meta_filter_exclude_keys") or []))
+                cap = cfg.get("meta_filter_max_values")
+                if isinstance(cap, int) and cap > 0:
+                    # Several datasets in one query: the strictest cap wins, so
+                    # a key excluded for one is not smuggled in by another.
+                    max_values = cap if max_values is None else min(max_values, cap)
+
+            fields = {k: v for k, v in cls._agg_fields_from_mapping_es(index_name).items() if k not in excluded}
             if not fields:
-                return _fallback()
+                return {} if excluded else _fallback()
 
             es = settings.docStoreConn.es
             # One terms aggregation per key, in a single request. They share ES's
@@ -867,6 +898,13 @@ class DocMetadataService:
             for key in fields:
                 buckets = (aggs.get(f"vs_{key}") or {}).get("buckets") or []
                 if not buckets:
+                    continue
+                if max_values is not None and len(buckets) > max_values:
+                    logging.info(
+                        "[get_meta_value_space_by_kbs] key %r has %d distinct values, over the "
+                        "meta_filter_max_values=%d configured for kb_ids=%s; not offered to the model.",
+                        key, len(buckets), max_values, kb_ids,
+                    )
                     continue
                 space[key] = [str(b["key"]) for b in buckets]
             return space
