@@ -114,6 +114,11 @@ class ESConnection(ESConnectionBase):
         q_base = copy.deepcopy(query)
         q_base.pop("from", None)
         q_base.pop("size", None)
+        if not q_base.get("sort"):
+            # Without a sort there is no sort key on the hits to page by, and
+            # every loop below would exit on its first iteration and report an
+            # empty result — indistinguishable from "no more documents".
+            raise ValueError("search_after paging requires a sorted query")
 
         search_after = None
         template_res = None
@@ -280,8 +285,8 @@ class ESConnection(ESConnectionBase):
         for field in highlight_fields:
             s = s.highlight(field, fragment_size=50, number_of_fragments=5)
 
+        orders = list()
         if order_by:
-            orders = list()
             for field, order in order_by.fields:
                 order = "asc" if order == 0 else "desc"
                 if field in ["page_num_int", "top_int"]:
@@ -299,7 +304,14 @@ class ESConnection(ESConnectionBase):
                 s.aggs.bucket(f"aggs_{fld}", "terms", field=fld, size=1000000)
 
         has_dense = any(isinstance(m, MatchDenseExpr) for m in match_expressions)
-        has_explicit_sort = bool(order_by and order_by.fields)
+        # Gate on the sort the query actually carries, not on what was asked
+        # for: `id` is dropped from `orders` just above, so order_by.fields can
+        # be non-empty while the query ends up unsorted. search_after pages by
+        # the sort key of the last hit, so on an unsorted query it reads no key,
+        # stops after the first page and returns zero hits without an error —
+        # a caller paging past max_result_window then sees an empty batch and
+        # concludes it has read everything.
+        has_explicit_sort = bool(orders)
         use_search_after = limit > 0 and (offset + limit > MAX_RESULT_WINDOW) and has_explicit_sort and not has_dense
 
         if limit > 0 and not use_search_after:
