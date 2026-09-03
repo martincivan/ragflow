@@ -164,15 +164,64 @@ def test_supported_operator_set_matches_documentation():
 # ===========================================================================
 
 
-def test_equal_translates_to_term_with_lowercased_value(es_translator):
-    """String equality runs against ``.keyword`` so multi-word phrases match."""
+def _should_terms(field_path: str, values):
+    """`=` on a string expands to one case-insensitive term per case variant."""
+    return {
+        "bool": {
+            "should": [{"term": {field_path + ".keyword": {"value": v, "case_insensitive": True}}} for v in values],
+            "minimum_should_match": 1,
+        }
+    }
+
+
+def test_equal_keeps_the_value_as_written(es_translator):
+    """String equality runs against ``.keyword``, matching the value as given.
+
+    The lower-cased spelling is offered alongside it so anything the previous
+    lower-casing behaviour matched still matches.
+    """
     from common.metadata_es_filter import META_FIELDS_PREFIX
 
     def _field(key: str) -> str:
         return f"{META_FIELDS_PREFIX}.{key}"
 
     clauses = es_translator.translate({"key": "tag", "op": "=", "value": "Alpha"}).to_clauses()
-    assert clauses == [{"term": {_field("tag") + ".keyword": {"value": "alpha", "case_insensitive": True}}}]
+    assert clauses == [_should_terms(_field("tag"), ["Alpha", "alpha"])]
+
+
+def test_equal_matches_a_non_ascii_capital(es_translator):
+    """Regression: ``case_insensitive`` folds ASCII only.
+
+    Lower-casing 'Dokumentácia_Štúdia' in Python produced 'dokumentácia_štúdia',
+    which ES could never fold back onto the indexed 'Š' — the condition matched
+    nothing and, in auto/semi_auto, the whole filter was then dropped.
+    """
+    from common.metadata_es_filter import META_FIELDS_PREFIX
+
+    clauses = es_translator.translate({"key": "phase", "op": "=", "value": "Dokumentácia_Štúdia"}).to_clauses()
+    values = [t["term"][f"{META_FIELDS_PREFIX}.phase.keyword"]["value"] for t in clauses[0]["bool"]["should"]]
+    assert "Dokumentácia_Štúdia" in values
+
+
+def test_equal_does_not_coerce_an_underscored_identifier_to_a_number(es_translator):
+    """Regression: PEP 515 makes '2015_062' a valid int literal (2015062).
+
+    ``ast.literal_eval`` therefore turned a project identifier into a number and
+    aimed the term at the numeric parent path, matching nothing.
+    """
+    from common.metadata_es_filter import META_FIELDS_PREFIX
+
+    clauses = es_translator.translate({"key": "project_id", "op": "=", "value": "2015_062"}).to_clauses()
+    assert clauses == [{"term": {f"{META_FIELDS_PREFIX}.project_id.keyword":
+                                 {"value": "2015_062", "case_insensitive": True}}}]
+
+
+@pytest.mark.parametrize("value,expected", [("42", 42), ("-7", -7), ("3.5", 3.5), ("007", 7)])
+def test_equal_still_parses_plain_numbers(es_translator, value, expected):
+    from common.metadata_es_filter import META_FIELDS_PREFIX
+
+    clauses = es_translator.translate({"key": "score", "op": "=", "value": value}).to_clauses()
+    assert clauses == [{"term": {f"{META_FIELDS_PREFIX}.score": expected}}]
 
 
 def test_equal_parses_numeric_literal(es_translator):
@@ -194,16 +243,7 @@ def test_equal_multiword_uses_keyword_subfield(es_translator):
         return f"{META_FIELDS_PREFIX}.{key}"
 
     clauses = es_translator.translate({"key": "author", "op": "=", "value": "Alice Wonderland"}).to_clauses()
-    assert clauses == [
-        {
-            "term": {
-                _field("author") + ".keyword": {
-                    "value": "alice wonderland",
-                    "case_insensitive": True,
-                }
-            }
-        }
-    ]
+    assert clauses == [_should_terms(_field("author"), ["Alice Wonderland", "alice wonderland"])]
 
 
 def test_not_equal_requires_field_to_exist(es_translator):
@@ -252,7 +292,7 @@ def test_range_passes_iso_date_through_unparsed(es_translator):
     assert range_clause == {"range": {"meta_fields.published": {"gte": "2025-01-15"}}}
 
 
-def test_in_operator_csv_value_lowercased(es_translator):
+def test_in_operator_csv_value(es_translator):
     from common.metadata_es_filter import META_FIELDS_PREFIX
 
     def _field(key: str) -> str:
@@ -267,7 +307,7 @@ def test_in_operator_csv_value_lowercased(es_translator):
         }
 
     clauses = es_translator.translate({"key": "status", "op": "in", "value": "Active,Pending"}).to_clauses()
-    assert clauses == [_string_terms_should(_field("status"), ["active", "pending"])]
+    assert clauses == [_string_terms_should(_field("status"), ["Active", "active", "Pending", "pending"])]
 
 
 def test_in_operator_python_list_literal(es_translator):
@@ -285,7 +325,7 @@ def test_in_operator_python_list_literal(es_translator):
         }
 
     clauses = es_translator.translate({"key": "status", "op": "in", "value": "['Open', 'Closed']"}).to_clauses()
-    assert clauses == [_string_terms_should(_field("status"), ["open", "closed"])]
+    assert clauses == [_string_terms_should(_field("status"), ["Open", "open", "Closed", "closed"])]
 
 
 def test_in_operator_numeric_members_keep_terms(es_translator):
