@@ -27,6 +27,51 @@ def convert_conditions(metadata_condition):
     return [{"op": op_mapping.get(cond["comparison_operator"], cond["comparison_operator"]), "key": cond["name"], "value": cond["value"]} for cond in metadata_condition.get("conditions", [])]
 
 
+# Operators whose value carries a set of members rather than one scalar.
+_MEMBERSHIP_OPS = frozenset({"in", "not in"})
+
+
+def _carries_several_values(value) -> bool:
+    if isinstance(value, (list, tuple, set)):
+        return len(value) > 1
+    return isinstance(value, str) and "," in value
+
+
+def enforce_operator_constraints(conditions: list[dict], constraints: dict) -> list[dict]:
+    """Apply the caller's per-key operator to the conditions the LLM returned.
+
+    ``semi_auto`` lets the caller pin an operator per key, and the prompt tells
+    the model it MUST use it, but nothing checked the answer -- and models do
+    deviate. The conditions become a hard document scope, so an operator the
+    caller did not ask for silently changes what the search can see.
+
+    A membership operator carrying several members is left as the model wrote
+    it: rewriting ``in ["a", "b"]`` to ``=`` would need two conditions on one
+    key, which the shared ``and`` logic turns into a scope that matches nothing.
+    """
+    if not constraints:
+        return conditions
+    enforced = []
+    for condition in conditions or []:
+        if not isinstance(condition, dict):
+            continue
+        key, op = condition.get("key"), condition.get("op")
+        wanted = constraints.get(key)
+        if not wanted or op == wanted:
+            enforced.append(condition)
+            continue
+        if op in _MEMBERSHIP_OPS and wanted not in _MEMBERSHIP_OPS and _carries_several_values(condition.get("value")):
+            logging.warning(
+                "Metadata filter kept operator %r on key %r: the constraint %r cannot express several values",
+                op, key, wanted,
+            )
+            enforced.append(condition)
+            continue
+        logging.debug("Metadata filter enforced operator %r on key %r (model returned %r)", wanted, key, op)
+        enforced.append({**condition, "op": wanted})
+    return enforced
+
+
 def meta_filter(metas: dict, filters: list[dict], logic: str = "and"):
     doc_ids = None
 
@@ -234,7 +279,8 @@ async def apply_meta_data_filter(
             if filtered_metas:
                 filters: dict = await gen_meta_filter(chat_mdl, filtered_metas, question, constraints=constraints)
                 logging.debug(f"Metadata filter(semi_auto) generated: {filters}")
-                doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
+                conditions = enforce_operator_constraints(filters["conditions"], constraints)
+                doc_ids.extend(_run_metadata_filter(conditions, filters.get("logic", "and")))
                 if not doc_ids:
                     return None
     elif method == "manual":
