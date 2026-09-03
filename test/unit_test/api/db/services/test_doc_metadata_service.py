@@ -75,3 +75,58 @@ class TestDocMetadataServiceConnectorGetCalls:
                 [],
             )
             assert result == {"author": "alice"}
+
+
+class TestMetaRowScan:
+    """The doc-meta scan must read every row, not the first result window.
+
+    The connector pages with from/size, which the doc store refuses past
+    ``index.max_result_window``, and its search_after path never engaged here
+    because the connector drops ``id`` from the sort. The scan therefore
+    returned exactly ``max_result_window`` rows and reported success.
+    """
+
+    @staticmethod
+    def _page(ids):
+        return {"hits": {"hits": [{"_id": i, "_source": {"id": i, "meta_fields": {"k": i}}, "sort": [i]} for i in ids]}}
+
+    def test_scan_pages_past_a_single_window(self, monkeypatch):
+        from api.db.services import doc_metadata_service as mod
+
+        monkeypatch.setattr(mod, "META_SCAN_PAGE_SIZE", 2)
+        pages = [self._page(["a", "b"]), self._page(["c", "d"]), self._page(["e"])]
+        seen_after = []
+
+        class _ES:
+            def search(self, index, body):
+                seen_after.append(body.get("search_after"))
+                return pages.pop(0)
+
+        rows = list(DocMetadataService._iter_meta_rows_es(_ES(), "idx", ["kb"]))
+        assert [doc_id for doc_id, _ in rows] == ["a", "b", "c", "d", "e"]
+        assert seen_after == [None, ["b"], ["d"]]
+
+    def test_scan_refuses_to_stop_without_a_sort_key(self, monkeypatch):
+        """A full page with no sort key cannot be paged past — raise, don't truncate."""
+        from api.db.services import doc_metadata_service as mod
+
+        monkeypatch.setattr(mod, "META_SCAN_PAGE_SIZE", 2)
+
+        class _ES:
+            def search(self, index, body):
+                return {"hits": {"hits": [{"_id": "a", "_source": {"id": "a"}}, {"_id": "b", "_source": {"id": "b"}}]}}
+
+        with pytest.raises(RuntimeError, match="lost its sort key"):
+            list(DocMetadataService._iter_meta_rows_es(_ES(), "idx", ["kb"]))
+
+    def test_scan_sorts_by_id(self):
+        captured = {}
+
+        class _ES:
+            def search(self, index, body):
+                captured.update(body)
+                return {"hits": {"hits": []}}
+
+        list(DocMetadataService._iter_meta_rows_es(_ES(), "idx", ["kb"]))
+        assert captured["sort"] == [{"id": {"order": "asc"}}]
+        assert captured["query"] == {"bool": {"filter": [{"terms": {"kb_id": ["kb"]}}]}}

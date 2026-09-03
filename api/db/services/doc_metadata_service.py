@@ -83,6 +83,11 @@ def _es_response_total(response: Any) -> int | None:
     return None
 
 
+# Page size for the metadata scan. Bounds one round trip, not the answer:
+# the scan pages with search_after, which has no result-window ceiling.
+META_SCAN_PAGE_SIZE = 1000
+
+
 class DocMetadataService:
     """Service for managing document metadata in ES/Infinity"""
 
@@ -975,41 +980,7 @@ class DocMetadataService:
             tenant_id = kb.tenant_id
             index_name = cls._get_doc_meta_index_name(tenant_id)
 
-            condition = {"kb_id": kb_ids}
-            order_by = OrderByExpr()
-            if not settings.DOC_ENGINE_INFINITY:
-                order_by.asc("id")
-
-            # Paginate to support datasets with more than 10,000 documents.
-            page_size = 1000
-            offset = 0
-            all_results = []
-            while True:
-                batch = settings.docStoreConn.search(
-                    select_fields=["*"],
-                    highlight_fields=[],
-                    condition=condition,
-                    match_expressions=[],
-                    order_by=order_by,
-                    offset=offset,
-                    limit=page_size,
-                    index_names=index_name,
-                    knowledgebase_ids=kb_ids,
-                )
-                batch_docs = list(cls._iter_search_results(batch))
-                if not batch_docs:
-                    break
-                all_results.extend(batch_docs)
-                logging.debug(
-                    "[get_flatted_meta_by_kbs] offset=%d batch=%d total=%d kb_ids=%s",
-                    offset,
-                    len(batch_docs),
-                    len(all_results),
-                    kb_ids,
-                )
-                if len(batch_docs) < page_size:
-                    break
-                offset += page_size
+            all_results = cls._scan_meta_rows(index_name, kb_ids)
 
             # Aggregate metadata over all retrieved results
             meta = {}
@@ -1043,6 +1014,99 @@ class DocMetadataService:
         except Exception as e:
             logging.error("Error getting flattened metadata for KBs %s: %s", kb_ids, e)
             return {}
+
+    @classmethod
+    def _scan_meta_rows(cls, index_name: str, kb_ids: list[str]) -> list:
+        """Every metadata row for ``kb_ids``, as ``(doc_id, doc)`` pairs.
+
+        Prefers a search_after scan on Elasticsearch and falls back to the
+        doc-store connector elsewhere. The connector pages with from/size, which
+        the store refuses past ``index.max_result_window``; its own search_after
+        path never engages here because it is gated on the sort surviving into
+        the query and the connector drops ``id`` from the sort. The effect was a
+        scan that stopped at exactly 10 000 rows and reported success, so a
+        dataset larger than that filtered against, and offered the UI, a
+        truncated view of its own metadata.
+        """
+        es = getattr(settings.docStoreConn, "es", None)
+        if es is not None:
+            try:
+                return list(cls._iter_meta_rows_es(es, index_name, kb_ids))
+            except Exception:
+                logging.exception(
+                    "[get_flatted_meta_by_kbs] search_after scan failed for %s; falling back to the connector",
+                    kb_ids,
+                )
+        return cls._iter_meta_rows_connector(index_name, kb_ids)
+
+    @classmethod
+    def _iter_meta_rows_es(cls, es, index_name: str, kb_ids: list[str]):
+        """Page the doc-meta index with search_after.
+
+        ``id`` is a keyword in this index and unique per document, so it is a
+        complete sort key — no tiebreaker is needed.
+        """
+        body = {
+            "query": {"bool": {"filter": [{"terms": {"kb_id": list(kb_ids)}}]}},
+            "sort": [{"id": {"order": "asc"}}],
+            "size": META_SCAN_PAGE_SIZE,
+        }
+        after = None
+        total = 0
+        while True:
+            page = dict(body)
+            if after is not None:
+                page["search_after"] = after
+            res = es.search(index=index_name, body=page)
+            hits = ((getattr(res, "body", res) or {}).get("hits") or {}).get("hits") or []
+            if not hits:
+                return
+            for hit in hits:
+                doc = hit.get("_source") or {}
+                doc_id = cls._extract_doc_id(doc, hit)
+                if doc_id:
+                    yield doc_id, doc
+            total += len(hits)
+            logging.debug("[get_flatted_meta_by_kbs] scanned=%d kb_ids=%s", total, kb_ids)
+            if len(hits) < META_SCAN_PAGE_SIZE:
+                return
+            after = hits[-1].get("sort")
+            if not after:
+                # Cannot page any further without a sort key; stopping here
+                # would silently truncate, which is the bug this scan exists to
+                # avoid.
+                raise RuntimeError(f"doc-meta scan lost its sort key after {total} rows for {kb_ids}")
+
+    @classmethod
+    def _iter_meta_rows_connector(cls, index_name: str, kb_ids: list[str]) -> list:
+        """from/size paging through the doc-store connector (non-ES backends)."""
+        condition = {"kb_id": kb_ids}
+        order_by = OrderByExpr()
+        if not settings.DOC_ENGINE_INFINITY:
+            order_by.asc("id")
+
+        offset = 0
+        all_results = []
+        while True:
+            batch = settings.docStoreConn.search(
+                select_fields=["*"],
+                highlight_fields=[],
+                condition=condition,
+                match_expressions=[],
+                order_by=order_by,
+                offset=offset,
+                limit=META_SCAN_PAGE_SIZE,
+                index_names=index_name,
+                knowledgebase_ids=kb_ids,
+            )
+            batch_docs = list(cls._iter_search_results(batch))
+            if not batch_docs:
+                break
+            all_results.extend(batch_docs)
+            if len(batch_docs) < META_SCAN_PAGE_SIZE:
+                break
+            offset += META_SCAN_PAGE_SIZE
+        return all_results
 
     @classmethod
     def filter_doc_ids_by_meta_pushdown(
