@@ -45,6 +45,25 @@ META_FIELDS_PREFIX = "meta_fields"
 # to in-memory semantics rather than guess at the right ES coercion.
 _DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
+# Plain decimal numbers, and only those. ``ast.literal_eval`` used to do this
+# job, but it accepts every Python literal: PEP 515 underscore separators make
+# "2015_062" a valid int (2015062), and "1e5", "0x1F", "007" parse too. An
+# identifier that merely looks numeric was therefore coerced to a number and
+# the term query aimed at the numeric parent path instead of ``.keyword``,
+# matching nothing. Numeric metadata still has to compare as a number, so keep
+# the coercion — just make it unambiguous.
+_NUMERIC_RE = re.compile(r"^[+-]?(?:\d+|\d*\.\d+)$")
+
+
+def _as_number(text: str):
+    """Return the int/float ``text`` denotes, or None when it is not a number."""
+    if not _NUMERIC_RE.match(text):
+        return None
+    try:
+        return int(text) if "." not in text else float(text)
+    except ValueError:
+        return None
+
 # Operators that the legacy filter exposes. Anything outside this set is a bug
 # elsewhere; surface it instead of silently no-op'ing.
 SUPPORTED_OPERATORS: frozenset[str] = frozenset(
@@ -410,51 +429,46 @@ def extract_doc_ids(es_response: Dict[str, Any]) -> List[str]:
 
 
 def _coerce_scalar(value: Any, flt: Dict[str, Any]) -> Any:
-    """Mirror the legacy ``ast.literal_eval`` then ``str.lower()`` flow.
+    """Normalise a comparison value for a ``term`` query.
 
-    The in-memory filter parses values as Python literals when possible (so
-    ``"5"`` becomes ``5``) and lower-cases strings. For ES ``term`` queries we
-    need the same coercion or numeric data won't match.
+    Numbers and booleans are parsed so numeric metadata compares numerically.
+    Strings are returned **as written**: the caller pairs the value with
+    ``case_insensitive`` on ``.keyword``, and that flag folds ASCII only, so
+    lower-casing here made every value carrying a non-ASCII capital
+    unmatchable -- 'Š' became 'š' and never matched the indexed 'Š'.
     """
     if value is None:
         raise UnsupportedMetaFilter("scalar comparison value is None", flt)
     if isinstance(value, (list, dict)):
         raise UnsupportedMetaFilter("scalar comparison value is non-scalar", flt)
+    if isinstance(value, bool):
+        return value
 
     s = str(value).strip()
     if _DATE_RE.match(s):
         return s
-    try:
-        parsed = ast.literal_eval(s)
-    except Exception:
-        parsed = s
-    if isinstance(parsed, str):
-        return parsed.lower()
-    if isinstance(parsed, (int, float, bool)):
-        return parsed
-    return s.lower()
+    number = _as_number(s)
+    if number is not None:
+        return number
+    if s.lower() in ("true", "false"):
+        return s.lower() == "true"
+    return s
 
 
 def _coerce_range_value(value: Any, flt: Dict[str, Any]) -> Any:
-    """Range comparisons accept dates verbatim and numbers parsed via literal_eval.
+    """Range comparisons accept dates verbatim and plain decimal numbers as numbers.
 
-    Strings that aren't numeric or ISO dates are pushed through as-is — ES
-    will compare them lexically against keyword fields, which is the same
-    behaviour as the in-memory ``input >= value`` Python comparison after the
-    original ``ast.literal_eval`` failure path.
+    Anything else is passed through as-is: ES compares it lexically against a
+    keyword field, which is what the in-memory path's Python ``>=`` does once
+    its own numeric parse fails.
     """
     if value is None:
         raise UnsupportedMetaFilter("range comparison value is None", flt)
     s = str(value).strip()
     if _DATE_RE.match(s):
         return s
-    try:
-        parsed = ast.literal_eval(s)
-    except Exception:
-        return s
-    if isinstance(parsed, (int, float)):
-        return parsed
-    return s
+    number = _as_number(s)
+    return s if number is None else number
 
 
 def _coerce_string(value: Any, flt: Dict[str, Any]) -> str:
@@ -472,8 +486,9 @@ def _coerce_string(value: Any, flt: Dict[str, Any]) -> str:
 def _csv_or_list(value: Any, flt: Dict[str, Any]) -> List[Any]:
     """``in`` / ``not in`` accept either a real list or a comma-separated string.
 
-    The legacy in-memory path applies ``ast.literal_eval`` to the value too.
-    Mirror that for parity, then trim whitespace and lower-case any strings.
+    Members are trimmed but not lower-cased: ``_terms_string_or_numeric``
+    matches each one case-insensitively, and folding here would break the
+    non-ASCII members (see ``_coerce_scalar``).
     """
     if value is None:
         raise UnsupportedMetaFilter("membership value is None", flt)
@@ -498,7 +513,7 @@ def _csv_or_list(value: Any, flt: Dict[str, Any]) -> List[Any]:
     normalised: List[Any] = []
     for m in members:
         if isinstance(m, str):
-            normalised.append(m.lower().strip())
+            normalised.append(m.strip())
         else:
             normalised.append(m)
     return normalised
@@ -517,42 +532,60 @@ def _keyword_path(field_path: str) -> str:
     return f"{field_path}.keyword"
 
 
+def _case_variants(value: str) -> List[str]:
+    """The spellings a ``term`` query must try to match ``value`` case-insensitively.
+
+    ES's ``case_insensitive`` flag folds ASCII only, so one term cannot cover
+    both 'Š' and 'š'. The value as written is what every real caller supplies
+    (the LLM copies it out of the value space; the UI offers it from the
+    metadata listing), so it comes first. The Python-lower-cased spelling is
+    added when it differs, which keeps matching anything the previous
+    lower-casing behaviour matched.
+    """
+    lowered = value.lower()
+    return [value] if lowered == value else [value, lowered]
+
+
+def _ci_term(field_path: str, value: str) -> Dict[str, Any]:
+    return {"term": {_keyword_path(field_path): {"value": value, "case_insensitive": True}}}
+
+
+def _any_of(clauses: List[Dict[str, Any]]) -> Dict[str, Any]:
+    if len(clauses) == 1:
+        return clauses[0]
+    return {"bool": {"should": clauses, "minimum_should_match": 1}}
+
+
 def _term_or_match(field_path: str, value: Any) -> Dict[str, Any]:
     """Exact-match clause that respects how dynamic mapping indexes the value.
 
-    String values target the ``.keyword`` sub-field with ``case_insensitive``
-    so phrase values still match (the in-memory path lower-cases before
-    comparing). Numeric / bool values target the parent path because numeric
-    fields have no ``.keyword`` sub-field under default dynamic mapping.
+    String values target the ``.keyword`` sub-field because the analyzed parent
+    stores per-token entries, not the original phrase. Numeric / bool values
+    target the parent path, which is where dynamic mapping puts them and where
+    no ``.keyword`` sub-field exists.
     """
     if isinstance(value, str):
-        return {
-            "term": {
-                _keyword_path(field_path): {
-                    "value": value,
-                    "case_insensitive": True,
-                }
-            }
-        }
+        return _any_of([_ci_term(field_path, v) for v in _case_variants(value)])
     return {"term": {field_path: value}}
 
 
 def _terms_string_or_numeric(field_path: str, members: List[Any]) -> Dict[str, Any]:
     """``in``/``not in`` payload that mirrors ``_term_or_match`` per element.
 
-    ES ``terms`` does not accept ``case_insensitive``, so for string members we
-    expand into a ``bool: should`` of case-insensitive ``term`` queries on the
-    keyword sub-field. Pure-numeric / bool member lists keep the cheaper
-    ``terms`` form on the parent path.
+    ES ``terms`` does not accept ``case_insensitive``, so string members expand
+    into a ``bool: should`` of case-insensitive ``term`` queries on the keyword
+    sub-field. Pure-numeric / bool member lists keep the cheaper ``terms`` form
+    on the parent path.
     """
     if all(not isinstance(m, str) for m in members):
         return {"terms": {field_path: members}}
-    return {
-        "bool": {
-            "should": [_term_or_match(field_path, m) for m in members],
-            "minimum_should_match": 1,
-        }
-    }
+    clauses: List[Dict[str, Any]] = []
+    for m in members:
+        if isinstance(m, str):
+            clauses.extend(_ci_term(field_path, v) for v in _case_variants(m))
+        else:
+            clauses.append({"term": {field_path: m}})
+    return {"bool": {"should": clauses, "minimum_should_match": 1}}
 
 
 def _wildcard(field_path: str, pattern: str) -> Dict[str, Any]:
