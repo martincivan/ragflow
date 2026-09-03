@@ -20,6 +20,7 @@ Manages document-level metadata storage in ES/Infinity.
 This is the SOLE source of truth for document metadata - MySQL meta_fields column has been removed.
 """
 
+import datetime
 import json
 import logging
 import re
@@ -776,8 +777,8 @@ class DocMetadataService:
             return {}
 
     @classmethod
-    def _agg_fields_from_mapping_es(cls, index_name: str) -> dict[str, str]:
-        """Map each metadata key to the ES field path that can be aggregated on.
+    def _agg_fields_from_mapping_es(cls, index_name: str) -> dict[str, tuple[str, str]]:
+        """Map each metadata key to the aggregatable ES field path and its type.
 
         ``meta_fields`` is mapped ``dynamic: true``, so the index mapping already
         enumerates every key ever indexed for the tenant. Reading it costs one
@@ -808,10 +809,32 @@ class DocMetadataService:
             typ = spec.get("type")
             if typ == "text" and "keyword" in (spec.get("fields") or {}):
                 # text is analysed and not aggregatable; its keyword subfield is
-                fields[key] = f"meta_fields.{key}.keyword"
+                fields[key] = (f"meta_fields.{key}.keyword", typ)
             elif typ in ("keyword", "long", "integer", "short", "byte", "double", "float", "boolean", "date"):
-                fields[key] = f"meta_fields.{key}"
+                fields[key] = (f"meta_fields.{key}", typ)
         return fields
+
+    @staticmethod
+    def _format_meta_value(value, es_type: str) -> str:
+        """Render a bucket key the way a filter value for that field is written.
+
+        A composite ``terms`` source over a ``date`` field keys its buckets by
+        epoch milliseconds and, unlike ``date_histogram``, takes no ``format``
+        option to change that. Left as they arrive, the value space offers the
+        filter generator 1784851200000 where the document holds 2026-07-23, so
+        the model cannot relate a date in the question to anything it is shown
+        and every condition it writes against a date field is meaningless.
+
+        Midnight UTC renders as a plain date, which is what such a field holds
+        in practice and what the filter translators recognise as a date; a value
+        carrying a time of day keeps it rather than being rounded away.
+        """
+        if es_type != "date" or isinstance(value, bool) or not isinstance(value, (int, float)):
+            return str(value)
+        moment = datetime.datetime.fromtimestamp(value / 1000, datetime.timezone.utc)
+        if (moment.hour, moment.minute, moment.second, moment.microsecond) == (0, 0, 0, 0):
+            return moment.strftime("%Y-%m-%d")
+        return moment.isoformat().replace("+00:00", "Z")
 
     @classmethod
     @DB.connection_context()
@@ -871,7 +894,7 @@ class DocMetadataService:
             requests = 0
             while pending:
                 aggs = {}
-                for key, field in pending.items():
+                for key, (field, _typ) in pending.items():
                     composite = {"size": page_size, "sources": [{key: {"terms": {"field": field}}}]}
                     if key in after:
                         composite["after"] = after[key]
@@ -893,7 +916,7 @@ class DocMetadataService:
                     raise MetaValueSpaceIncomplete(f"partial aggregation response for kb_ids={kb_ids}: timed_out={payload.get('timed_out')}, shards={shards}")
                 result = payload.get("aggregations", {})
                 unfinished = {}
-                for key, field in pending.items():
+                for key, (field, typ) in pending.items():
                     agg = result.get(f"vs_{key}")
                     if agg is None:
                         # A requested aggregation that came back absent is not an
@@ -902,10 +925,12 @@ class DocMetadataService:
                         raise MetaValueSpaceIncomplete(f"aggregation vs_{key} missing from the response for kb_ids={kb_ids}")
                     buckets = agg.get("buckets") or []
                     if buckets:
-                        space.setdefault(key, []).extend(str(b["key"][key]) for b in buckets)
+                        space.setdefault(key, []).extend(cls._format_meta_value(b["key"][key], typ) for b in buckets)
                     if len(buckets) == page_size and agg.get("after_key"):
+                        # after_key must go back in the store's own representation
+                        # (epoch millis for a date), not the formatted one.
                         after[key] = agg["after_key"]
-                        unfinished[key] = field
+                        unfinished[key] = (field, typ)
                 pending = unfinished
 
             logging.debug(

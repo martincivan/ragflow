@@ -257,3 +257,64 @@ def test_falls_back_to_the_paged_path_without_an_es_client(monkeypatch):
 
     assert space["project"] == ["p1"]
     assert LATE_PHASE not in space["phase"]
+
+
+# ---------------------------------------------------------------------------
+# Date fields
+#
+# A composite `terms` source over a `date` field keys its buckets by epoch
+# milliseconds, and — unlike `date_histogram` — takes no `format` option
+# ("[terms] unknown field [format]"), so the conversion has to happen here.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "millis,expected",
+    [
+        (1784851200000, "2026-07-24"),  # midnight UTC -> a plain date
+        (1246406400000, "2009-07-01"),
+        (1784851200000 + 3600_000, "2026-07-24T01:00:00Z"),  # a time of day is kept
+    ],
+)
+def test_date_buckets_render_as_dates(millis, expected):
+    assert DocMetadataService._format_meta_value(millis, "date") == expected
+
+
+@pytest.mark.parametrize("value,es_type", [("AD", "text"), (3, "long"), (True, "boolean"), ("2026-07-24", "keyword")])
+def test_non_date_values_are_untouched(value, es_type):
+    assert DocMetadataService._format_meta_value(value, es_type) == str(value)
+
+
+def test_value_space_formats_a_date_field(monkeypatch):
+    """The generator must be shown 2026-07-24, not 1784851200000."""
+
+    class _DateEs:
+        @property
+        def indices(self):
+            mapping = {"idx": {"mappings": {"properties": {"meta_fields": {"properties": {
+                "doc_date": {"type": "date"},
+                "phase": {"type": "text", "fields": {"keyword": {"type": "keyword"}}},
+            }}}}}}
+            return SimpleNamespace(get_mapping=lambda index: mapping)
+
+        def search(self, index, body, allow_partial_search_results=None):
+            buckets = {
+                "vs_doc_date": [{"key": {"doc_date": 1784851200000}}, {"key": {"doc_date": 1784937600000}}],
+                "vs_phase": [{"key": {"phase": "AD"}}],
+            }
+            return {
+                "aggregations": {name: {"buckets": buckets[name]} for name in body["aggs"]},
+                "_shards": {"total": 1, "successful": 1, "failed": 0},
+                "timed_out": False,
+            }
+
+    class _Store:
+        es = _DateEs()
+
+        def index_exist(self, index_name, kb_id):
+            return True
+
+    _patch(monkeypatch, _Store())
+    space = DocMetadataService.get_meta_value_space_by_kbs(["kb"])
+    assert space["doc_date"] == ["2026-07-24", "2026-07-25"]
+    assert space["phase"] == ["AD"]
