@@ -139,14 +139,23 @@ def _patch(monkeypatch, store):
     monkeypatch.setattr("api.db.services.doc_metadata_service.Knowledgebase.get_by_id", lambda kb_id: SimpleNamespace(tenant_id="tenant-1"))
 
 
-def test_paged_path_cannot_see_values_beyond_the_result_window(monkeypatch):
-    """Establishes the bug the aggregation exists to avoid."""
+def test_connector_paging_cannot_see_values_beyond_the_result_window(monkeypatch):
+    """Establishes the bug the aggregation exists to avoid.
+
+    Exercises the connector paging directly. get_flatted_meta_by_kbs no longer
+    reaches it on Elasticsearch — it scans with search_after now — so this
+    truncation is what a doc store without such a scan still does. The
+    aggregation remains the right source for the value space either way: it
+    costs one request over the distinct values, where the scan reads every
+    document to rediscover the same few hundred.
+    """
     _patch(monkeypatch, _FakeDocStoreConn(_docs(), ["phase", "project"]))
 
-    metas = DocMetadataService.get_flatted_meta_by_kbs(["kb-1"])
+    rows = DocMetadataService._iter_meta_rows_connector("idx", ["kb-1"])
 
-    assert LATE_PHASE not in metas["phase"]
-    assert sum(len(doc_ids) for doc_ids in metas["phase"].values()) == RESULT_WINDOW
+    phases = {doc["meta_fields"]["phase"] for _, doc in rows}
+    assert LATE_PHASE not in phases
+    assert len(rows) == RESULT_WINDOW
 
 
 def test_value_space_is_complete_beyond_the_result_window(monkeypatch):
