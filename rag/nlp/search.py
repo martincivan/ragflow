@@ -610,8 +610,14 @@ class Dealer:
         rerank_candidates_count=64,
         knn_top_k=1024,  # Advanced knn parameter
         knn_num_candidates=2048,  # Advanced knn parameter
+        collapse_duplicates=True,
     ):
         """
+        collapse_duplicates: chunks whose text is identical (after whitespace normalization) are
+          returned once, as the highest ranked copy. The copies are listed under that chunk's
+          ``duplicates`` (chunk_id, doc_id, docnm_kwd, kb_id, similarity) but do not count towards
+          ``total``, the page, or ``doc_aggs``, so duplicate files cannot crowd out distinct content.
+
         Pagination is neither efficient nor reliable for this retrieval when rerank is enabled because the system must:
           - Retrieve more rerank candidates than the requested page_size.
           - Rerank those records to calculate similarity scores.
@@ -734,6 +740,9 @@ class Dealer:
         post_threshold = 0.0 if vector_similarity_weight <= 0 else similarity_threshold
 
         valid_idx = [int(i) for i in sorted_idx if sim_np[i] >= post_threshold]
+        duplicates_of: dict[int, list[int]] = {}
+        if collapse_duplicates:
+            valid_idx, duplicates_of = self._collapse_duplicate_chunks(sres, valid_idx)
         filtered_count = len(valid_idx)
         ranks["total"] = int(filtered_count)
 
@@ -780,6 +789,17 @@ class Dealer:
                 "mom_id": chunk.get("mom_id", ""),
                 "row_id": chunk.get("row_id()"),
             }
+            if collapse_duplicates:
+                d["duplicates"] = [
+                    {
+                        "chunk_id": sres.ids[j],
+                        "doc_id": sres.field[sres.ids[j]].get("doc_id", ""),
+                        "docnm_kwd": sres.field[sres.ids[j]].get("docnm_kwd", ""),
+                        "kb_id": sres.field[sres.ids[j]].get("kb_id", ""),
+                        "similarity": float(sim_np[j]),
+                    }
+                    for j in duplicates_of.get(i, [])
+                ]
             if id in sres.highlight:
                 d["highlight"] = sres.highlight[id]
             ranks["chunks"].append(d)
@@ -809,6 +829,31 @@ class Dealer:
             ranks["doc_aggs"] = []
 
         return ranks
+
+    @staticmethod
+    def _collapse_duplicate_chunks(sres, idx: list[int]) -> tuple[list[int], dict[int, list[int]]]:
+        """Keep the first (best ranked) chunk of every distinct text.
+
+        ``idx`` is ordered by rank. Returns the kept indices in that order and,
+        for each kept index, the indices of the chunks it stands for. Text is
+        compared after collapsing whitespace; chunks without text are never
+        merged with each other.
+        """
+        kept: list[int] = []
+        duplicates_of: dict[int, list[int]] = {}
+        first_by_text: dict[str, int] = {}
+        for i in idx:
+            text = re.sub(r"\s+", " ", str(sres.field[sres.ids[i]].get("content_with_weight") or "")).strip()
+            if not text:
+                kept.append(i)
+                continue
+            first = first_by_text.get(text)
+            if first is None:
+                first_by_text[text] = i
+                kept.append(i)
+            else:
+                duplicates_of.setdefault(first, []).append(i)
+        return kept, duplicates_of
 
     def sql_retrieval(self, sql, fetch_size=128, format="json"):
         tbl = self.dataStore.sql(sql, fetch_size, format)
