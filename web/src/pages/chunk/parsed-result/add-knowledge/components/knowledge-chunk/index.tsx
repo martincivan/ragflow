@@ -12,6 +12,7 @@ import {
   useGetChunkHighlights,
   useGetSelectedChunk,
   useHandleChunkCardClick,
+  useTargetChunkFromQuery,
   useUpdateChunk,
 } from './hooks';
 
@@ -41,7 +42,12 @@ import { getExtension } from '@/utils/document-util';
 import { LucideArrowBigLeft } from 'lucide-react';
 
 function Chunk() {
-  const [filterChunkIds, setFilterChunkIds] = useState<string[]>([]);
+  const { targetChunkId, clearTargetChunkId } = useTargetChunkFromQuery();
+  // Arriving from a retrieval-testing hit: show only that chunk, because its
+  // position in the full paginated list is unknown.
+  const [filterChunkIds, setFilterChunkIds] = useState<string[]>(
+    targetChunkId ? [targetChunkId] : [],
+  );
   const [selectedChunkIds, setSelectedChunkIds] = useState<string[]>([]);
   const { removeChunk } = useDeleteChunkByIds();
   const {
@@ -54,7 +60,8 @@ function Chunk() {
     handleSetAvailable,
     dataUpdatedAt,
   } = useFetchNextChunkList(true, { chunkIds: filterChunkIds });
-  const { handleChunkCardClick, selectedChunkId } = useHandleChunkCardClick();
+  const { handleChunkCardClick, selectedChunkId } =
+    useHandleChunkCardClick(targetChunkId);
 
   const { t } = useTranslation();
   const { changeChunkTextMode, textMode } = useChangeChunkTextMode();
@@ -113,6 +120,11 @@ function Chunk() {
     },
     [pagination],
   );
+
+  const showAllChunks = useCallback(() => {
+    setFilterChunkIds([]);
+    clearTargetChunkId();
+  }, [clearTargetChunkId]);
 
   const showSelectedChunkWarning = useCallback(() => {
     message.warning(t('message.pleaseSelectChunk'));
@@ -270,6 +282,21 @@ function Chunk() {
                         selectedChunkIds={selectedChunkIds}
                       />
                     </div>
+
+                    {targetChunkId && filterChunkIds.length > 0 && (
+                      <div className="mb-4 flex items-center justify-between gap-4 rounded-lg border-0.5 border-border-button bg-bg-card px-4 py-2.5">
+                        <span className="text-sm text-text-secondary">
+                          {t('chunk.showingRetrievedChunk')}
+                        </span>
+                        <Button
+                          variant="secondary"
+                          size="sm"
+                          onClick={showAllChunks}
+                        >
+                          {t('chunk.showAllChunks')}
+                        </Button>
+                      </div>
+                    )}
 
                     <div className="space-y-4 flex-1 overflow-y-auto min-h-0">
                       {chunkList.map((item) => (
