@@ -54,7 +54,13 @@ function chunk(overrides: Partial<ITestingChunk> = {}): ITestingChunk {
   };
 }
 
-function renderResult(chunks: ITestingChunk[]) {
+type IRetrievalMetaFilter =
+  import('@/interfaces/database/dataset').IRetrievalMetaFilter;
+
+function renderResult(
+  chunks: ITestingChunk[],
+  meta_filter?: IRetrievalMetaFilter,
+) {
   return render(
     <MemoryRouter initialEntries={['/dataset/retrieval/kb-1']}>
       <Routes>
@@ -62,7 +68,7 @@ function renderResult(chunks: ITestingChunk[]) {
           path="/dataset/retrieval/:id"
           element={
             <TestingResult
-              data={{ chunks, doc_aggs: [], total: chunks.length }}
+              data={{ chunks, doc_aggs: [], total: chunks.length, meta_filter }}
               loading={false}
               filterValue={{}}
               handleFilterSubmit={jest.fn()}
@@ -109,5 +115,59 @@ describe('TestingResult', () => {
 
     expect(screen.queryByRole('button')).not.toBeInTheDocument();
     expect(screen.getByText('Retrieved text')).toBeInTheDocument();
+  });
+
+  describe('metadata filter summary', () => {
+    function metaFilter(
+      overrides: Partial<IRetrievalMetaFilter> = {},
+    ): IRetrievalMetaFilter {
+      return {
+        method: 'auto',
+        logic: 'and',
+        conditions: [
+          { key: 'year', op: '=', value: '2026' },
+          { key: 'author', op: 'in', value: ['ann', 'bo'] },
+        ],
+        document_count: 3,
+        ignored: false,
+        ...overrides,
+      };
+    }
+
+    it('shows the conditions the LLM generated and what they matched', () => {
+      renderResult([chunk()], metaFilter());
+
+      expect(screen.getByText('Metadata filter (auto)')).toBeInTheDocument();
+      expect(screen.getByText('year = 2026')).toBeInTheDocument();
+      expect(screen.getByText('author in ann, bo')).toBeInTheDocument();
+      expect(screen.getByText('and')).toBeInTheDocument();
+      expect(screen.getByText('Narrowed to 3 documents')).toBeInTheDocument();
+    });
+
+    it('says so when the filter matched nothing and was dropped', () => {
+      renderResult([chunk()], metaFilter({ ignored: true, document_count: 0 }));
+
+      expect(
+        screen.getByText(
+          'Matched no documents, so the whole dataset was searched.',
+        ),
+      ).toBeInTheDocument();
+    });
+
+    it('reports an empty generation rather than showing nothing', () => {
+      renderResult([], metaFilter({ conditions: [], document_count: 0 }));
+
+      expect(
+        screen.getByText('No conditions were generated.'),
+      ).toBeInTheDocument();
+    });
+
+    it('stays out of the way when no metadata filter ran', () => {
+      renderResult([chunk()]);
+
+      expect(
+        screen.queryByText('Metadata filter (auto)'),
+      ).not.toBeInTheDocument();
+    });
   });
 });
