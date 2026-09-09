@@ -27,6 +27,16 @@ jest.mock('@/utils/authorization-util', () => ({
 jest.mock('@/constants/authorization', () => ({
   Authorization: 'Authorization',
 }));
+// file-util pulls in file-manager-service -> next-request, which calls
+// axios.create() at module scope; the axios mock above has no create().
+jest.mock('@/utils/file-util', () => ({ downloadFileFromBlob: jest.fn() }));
+jest.mock('@/components/ui/message', () => ({
+  __esModule: true,
+  default: { error: jest.fn() },
+}));
+jest.mock('react-i18next', () => ({
+  useTranslation: () => ({ t: (key: string) => key }),
+}));
 
 function mockPreviewer(sheetCount = 2) {
   const makeData = () => ({

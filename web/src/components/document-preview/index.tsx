@@ -14,9 +14,8 @@
  *  limitations under the License.
  */
 
-import { memo } from 'react';
+import { memo, useMemo } from 'react';
 
-import { Images } from '@/constants/common';
 import CSVFileViewer from './csv-preview';
 import { DocPreviewer } from './doc-preview';
 import { EpubPreviewer } from './epub-preview';
@@ -25,7 +24,9 @@ import { ImagePreviewer } from './image-preview';
 import { Md } from './md';
 import PdfPreviewer, { IProps } from './pdf-preview';
 import { PptPreviewer } from './ppt-preview';
+import { PreviewKind, resolvePreviewKind } from './preview-kind';
 import { TxtPreviewer } from './txt-preview';
+import { UnsupportedPreview } from './unsupported-preview';
 import { VideoPreviewer } from './video-preview';
 
 type PreviewProps = {
@@ -33,20 +34,24 @@ type PreviewProps = {
   className?: string;
   url: string;
   positions?: number[][];
+  /** Used by the unsupported-type fallback to name the file and the download. */
+  fileName?: string;
 };
+
 const DocumentPreview = function ({
   fileType,
   className,
+  fileName,
   highlights,
   setWidthAndHeight,
   url,
   positions,
 }: PreviewProps & Partial<IProps>) {
-  const isPdf = fileType === 'pdf';
+  const kind = useMemo(() => resolvePreviewKind(fileType), [fileType]);
 
-  return (
-    <>
-      {isPdf && (
+  switch (kind) {
+    case PreviewKind.Pdf:
+      return (
         <section className="h-full">
           <PdfPreviewer
             className={className}
@@ -55,45 +60,39 @@ const DocumentPreview = function ({
             url={url}
           ></PdfPreviewer>
         </section>
-      )}
-      {['doc', 'docx'].indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Doc:
+      return (
         <section>
           <DocPreviewer className={className} url={url} />
         </section>
-      )}
-      {['txt', 'json'].indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Text:
+      return (
         <section>
           <TxtPreviewer className={className} url={url} />
         </section>
-      )}
-      {Images.indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Image:
+      return (
         <section>
           <ImagePreviewer className={className} url={url} />
         </section>
-      )}
-      {[
-        'mp4',
-        'avi',
-        'mov',
-        'mkv',
-        'wmv',
-        'flv',
-        'mpeg',
-        'mpg',
-        'asf',
-        'rm',
-        'rmvb',
-      ].indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Video:
+      return (
         <section>
           <VideoPreviewer className={className} url={url} />
         </section>
-      )}
-      {['ppt', 'pptx'].indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Ppt:
+      return (
         <section>
           <PptPreviewer className={className} url={url} />
         </section>
-      )}
-      {['xlsx', 'xls'].indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Excel:
+      return (
         <section className="h-full">
           <ExcelCsvPreviewer
             className={className}
@@ -101,23 +100,36 @@ const DocumentPreview = function ({
             positions={positions}
           />
         </section>
-      )}
-      {['csv'].indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Csv:
+      return (
         <section>
           <CSVFileViewer className={className} url={url} />
         </section>
-      )}
-      {['md', 'mdx'].indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Markdown:
+      return (
         <section>
           <Md className={className} url={url} />
         </section>
-      )}
-      {['epub'].indexOf(fileType) > -1 && (
+      );
+    case PreviewKind.Epub:
+      return (
         <section>
           <EpubPreviewer className={className} url={url} />
         </section>
-      )}
-    </>
-  );
+      );
+    default:
+      return (
+        <section className="h-full">
+          <UnsupportedPreview
+            className={className}
+            fileType={fileType}
+            fileName={fileName}
+            url={url}
+          />
+        </section>
+      );
+  }
 };
 export default memo(DocumentPreview);
