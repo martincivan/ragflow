@@ -15,6 +15,7 @@ import {
   useUpdateChunk,
 } from './hooks';
 
+import { ChunkEmptyState } from './components/chunk-empty-state';
 import ChunkResultBar from './components/chunk-result-bar';
 import CheckboxSets from './components/chunk-result-bar/checkbox-sets';
 import DocumentViewSwitch from './components/document-view-switch';
@@ -169,6 +170,11 @@ function Chunk() {
     ],
   );
 
+  const isChunkListFiltered =
+    (searchString?.length ?? 0) > 0 ||
+    available !== undefined ||
+    filterChunkIds.length > 0;
+
   const { highlights, setWidthAndHeight } =
     useGetChunkHighlights(selectedChunkId);
   const selectedChunk = useGetSelectedChunk(selectedChunkId);
@@ -181,18 +187,9 @@ function Chunk() {
     if (name.includes('.')) {
       return getExtension(name);
     }
-    switch (documentInfo?.type) {
-      case 'doc':
-      case 'visual':
-        return documentInfo?.name?.split('.').pop() || documentInfo.type;
-      case 'docx':
-      case 'txt':
-      case 'md':
-      case 'mdx':
-      case 'pdf':
-        return documentInfo.type;
-    }
-    return 'unknown';
+    // No extension to go on: the coarse document type is the only hint, and
+    // anything the previewer cannot map lands on its unsupported fallback.
+    return documentInfo?.type || '';
   }, [documentInfo]);
 
   return (
@@ -272,6 +269,12 @@ function Chunk() {
                     </div>
 
                     <div className="space-y-4 flex-1 overflow-y-auto min-h-0">
+                      {!loading && chunkList.length === 0 && (
+                        <ChunkEmptyState
+                          documentInfo={documentInfo}
+                          filtered={isChunkListFiltered}
+                        />
+                      )}
                       {chunkList.map((item) => (
                         <ChunkCard
                           item={item}

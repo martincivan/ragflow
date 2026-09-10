@@ -55,6 +55,12 @@ export default {
       viewLess: 'View less',
       comingSoon: 'Coming soon',
       download: 'Download',
+      downloadFailed: 'Failed to download the file',
+      previewNotAvailable: 'Preview is not available for this file',
+      previewNotAvailableForType:
+        'Preview is not available for {{type}} files',
+      previewNotAvailableTip:
+        'Download the file to open it with an application on your device.',
       figure: 'Fig.',
       close: 'Close',
       preview: 'Preview',
@@ -994,6 +1000,17 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       questionTip: `If there are given questions, the embedding of the chunk will be based on them.`,
       chunkResult: 'Chunk result',
       chunkResultTip: `View the chunked segments used for embedding and retrieval.`,
+      emptyNotParsed: 'This document has not been parsed yet',
+      emptyNotParsedTip:
+        'Start parsing from the dataset file list to generate chunks.',
+      emptyParsing: 'Parsing is still running ({{progress}}%)',
+      emptyParsingTip: 'Chunks appear here once parsing finishes.',
+      emptyParseFailed: 'Parsing failed, so no chunks were created',
+      emptyParseCancelled: 'Parsing was cancelled, so no chunks were created',
+      emptyNoChunksProduced: 'Parsing finished without producing any chunks',
+      emptyNoChunksProducedTip:
+        'The parser extracted nothing from this file. Scanned PDFs without OCR, empty files, and file types the selected chunk method cannot read all end up here.',
+      parsingLog: 'Parsing log',
       representation: 'Representation',
       representationKinds: {
         knowledge_graph: 'Knowledge graph',

@@ -1,5 +1,6 @@
 import DocumentPreview from '@/components/document-preview';
 import DocumentHeader from '@/components/document-preview/document-header';
+import { DownloadDocumentButton } from '@/components/document-preview/download-document-button';
 import { Segmented, type SegmentedValue } from '@/components/ui/segmented';
 import Representation, {
   type ClickableNode,
@@ -87,11 +88,19 @@ export default function DocumentViewSwitch({
         name={documentInfo?.name ?? ''}
         create_date={documentInfo?.create_date ?? ''}
       >
-        <Segmented
-          options={options}
-          value={viewMode}
-          onChange={handleViewModeChange}
-        />
+        <div className="flex items-center gap-2">
+          <Segmented
+            options={options}
+            value={viewMode}
+            onChange={handleViewModeChange}
+          />
+          <DownloadDocumentButton
+            url={url}
+            fileName={documentInfo?.name}
+            size="icon"
+            showLabel={false}
+          />
+        </div>
       </DocumentHeader>
 
       <div className="flex-1 h-0 min-h-0 overflow-hidden p-5 pt-2.5 [&>section]:h-full [&>section]:min-h-0">
@@ -99,6 +108,7 @@ export default function DocumentViewSwitch({
           <DocumentPreview
             className="h-full min-h-0 overflow-auto [&_img]:max-w-full [&_img]:h-auto"
             fileType={fileType}
+            fileName={documentInfo?.name}
             highlights={highlights}
             setWidthAndHeight={setWidthAndHeight}
             url={url}

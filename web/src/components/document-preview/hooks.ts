@@ -14,16 +14,19 @@
  *  limitations under the License.
  */
 
+import message from '@/components/ui/message';
 import { Authorization } from '@/constants/authorization';
 import { useGetKnowledgeSearchParams } from '@/hooks/route-hook';
 import { useGetPipelineResultSearchParams } from '@/pages/dataflow-result/hooks';
 import api, { restAPIv1 } from '@/utils/api';
 import { getAuthorization } from '@/utils/authorization-util';
+import { downloadFileFromBlob } from '@/utils/file-util';
 import jsPreviewExcel from '@js-preview/excel';
 import { useDebounceFn, useSize } from 'ahooks';
 import axios from 'axios';
 import JSZip from 'jszip';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import * as XLSX from 'xlsx';
 
 // ZIP file header bytes "PK"
@@ -112,6 +115,35 @@ export const useFetchDocument = () => {
   }, []);
 
   return { fetchDocument };
+};
+
+export const useDownloadDocumentFile = (url: string, fileName?: string) => {
+  const { fetchDocument } = useFetchDocument();
+  const { t } = useTranslation();
+  const [downloading, setDownloading] = useState(false);
+
+  const downloadDocumentFile = useCallback(async () => {
+    if (!url) return;
+    setDownloading(true);
+    try {
+      const response = await fetchDocument(url);
+      const contentType = response.headers?.['content-type'];
+      const blob = new Blob([response.data], {
+        type:
+          typeof contentType === 'string' && contentType
+            ? contentType
+            : 'application/octet-stream',
+      });
+      downloadFileFromBlob(blob, fileName || undefined);
+    } catch (e) {
+      console.error('Failed to download document', e);
+      message.error(t('common.downloadFailed'));
+    } finally {
+      setDownloading(false);
+    }
+  }, [fetchDocument, fileName, t, url]);
+
+  return { downloadDocumentFile, downloading };
 };
 
 /**
