@@ -37,7 +37,7 @@ from api.db.services.langfuse_service import TenantLangfuseService
 from api.db.services.llm_service import LLMBundle, resolve_llm_setting
 from api.db.services.user_service import TenantService
 from common import chunk_metadata
-from common.metadata_utils import apply_meta_data_filter, apply_meta_data_scope
+from common.metadata_utils import apply_meta_data_scope
 from api.utils.reference_metadata_utils import (
     enrich_chunks_with_document_metadata,
     resolve_reference_metadata_preferences,
@@ -673,7 +673,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             scoped_doc_ids,
             kb_ids=dialog.kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids),
-            chunk_meta=chunk_metadata.config_for_kbs(kbs, settings.docStoreConn),
+            chunk_meta=chunk_metadata.config_for_kbs(kbs),
         )
         scoped_doc_ids = meta_scope.doc_ids
 
@@ -1742,8 +1742,9 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
     max_tokens = chat_mdl.max_length
     tenant_ids = list(set([kb.tenant_id for kb in kbs]))
 
+    meta_scope = None
     if meta_data_filter:
-        doc_ids = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             meta_data_filter,
             None,
             question,
@@ -1751,7 +1752,9 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
             doc_ids,
             kb_ids=kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
+            chunk_meta=chunk_metadata.config_for_kbs(kbs),
         )
+        doc_ids = meta_scope.doc_ids
 
     vector_similarity_weight = search_config.get("vector_similarity_weight", 0.3)
     try:
@@ -1783,6 +1786,7 @@ async def async_ask(question, kb_ids, tenant_id, chat_llm_name=None, search_conf
         rank_feature=label_question(question, kbs),
         trace_id=search_id,
         rerank_candidates_count=search_config.get("rerank_candidates_count", 100),
+        **(meta_scope.retrieval_kwargs() if meta_scope else {}),
     )
     if include_reference_metadata:
         logging.debug(
@@ -1859,8 +1863,9 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
         rerank_model_config = resolve_model_config(tenant_id, LLMType.RERANK, rerank_id)
         rerank_mdl = LLMBundle(tenant_id, rerank_model_config)
 
+    meta_scope = None
     if meta_data_filter:
-        doc_ids = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             meta_data_filter,
             None,
             question,
@@ -1868,7 +1873,9 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
             doc_ids,
             kb_ids=kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
+            chunk_meta=chunk_metadata.config_for_kbs(kbs),
         )
+        doc_ids = meta_scope.doc_ids
 
     ranks = await settings.retriever.retrieval(
         question=question,
@@ -1885,6 +1892,7 @@ async def gen_mindmap(question, kb_ids, tenant_id, search_config={}):
         rerank_mdl=rerank_mdl,
         rank_feature=label_question(question, kbs),
         rerank_candidates_count=search_config.get("rerank_candidates_count", 100),
+        **(meta_scope.retrieval_kwargs() if meta_scope else {}),
     )
     mindmap = MindMapExtractor(chat_mdl)
     mind_map = await mindmap([c["content_with_weight"] for c in ranks["chunks"]])
@@ -2065,8 +2073,9 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
             doc_scope = [doc_id for doc_id in kwargs["doc_ids"] if doc_id]
     if "doc_ids" in messages[-1]:
         doc_scope = [doc_id for doc_id in messages[-1]["doc_ids"] if doc_id]
+    meta_scope = None
     if dialog.meta_data_filter:
-        doc_scope = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             dialog.meta_data_filter,
             None,
             messages[-1].get("content", ""),
@@ -2074,7 +2083,9 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
             doc_scope,
             kb_ids=dialog.kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids),
+            chunk_meta=chunk_metadata.config_for_kbs(kbs),
         )
+        doc_scope = meta_scope.doc_ids
 
     rag_tools = RAGTools(
         tenant_ids,
@@ -2083,6 +2094,7 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
         kb_ids=dialog.kb_ids,
         web_search=create_web_search_provider(prompt_config) if use_web_search else None,
         meta_data_filter=dialog.meta_data_filter,
+        meta_scope=meta_scope,
         doc_scope=doc_scope,
         empty_response=prompt_config.get("empty_response", ""),
         do_refer=False,

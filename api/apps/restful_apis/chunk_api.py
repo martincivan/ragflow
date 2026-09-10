@@ -59,7 +59,7 @@ from common import settings
 from common.constants import LLMType, ParserType, RetCode, TaskStatus
 from common.doc_store.doc_store_base import OrderByExpr
 from common import chunk_metadata
-from common.metadata_utils import apply_meta_data_scope, convert_conditions, filter_doc_ids_by_metadata
+from common.metadata_utils import apply_meta_data_scope, convert_conditions, filter_doc_ids_by_metadata, needs_llm
 from common.misc_utils import thread_pool_exec
 from common.string_utils import is_content_empty, remove_redundant_spaces
 from common.tag_feature_utils import validate_tag_features
@@ -393,11 +393,11 @@ async def retrieval_test(tenant_id, dataset_id=None):
     # Chunk-level metadata (common.chunk_metadata): active only when every
     # requested dataset opted in and was backfilled on a doc store that carries
     # the fields; otherwise the doc-id path below is used unchanged.
-    chunk_meta = chunk_metadata.config_for_kbs(kbs, settings.docStoreConn)
+    chunk_meta = chunk_metadata.config_for_kbs(kbs)
     chunk_meta_filter, meta_boost, meta_boost_max_total = None, None, chunk_metadata.DEFAULT_MAX_TOTAL
     if meta_data_filter:
         chat_mdl = None
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_id = req.get("chat_id", "")
             if chat_id:
                 chat_model_config = resolve_model_config(tenant_id, LLMType.CHAT, chat_id)

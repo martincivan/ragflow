@@ -2384,7 +2384,7 @@ Returns whether the document engine supports chunk metadata, the dataset's confi
 
 ### Metadata boost in chats
 
-The chat assistant's `meta_data_filter` accepts a `boost` object next to `method`/`manual`/`semi_auto`:
+The chat assistant's `meta_data_filter` accepts a `boost` object next to `method`/`manual`/`semi_auto`. The boost is configured the same way as the filter and independently of it — each has its own `method`:
 
 ```json
 {
@@ -2393,7 +2393,7 @@ The chat assistant's `meta_data_filter` accepts a `boost` object next to `method
     "semi_auto": [{"key": "project", "op": "="}],
     "boost": {
       "method": "semi_auto",
-      "semi_auto": ["phase", "discipline"],
+      "semi_auto": [{"key": "phase", "op": "in", "weight": 0.2}, {"key": "discipline"}],
       "manual": [
         {"key": "flow", "op": "=", "value": "expedition", "weight": 0.15},
         {"key": "expedition_date", "op": "max", "weight": 0.1}
@@ -2405,11 +2405,13 @@ The chat assistant's `meta_data_filter` accepts a `boost` object next to `method
 }
 ```
 
-- `manual`: fixed preferences of the assistant (`=`, `in`, `>`, `<`, `≥`, `≤`, `contains`, `max`, `min`).
-- `method` `auto`/`semi_auto`: the same LLM call that generates the filter tags every condition `"strength": "hard"` (a requirement, applied as a filter) or `"soft"` (a preference, applied as a boost of `auto_weight`). `semi_auto` lists the keys offered for preferences.
-- `max_total` caps the sum of boosts per chunk; the fused similarity is in `[0, 1]`, so weights of 0.05–0.2 are the useful range.
+- `method: "manual"` — only the fixed preferences in `manual` (`=`, `in`, `>`, `<`, `≥`, `≤`, `contains`, `max`, `min`; `max`/`min` prefer the newest/oldest value of a date or numeric field among the candidates).
+- `method: "semi_auto"` — the keys in `semi_auto` are offered to the LLM, which fills in the values from the question; `op` and `weight` may be pinned per key (otherwise the model picks the operator and `auto_weight` applies). A condition on a boost key is always a boost, never a filter.
+- `method: "auto"` — the whole value space is offered; the model tags each condition `"strength": "hard"` (a requirement, applied as a filter when the filter's own method allows it) or `"soft"` (a preference, applied as a boost of `auto_weight`).
+- `manual` preferences apply in every boost mode. A key listed in both the filter's and the boost's `semi_auto` belongs to the filter.
+- The filter and the boost share one LLM call. `max_total` caps the sum of boosts per chunk; the fused similarity is in `[0, 1]`, so weights of 0.05–0.2 are the useful range.
 
-Boosts require chunk metadata to be active on every dataset of the chat; otherwise they are ignored and the filter works exactly as before.
+The same `meta_data_filter` object (with `boost`) works wherever metadata filters are accepted: chat assistants, search apps, the agent Retrieval component, `POST /api/v1/retrieval` and `POST /api/v1/datasets/search`. Boosts require chunk metadata to be active on every dataset of the request; otherwise they are ignored and the filter works exactly as before.
 
 ---
 

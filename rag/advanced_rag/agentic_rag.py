@@ -228,6 +228,7 @@ class RAGTools:
         web_search: WebSearchProvider | None = None,
         meta_data_filter: dict | None = None,
         doc_scope: list[str] | None = None,
+        meta_scope=None,
         user_defined_prompts: dict | None = None,
         empty_response: str = "",
         do_refer: bool | None = True,
@@ -290,6 +291,10 @@ class RAGTools:
         self.web_search = web_search
         self.meta_data_filter = meta_data_filter
         self.doc_scope = list(dict.fromkeys(doc_scope)) if doc_scope is not None else None
+        # Chunk-level metadata filter/boost resolved by the caller
+        # (common.metadata_utils.MetaScope); every retrieval this object or the
+        # harness tools issue carries it — see meta_retrieval_kwargs().
+        self.meta_scope = meta_scope
         self.user_defined_prompts = user_defined_prompts or {}
         self.empty_response = empty_response
         self.do_refer = do_refer
@@ -348,6 +353,11 @@ class RAGTools:
 
     def has_llm(self) -> bool:
         return self.chat_mdl is not None
+
+    def meta_retrieval_kwargs(self) -> dict:
+        """``Dealer.retrieval`` kwargs for the chunk-level metadata scope, if any."""
+        scope = getattr(self, "meta_scope", None)
+        return scope.retrieval_kwargs() if scope is not None and hasattr(scope, "retrieval_kwargs") else {}
 
     def scoped_doc_ids(self, doc_scope: list[str] | None = None) -> list[str] | None:
         if self.doc_scope is None:
@@ -667,6 +677,7 @@ class RAGTools:
             doc_ids=doc_scope,
             rank_feature=label_question(question, self.kbs),
             rerank_candidates_count=rerank_candidates_count,
+            **self.meta_retrieval_kwargs(),
         )
         if not kbinfos:
             return {"chunks": [], "doc_aggs": []}

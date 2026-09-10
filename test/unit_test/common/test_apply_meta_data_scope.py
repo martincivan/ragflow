@@ -24,7 +24,7 @@ from rag.prompts import generator
 
 ACTIVE = cm.ChunkMetadataConfig(enabled=True, fields=["project", "phase", "flow", "expedition_date"], ready=True)
 NOT_READY = cm.ChunkMetadataConfig(enabled=True, fields=["project", "phase"], ready=False)
-METAS = {"project": {"nst": ["d1", "d2"], "bystricka": ["d3"]}, "phase": {"sp": ["d1"], "rp": ["d2", "d3"]}}
+METAS = {"project": {"nst": ["d1", "d2"], "bystricka": ["d3"]}, "phase": {"sp": ["d1"], "rp": ["d2", "d3"]}, "flow": {"expedition": ["d1"], "in": ["d2"]}}
 
 
 def _llm(conditions, logic="and"):
@@ -206,3 +206,66 @@ async def test_apply_meta_data_filter_wrapper_keeps_contract(monkeypatch):
     monkeypatch.setattr(metadata_utils, "_try_meta_pushdown", lambda *a: ["d3"])
     assert await metadata_utils.apply_meta_data_filter({"method": "manual", "manual": [{"key": "project", "op": "=", "value": "bystricka"}]}, METAS, "q", None, None, kb_ids=["kb"]) == ["d3"]
     assert await metadata_utils.apply_meta_data_filter(None, METAS, "q", None, ["base"]) == ["base"]
+
+
+@pytest.mark.asyncio
+async def test_filter_manual_with_boost_auto_treats_every_llm_condition_as_preference(monkeypatch):
+    fake, calls = _llm([{"key": "phase", "op": "=", "value": "rp"}, {"key": "project", "op": "=", "value": "nst", "strength": "hard"}])
+    monkeypatch.setattr(generator, "gen_meta_filter", fake)
+    monkeypatch.setattr(metadata_utils, "_try_meta_pushdown", lambda *a: pytest.fail("doc-id path must not run"))
+    scope = await metadata_utils.apply_meta_data_scope(
+        {"method": "manual", "manual": [{"key": "project", "op": "=", "value": "nst"}], "boost": {"method": "auto", "auto_weight": 0.1}},
+        METAS,
+        "q",
+        object(),
+        None,
+        kb_ids=["kb"],
+        chunk_meta=ACTIVE,
+    )
+    # the manual filter is a chunk filter; the LLM was called for the boost only, over the whole value space
+    assert scope.chunk_filter["conditions"] == [{"key": "project", "op": "=", "value": "nst"}]
+    assert calls[0]["keys"] == ["flow", "phase", "project"] and calls[0]["allow_soft"] is True
+    assert [(b.key, b.weight) for b in scope.boosts] == [("phase", 0.1), ("project", 0.1)]
+
+
+@pytest.mark.asyncio
+async def test_boost_semi_auto_pins_op_and_weight_per_key(monkeypatch):
+    fake, calls = _llm([{"key": "phase", "op": "in", "value": "sp,dsp"}, {"key": "flow", "op": "=", "value": "expedition"}])
+    monkeypatch.setattr(generator, "gen_meta_filter", fake)
+    scope = await metadata_utils.apply_meta_data_scope(
+        {"boost": {"method": "semi_auto", "semi_auto": [{"key": "phase", "op": "in", "weight": 0.25}, "flow"], "auto_weight": 0.05}},
+        METAS,
+        "q",
+        object(),
+        None,
+        kb_ids=["kb"],
+        chunk_meta=ACTIVE,
+    )
+    assert calls[0]["keys"] == ["flow", "phase"] and calls[0]["constraints"] == {"phase": "in"} and calls[0]["allow_soft"] is False
+    assert [(b.key, b.op, b.weight) for b in scope.boosts] == [("phase", "in", 0.25), ("flow", "=", 0.05)]
+    assert scope.chunk_filter is None and scope.doc_ids == []
+
+
+@pytest.mark.asyncio
+async def test_key_in_both_semi_auto_lists_belongs_to_the_filter(monkeypatch):
+    fake, calls = _llm([{"key": "phase", "op": "=", "value": "sp"}])
+    monkeypatch.setattr(generator, "gen_meta_filter", fake)
+    scope = await metadata_utils.apply_meta_data_scope(
+        {"method": "semi_auto", "semi_auto": [{"key": "phase", "op": "="}], "boost": {"method": "semi_auto", "semi_auto": ["phase"]}},
+        METAS,
+        "q",
+        object(),
+        None,
+        kb_ids=["kb"],
+        chunk_meta=ACTIVE,
+    )
+    assert calls[0]["keys"] == ["phase"]
+    assert scope.chunk_filter["conditions"] == [{"key": "phase", "op": "=", "value": "sp"}] and scope.boosts == []
+
+
+def test_needs_llm():
+    assert not metadata_utils.needs_llm(None)
+    assert not metadata_utils.needs_llm({"method": "manual"})
+    assert metadata_utils.needs_llm({"method": "semi_auto"})
+    assert metadata_utils.needs_llm({"method": "manual", "boost": {"method": "auto"}})
+    assert not metadata_utils.needs_llm({"method": "manual", "boost": {"method": "manual", "manual": []}})
