@@ -389,6 +389,16 @@ async def retrieval_test(tenant_id, dataset_id=None):
                 return get_error_data_result(f"The datasets don't own the document {doc_id}")
     metadata_condition = req.get("metadata_condition")
     meta_data_filter = None if "metadata_condition" in request_fields else req.get("meta_data_filter")
+    # The conditions a metadata filter resolved to. For `auto` / `semi_auto`
+    # the LLM writes them, so returning them is the only way a caller can tell
+    # why this particular set of documents was searched.
+    resolved_meta_filter: dict = {}
+
+    def _meta_filter_summary(document_count: int, ignored: bool) -> dict | None:
+        if not resolved_meta_filter:
+            return None
+        return {**resolved_meta_filter, "document_count": document_count, "ignored": ignored}
+
     if meta_data_filter:
         chat_mdl = None
         if meta_data_filter.get("method") in ["auto", "semi_auto"]:
@@ -406,11 +416,18 @@ async def retrieval_test(tenant_id, dataset_id=None):
             doc_ids,
             kb_ids=kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
+            resolved_out=resolved_meta_filter,
         )
     elif metadata_condition:
+        conditions = convert_conditions(metadata_condition)
+        resolved_meta_filter = {
+            "method": "manual",
+            "logic": metadata_condition.get("logic", "and"),
+            "conditions": conditions,
+        }
         filtered_doc_ids = filter_doc_ids_by_metadata(
             kb_ids,
-            convert_conditions(metadata_condition),
+            conditions,
             metadata_condition.get("logic", "and"),
             lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
         )
@@ -420,7 +437,7 @@ async def retrieval_test(tenant_id, dataset_id=None):
         else:
             doc_ids = filtered_doc_ids
         if not doc_ids and metadata_condition.get("conditions"):
-            return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}})
+            return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}, "meta_filter": _meta_filter_summary(0, False)})
         if metadata_condition and not doc_ids:
             doc_ids = ["-999"]
     elif not doc_ids:
@@ -535,6 +552,12 @@ async def retrieval_test(tenant_id, dataset_id=None):
             "kb_id": "dataset_id",
         }
         ranks["chunks"] = [{key_mapping.get(key, key): value for key, value in chunk.items()} for chunk in ranks["chunks"]]
+        # `doc_ids` is None when auto/semi_auto matched nothing: the filter is
+        # then dropped and the search runs unscoped, which is worth saying out
+        # loud rather than leaving the caller to guess.
+        meta_filter_summary = _meta_filter_summary(len([doc_id for doc_id in doc_ids if doc_id != "-999"]) if doc_ids else 0, doc_ids is None)
+        if meta_filter_summary is not None:
+            ranks["meta_filter"] = meta_filter_summary
         return get_result(data=ranks)
     except Exception as e:
         if "not_found" in str(e):

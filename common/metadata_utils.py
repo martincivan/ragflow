@@ -159,6 +159,7 @@ async def apply_meta_data_filter(
     manual_value_resolver: Callable[[dict], dict] | None = None,
     kb_ids: list[str] | None = None,
     metas_loader: Callable[[], dict] | None = None,
+    resolved_out: dict | None = None,
 ) -> list[str] | None:
     """
     Apply metadata filtering rules and return the filtered doc_ids.
@@ -181,6 +182,11 @@ async def apply_meta_data_filter(
     push-down path therefore skips the expensive
     ``get_flatted_meta_by_kbs`` round-trip entirely.
 
+    ``resolved_out`` is filled in with the conditions this call actually ran —
+    ``{"method", "logic", "conditions"}``. For ``auto`` / ``semi_auto`` those
+    are the LLM's, which the caller has no other way to see, so a UI can
+    explain why a given set of documents came back.
+
     Returns:
         list of doc_ids, ["-999"] when manual filters yield no result, or None
         when auto/semi_auto filters return empty.
@@ -193,6 +199,15 @@ async def apply_meta_data_filter(
         return doc_ids
 
     method = meta_data_filter.get("method")
+
+    def _record(conditions: list[dict], logic: str) -> None:
+        if resolved_out is None:
+            return
+        resolved_out.update({"method": method, "logic": logic, "conditions": list(conditions)})
+
+    # Report the method even when it yields nothing, so a caller can tell "the
+    # LLM found nothing to filter on" apart from "no filter was asked for".
+    _record([], meta_data_filter.get("logic", "and"))
 
     # Memoised metadata loader. ``_get_metas`` materialises the dict at most
     # once per call; downstream branches that never reach an in-memory eval
@@ -212,6 +227,7 @@ async def apply_meta_data_filter(
     if method == "auto":
         filters: dict = await gen_meta_filter(chat_mdl, _get_metas(), question)
         logging.debug(f"Metadata filter(auto) generated: {filters}")
+        _record(filters["conditions"], filters.get("logic", "and"))
         doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
         if not doc_ids:
             return None
@@ -234,6 +250,7 @@ async def apply_meta_data_filter(
             if filtered_metas:
                 filters: dict = await gen_meta_filter(chat_mdl, filtered_metas, question, constraints=constraints)
                 logging.debug(f"Metadata filter(semi_auto) generated: {filters}")
+                _record(filters["conditions"], filters.get("logic", "and"))
                 doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
                 if not doc_ids:
                     return None
@@ -242,6 +259,7 @@ async def apply_meta_data_filter(
         if manual_value_resolver:
             filters = [manual_value_resolver(flt) for flt in filters]
         logging.debug(f"Metadata filter(manual): {filters}")
+        _record(filters, meta_data_filter.get("logic", "and"))
         doc_ids.extend(_run_metadata_filter(filters, meta_data_filter.get("logic", "and")))
         if filters and not doc_ids:
             doc_ids = ["-999"]
