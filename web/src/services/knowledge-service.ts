@@ -373,6 +373,12 @@ export const datasetFilter = () => request.get(api.datasetFilter);
 export const updateKb = (datasetId: string, data: Record<string, any>) =>
   request.put(api.updateKb(datasetId), { data });
 
+export const runChunkMetadataBackfill = (datasetId: string) =>
+  request.post(api.chunkMetadataBackfill(datasetId));
+
+export const fetchChunkMetadataStatus = (datasetId: string) =>
+  request.get(api.chunkMetadataStatus(datasetId));
+
 export const runIndex = (datasetId: string, indexType: string) =>
   request.post(api.runIndex(datasetId, indexType));
 

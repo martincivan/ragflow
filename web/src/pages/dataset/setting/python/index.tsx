@@ -20,6 +20,7 @@ import { createContext, useEffect, useState } from 'react';
 import { useForm, useWatch } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { z } from 'zod';
+import { ChunkMetadataFormField } from './chunk-metadata-form-field';
 import { ChunkMethodForm } from './chunk-method-form';
 import ChunkMethodLearnMore from './chunk-method-learn-more';
 import LinkDataSource, {
@@ -75,6 +76,7 @@ export default function DatasetSettings() {
         },
         built_in_metadata: [],
         enable_metadata: false,
+        chunk_metadata: { enabled: false, fields: [], ready: false },
         llm_id: '',
       },
       pipeline_id: '',
@@ -265,6 +267,12 @@ export default function DatasetSettings() {
                     )}
 
                     {parseType === ParseType.BuiltIn && <ChunkMethodForm />}
+
+                    <Divider />
+                    <div className="text-base font-medium text-text-primary">
+                      {t('knowledgeConfiguration.chunkMetadata')}
+                    </div>
+                    <ChunkMetadataFormField />
 
                     {/* <LinkDataPipeline
                     data={pipelineData}

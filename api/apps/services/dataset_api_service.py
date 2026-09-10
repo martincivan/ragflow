@@ -302,6 +302,23 @@ def get_ingestion_summary(dataset_id: str, tenant_id: str):
     }
 
 
+def _guard_chunk_metadata_ready(old_parser_config: dict | None, new_parser_config: dict) -> None:
+    """``chunk_metadata.ready`` is owned by the backfill task (common.chunk_metadata).
+
+    A client may reset it to false (to force a new backfill) but cannot set it
+    to true, and a changed whitelist always resets it: existing chunks do not
+    carry the new fields until the backfill has run.
+    """
+    from common import chunk_metadata
+
+    new_cm = new_parser_config.get(chunk_metadata.CONFIG_KEY)
+    if not isinstance(new_cm, dict):
+        return
+    old_cm = (old_parser_config or {}).get(chunk_metadata.CONFIG_KEY) or {}
+    same_fields = sorted(new_cm.get("fields") or []) == sorted(old_cm.get("fields") or [])
+    new_cm["ready"] = bool(new_cm.get("ready")) and bool(old_cm.get("ready")) and same_fields
+
+
 async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
     """
     Update a dataset.
@@ -359,6 +376,7 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
             req["parser_config"]["parent_child"] = {}
 
         req["parser_config"] = deep_merge(kb.parser_config, req["parser_config"])
+        _guard_chunk_metadata_ready(kb.parser_config, req["parser_config"])
 
     if (chunk_method := req.get("parser_id")) and chunk_method != kb.parser_id:
         if not req.get("parser_config"):

@@ -2304,7 +2304,7 @@ Copies the dataset's whitelisted document metadata onto every existing chunk and
 
 By default a metadata filter is resolved to a list of document IDs, which is capped by the document engine's result window (10 000 on Elasticsearch) and slow for large matches. When `parser_config.chunk_metadata` is enabled on a dataset, the listed keys are stored on each chunk as `meta_<key>_kwd` (plus a typed twin for numbers and dates), and a filter or boost becomes one clause on the chunk query — exact, uncapped, and as fast as the dataset filter itself. New and re-parsed documents get the fields at indexing time; this endpoint writes them onto chunks that already exist. Supported on Elasticsearch and OpenSearch; other engines keep the document-ID path.
 
-Enable it first with [Update dataset](#update-dataset):
+In the web UI the same settings live under **Dataset → Settings → Chunk metadata** (enable, pick the fields, start the backfill, see whether the dataset is ready). Via the API, enable it first with [Update dataset](#update-dataset):
 
 ```json
 {
@@ -2384,7 +2384,7 @@ Returns whether the document engine supports chunk metadata, the dataset's confi
 
 ### Metadata boost in chats
 
-The chat assistant's `meta_data_filter` accepts a `boost` object next to `method`/`manual`/`semi_auto`. The boost is configured the same way as the filter and independently of it — each has its own `method`:
+The chat assistant's `meta_data_filter` accepts a `boost` object next to `method`/`manual`/`semi_auto`. The boost is configured the same way as the filter and independently of it — each has its own `method`. In the web UI it appears as **Metadata boost** below the metadata filter wherever the filter is offered (chat settings, search settings, agent retrieval nodes and tools, dataset retrieval testing):
 
 ```json
 {
