@@ -16,16 +16,10 @@
 
 from types import SimpleNamespace
 
-import infinity.rag_tokenizer
 import pytest
 
 from common import settings
 from rag.nlp import dataset_language, rag_tokenizer
-
-# Slovak/Czech folding is implemented in infinity-sdk; skip on releases
-# that predate it instead of failing on the pinned version.
-_SDK_FOLDS = hasattr(infinity.rag_tokenizer, "fold_diacritics")
-needs_folding_sdk = pytest.mark.skipif(not _SDK_FOLDS, reason="infinity-sdk without Slovak/Czech diacritics folding")
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +31,6 @@ def non_infinity_engine(monkeypatch):
     rag_tokenizer.tokenizer.set_language("English")
 
 
-@needs_folding_sdk
 @pytest.mark.p2
 @pytest.mark.parametrize("language", ["Slovak", "slovak", "Czech", "czech"])
 @pytest.mark.parametrize(
@@ -55,7 +48,6 @@ def test_folding_languages_keep_words_whole(language, text, expected):
     assert rag_tokenizer.tokenize(text) == expected
 
 
-@needs_folding_sdk
 @pytest.mark.p2
 def test_folding_languages_match_unaccented_queries():
     # Users routinely type Slovak without diacritics; index and query
@@ -65,7 +57,6 @@ def test_folding_languages_match_unaccented_queries():
     assert rag_tokenizer.tokenize("požiarna bezpečnosť") == rag_tokenizer.tokenize("poziarna bezpecnost")
 
 
-@needs_folding_sdk
 @pytest.mark.p2
 def test_folding_languages_do_not_stem():
     rag_tokenizer.tokenizer.set_language("Slovak")
@@ -73,7 +64,6 @@ def test_folding_languages_do_not_stem():
     assert rag_tokenizer.tokenize("skoly running") == "skoly running"
 
 
-@needs_folding_sdk
 @pytest.mark.p2
 def test_fine_grained_tokenize_preserves_folded_tokens():
     rag_tokenizer.tokenizer.set_language("Slovak")
@@ -82,7 +72,6 @@ def test_fine_grained_tokenize_preserves_folded_tokens():
     assert rag_tokenizer.fine_grained_tokenize(tks).split() == tks.split()
 
 
-@needs_folding_sdk
 @pytest.mark.p2
 def test_switching_back_to_english_restores_stemming():
     rag_tokenizer.tokenizer.set_language("Slovak")
