@@ -1040,8 +1040,9 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
     from api.db.services.llm_service import LLMBundle
     from api.db.services.search_service import SearchService
     from api.db.services.user_service import UserTenantService
+    from common import chunk_metadata
     from common.constants import LLMType
-    from common.metadata_utils import apply_meta_data_filter
+    from common.metadata_utils import apply_meta_data_scope, needs_llm
     from rag.app.tag import label_question
     from rag.prompts.generator import cross_languages, keyword_extraction
 
@@ -1103,7 +1104,7 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
             similarity_threshold,
             knn_top_k,
         )
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_id = search_config.get("chat_id", "")
             if chat_id:
                 chat_model_config = resolve_model_config(tenant_id, LLMType.CHAT, search_config["chat_id"])
@@ -1112,12 +1113,13 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
     else:
         meta_data_filter = req.get("meta_data_filter") or {}
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
 
+    meta_scope = None
     if meta_data_filter:
-        local_doc_ids = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             meta_data_filter,
             None,
             question,
@@ -1125,7 +1127,9 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
             local_doc_ids,
             kb_ids=[dataset_id],
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs([dataset_id]),
+            chunk_meta=chunk_metadata.config_for_kbs([kb]),
         )
+        local_doc_ids = meta_scope.doc_ids
 
     tenant_ids = []
     tenants = UserTenantService.query(user_id=tenant_id)
@@ -1173,6 +1177,7 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
         rank_feature=labels,
         trace_id=search_id,
         rerank_candidates_count=rerank_candidates_count,
+        **(meta_scope.retrieval_kwargs() if meta_scope else {}),
     )
 
     if use_kg:
@@ -1436,8 +1441,9 @@ async def search_datasets(tenant_id: str, req: dict):
     from api.db.services.llm_service import LLMBundle
     from api.db.services.search_service import SearchService
     from api.db.services.user_service import UserTenantService
+    from common import chunk_metadata
     from common.constants import LLMType
-    from common.metadata_utils import apply_meta_data_filter
+    from common.metadata_utils import apply_meta_data_scope, needs_llm
     from rag.app.tag import label_question
     from rag.prompts.generator import cross_languages, keyword_extraction
 
@@ -1505,7 +1511,7 @@ async def search_datasets(tenant_id: str, req: dict):
             similarity_threshold,
             knn_top_k,
         )
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_id = search_config.get("chat_id", "")
             if chat_id:
                 chat_model_config = resolve_model_config(tenant_id, LLMType.CHAT, search_config["chat_id"])
@@ -1514,13 +1520,14 @@ async def search_datasets(tenant_id: str, req: dict):
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
     else:
         meta_data_filter = req.get("meta_data_filter") or {}
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
 
+    meta_scope = None
     if meta_data_filter:
         logging.debug("Metadata filter applied: %s, question length: %d, chat_mdl=%s", meta_data_filter, len(question), "None" if chat_mdl is None else "configured")
-        local_doc_ids = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             meta_data_filter,
             None,
             question,
@@ -1528,7 +1535,9 @@ async def search_datasets(tenant_id: str, req: dict):
             local_doc_ids,
             kb_ids=kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
+            chunk_meta=chunk_metadata.config_for_kbs(kbs),
         )
+        local_doc_ids = meta_scope.doc_ids
 
     tenant_ids = []
     tenants = UserTenantService.query(user_id=tenant_id)
@@ -1581,6 +1590,7 @@ async def search_datasets(tenant_id: str, req: dict):
         trace_id=search_id,
         must_not=None if req.get("include_knowledge_compilation", True) else {"exists": "compile_kwd"},
         rerank_candidates_count=rerank_candidates_count,
+        **(meta_scope.retrieval_kwargs() if meta_scope else {}),
     )
 
     if use_kg:

@@ -154,8 +154,16 @@ def store_supports(doc_store: Any) -> bool:
     return callable(getattr(doc_store, "update_chunk_metadata", None))
 
 
-def config_for_kbs(kbs: Sequence[Any], doc_store: Any) -> ChunkMetadataConfig | None:
-    """Config usable for a query over ``kbs`` on ``doc_store``, else None."""
+_CURRENT_STORE = object()
+
+
+def config_for_kbs(kbs: Sequence[Any], doc_store: Any = _CURRENT_STORE) -> ChunkMetadataConfig | None:
+    """Config usable for a query over ``kbs`` on ``doc_store`` (default: the
+    configured doc store), else None."""
+    if doc_store is _CURRENT_STORE:
+        from common import settings  # lazy: settings imports the connectors that import this module
+
+        doc_store = getattr(settings, "docStoreConn", None)
     if not store_supports(doc_store) or not kbs:
         return None
     return config_for_datasets([getattr(kb, "parser_config", None) or {} for kb in kbs])
@@ -383,16 +391,30 @@ class BoostCondition:
 
 
 @dataclass
+class BoostKey:
+    """A key offered to the LLM in ``semi_auto`` boost mode; ``op``/``weight``
+    may be pinned per key the way the filter's ``semi_auto`` pins ``op``."""
+
+    key: str
+    op: str | None = None
+    weight: float | None = None
+
+
+@dataclass
 class BoostConfig:
     method: str = "off"  # off | manual | auto | semi_auto
     manual: list[BoostCondition] = field(default_factory=list)
-    semi_auto: list[str] = field(default_factory=list)
+    semi_auto: list[BoostKey] = field(default_factory=list)
     auto_weight: float = DEFAULT_AUTO_WEIGHT
     max_total: float = DEFAULT_MAX_TOTAL
 
     @property
     def uses_llm(self) -> bool:
         return self.method in ("auto", "semi_auto")
+
+    @property
+    def semi_auto_keys(self) -> list[str]:
+        return [b.key for b in self.semi_auto]
 
 
 def _clamp(x: Any, default: float) -> float:
@@ -419,7 +441,16 @@ def parse_boost(raw: Any, keys: Iterable[str] | None = None) -> BoostConfig:
         b = boost_from_dict(item, cfg.auto_weight, allowed)
         if b:
             cfg.manual.append(b)
-    cfg.semi_auto = [k for k in raw.get("semi_auto") or [] if isinstance(k, str) and (allowed is None or k in allowed)]
+    for item in raw.get("semi_auto") or []:
+        if isinstance(item, str):
+            item = {"key": item}
+        if not isinstance(item, dict) or not isinstance(item.get("key"), str) or not item["key"]:
+            continue
+        if allowed is not None and item["key"] not in allowed:
+            continue
+        op = item.get("op") if item.get("op") in BOOST_OPS else None
+        weight = _clamp(item["weight"], cfg.auto_weight) if item.get("weight") not in (None, "") else None
+        cfg.semi_auto.append(BoostKey(key=item["key"], op=op, weight=weight))
     return cfg
 
 

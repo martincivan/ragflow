@@ -158,7 +158,7 @@ def test_parse_boost_defaults_and_validation():
     )
     assert cfg.method == "semi_auto" and cfg.uses_llm
     assert [(b.key, b.op, b.weight) for b in cfg.manual] == [("flow", "=", 0.2), ("expedition_date", "max", 1.0)]
-    assert cfg.semi_auto == ["phase", "discipline"]
+    assert cfg.semi_auto_keys == ["phase", "discipline"]
     assert cfg.auto_weight == 0.1 and cfg.max_total == 0.25
     assert cm.parse_boost(None).method == "off"
     assert cm.parse_boost({"manual": [{"key": "a", "op": "=", "value": "b"}]}).method == "manual"
