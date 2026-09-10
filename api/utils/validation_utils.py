@@ -430,11 +430,31 @@ class AutoMetadataConfig(Base):
 TableColumnRole = Literal["indexing", "metadata", "both"]
 
 
+class ChunkMetadataConfig(Base):
+    """Copy whitelisted document metadata onto chunks (common.chunk_metadata).
+
+    ``ready`` is owned by the backfill task; a client may reset it to false to
+    force a new backfill but cannot set it to true.
+    """
+
+    enabled: Annotated[bool, Field(default=False)]
+    fields: Annotated[list[str], Field(default_factory=list)]
+    ready: Annotated[bool, Field(default=False)]
+
+    @field_validator("fields", mode="after")
+    @classmethod
+    def validate_field_names(cls, value: list[str]) -> list[str]:
+        from common.chunk_metadata import validate_fields
+
+        return validate_fields(value)
+
+
 class ParserConfig(Base):
     """Complete parser configuration accepted by dataset APIs."""
 
     model_config = ConfigDict(extra="allow", strict=True)
 
+    chunk_metadata: Annotated[ChunkMetadataConfig | None, Field(default=None)]
     auto_keywords: Annotated[int, Field(default=0, ge=0, le=32)]
     auto_questions: Annotated[int, Field(default=0, ge=0, le=10)]
     chunk_token_num: Annotated[int, Field(default=512, ge=1, le=2048)]
