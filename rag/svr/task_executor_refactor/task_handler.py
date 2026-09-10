@@ -53,6 +53,7 @@ from common.connection_utils import timeout
 from common.misc_utils import thread_pool_exec
 from rag.nlp import search
 from rag.svr.task_executor_refactor.constants import CANVAS_DEBUG_DOC_ID
+from rag.svr.task_executor_refactor.chunk_metadata_service import run_chunk_metadata_backfill
 from rag.svr.task_executor_refactor.chunk_service import ChunkService
 from rag.svr.task_executor_refactor.dataflow_service import BillingHook, DataflowService
 from rag.svr.task_executor_refactor.embedding_service import EmbeddingService
@@ -163,6 +164,7 @@ class TaskHandler:
             "evaluation",
             "reembedding",
             "clone",
+            "chunk_metadata",
         } | STRUCTURE_MERGE_TASK_TYPES and not task_type.startswith("dataflow")
 
     async def handle_task(self) -> None:
@@ -300,6 +302,8 @@ class TaskHandler:
                 await self._run_evaluation()
             elif task_type == "reembedding":
                 await self._run_reembedding()
+            elif task_type == "chunk_metadata":
+                await run_chunk_metadata_backfill(ctx)
             elif task_type == "clone":
                 await self._run_clone()
             else:

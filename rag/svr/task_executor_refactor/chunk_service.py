@@ -33,7 +33,7 @@ from timeit import default_timer as timer
 from typing import Any, Dict, List
 
 import xxhash
-from common import settings
+from common import chunk_metadata, settings
 from common.connection_utils import timeout
 from common.constants import PAGERANK_FLD, TAG_FLD
 from common.misc_utils import thread_pool_exec
@@ -216,12 +216,37 @@ class ChunkService:
         tags_applied = [d for d in docs if d.get(TAG_FLD)]
         self._task_context.recording_context.record("tags_applied", tags_applied)
 
+        # Document metadata on chunks (common.chunk_metadata). Stamped last so
+        # metadata written by generate_metadata above is already in the doc-meta
+        # index when it is read back here.
+        self._stamp_chunk_metadata(docs)
+
         # Record final chunks
         self._task_context.recording_context.record("final_chunks", docs)
         final_chunk_ids = [c.get("id") for c in docs if isinstance(c, dict) and "id" in c]
         self._task_context.recording_context.record("final_chunk_ids_count", len(final_chunk_ids))
 
         return docs
+
+    def _stamp_chunk_metadata(self, docs: List[Dict]) -> None:
+        """Copy the dataset's whitelisted metadata keys onto every chunk."""
+        ctx = self._task_context
+        cfg = chunk_metadata.parse_config(ctx.kb_parser_config)
+        if not docs or cfg is None or not cfg.enabled or not chunk_metadata.store_supports(settings.docStoreConn):
+            return
+        try:
+            from api.db.services.doc_metadata_service import DocMetadataService
+
+            meta = DocMetadataService.get_document_metadata(ctx.doc_id)
+        except Exception:
+            logging.exception("Reading document metadata for chunk stamping failed for doc %s", ctx.doc_id)
+            return
+        fields = chunk_metadata.chunk_fields(meta, cfg.fields)
+        if not fields:
+            return
+        for d in docs:
+            d.update(fields)
+        ctx.recording_context.record("chunk_metadata_fields", sorted(fields.keys()))
 
     async def _prepare_docs_and_upload(self, cks: List[Dict]) -> List[Dict]:
         """Prepare docs and upload images to MinIO."""

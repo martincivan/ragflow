@@ -46,6 +46,13 @@ export const formSchema = z
         mineru_table_enable: z.boolean().optional(),
         mineru_lang: z.string().optional(),
         metadata: z.any().optional(),
+        chunk_metadata: z
+          .object({
+            enabled: z.boolean().optional(),
+            fields: z.array(z.string()).optional(),
+            ready: z.boolean().optional(),
+          })
+          .optional(),
         built_in_metadata: z
           .array(
             z.object({

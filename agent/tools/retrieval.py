@@ -22,7 +22,8 @@ from abc import ABC
 from agent.tools.base import ToolParamBase, ToolBase, ToolMeta
 from common.constants import LLMType
 from api.db.services.doc_metadata_service import DocMetadataService
-from common.metadata_utils import apply_meta_data_filter
+from common import chunk_metadata
+from common.metadata_utils import apply_meta_data_scope, needs_llm
 from api.db.services.knowledgebase_service import KnowledgebaseService, validate_dataset_embedding_models
 from api.db.services.llm_service import LLMBundle
 from api.db.services.memory_service import MemoryService
@@ -165,6 +166,7 @@ class Retrieval(ToolBase, ABC):
         query = self.string_format(query_text, vars)
 
         doc_ids = []
+        meta_scope = None
         if self._param.meta_data_filter != {}:
             # Defer the (potentially expensive) metadata table load — manual
             # filters served by ES push-down never need it. The loader is
@@ -173,12 +175,12 @@ class Retrieval(ToolBase, ABC):
                 return DocMetadataService.get_flatted_meta_by_kbs(kb_ids)
 
             chat_mdl = None
-            if self._param.meta_data_filter.get("method") in ["auto", "semi_auto"]:
+            if needs_llm(self._param.meta_data_filter):
                 tenant_id = self._canvas.get_tenant_id()
                 chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
                 chat_mdl = LLMBundle(tenant_id, chat_model_config)
 
-            doc_ids = await apply_meta_data_filter(
+            meta_scope = await apply_meta_data_scope(
                 self._param.meta_data_filter,
                 None,
                 query,
@@ -187,7 +189,9 @@ class Retrieval(ToolBase, ABC):
                 self._resolve_manual_filter if self._param.meta_data_filter.get("method") == "manual" else None,
                 kb_ids=kb_ids,
                 metas_loader=_load_metas,
+                chunk_meta=chunk_metadata.config_for_kbs(kbs),
             )
+            doc_ids = meta_scope.doc_ids
 
         if self._param.cross_languages:
             query = await cross_languages(kbs[0].tenant_id, None, query, self._param.cross_languages)
@@ -209,6 +213,9 @@ class Retrieval(ToolBase, ABC):
                 rerank_mdl=rerank_mdl,
                 rank_feature=label_question(query, kbs),
                 rerank_candidates_count=self._param.rerank_candidates_count,
+                meta_filter=meta_scope.chunk_filter if meta_scope else None,
+                meta_boost=meta_scope.boosts if meta_scope else None,
+                meta_boost_max_total=meta_scope.boost_max_total if meta_scope else 0.3,
             )
             if self.check_if_canceled("Retrieval processing"):
                 return

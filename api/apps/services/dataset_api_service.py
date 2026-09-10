@@ -302,6 +302,23 @@ def get_ingestion_summary(dataset_id: str, tenant_id: str):
     }
 
 
+def _guard_chunk_metadata_ready(old_parser_config: dict | None, new_parser_config: dict) -> None:
+    """``chunk_metadata.ready`` is owned by the backfill task (common.chunk_metadata).
+
+    A client may reset it to false (to force a new backfill) but cannot set it
+    to true, and a changed whitelist always resets it: existing chunks do not
+    carry the new fields until the backfill has run.
+    """
+    from common import chunk_metadata
+
+    new_cm = new_parser_config.get(chunk_metadata.CONFIG_KEY)
+    if not isinstance(new_cm, dict):
+        return
+    old_cm = (old_parser_config or {}).get(chunk_metadata.CONFIG_KEY) or {}
+    same_fields = sorted(new_cm.get("fields") or []) == sorted(old_cm.get("fields") or [])
+    new_cm["ready"] = bool(new_cm.get("ready")) and bool(old_cm.get("ready")) and same_fields
+
+
 async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
     """
     Update a dataset.
@@ -359,6 +376,7 @@ async def update_dataset(tenant_id: str, dataset_id: str, req: dict):
             req["parser_config"]["parent_child"] = {}
 
         req["parser_config"] = deep_merge(kb.parser_config, req["parser_config"])
+        _guard_chunk_metadata_ready(kb.parser_config, req["parser_config"])
 
     if (chunk_method := req.get("parser_id")) and chunk_method != kb.parser_id:
         if not req.get("parser_config"):
@@ -1037,8 +1055,9 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
     from api.db.services.llm_service import LLMBundle
     from api.db.services.search_service import SearchService
     from api.db.services.user_service import UserTenantService
+    from common import chunk_metadata
     from common.constants import LLMType
-    from common.metadata_utils import apply_meta_data_filter
+    from common.metadata_utils import apply_meta_data_scope, needs_llm
     from rag.app.tag import label_question
     from rag.prompts.generator import cross_languages, keyword_extraction
 
@@ -1100,7 +1119,7 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
             similarity_threshold,
             knn_top_k,
         )
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_id = search_config.get("chat_id", "")
             if chat_id:
                 chat_model_config = resolve_model_config(tenant_id, LLMType.CHAT, search_config["chat_id"])
@@ -1109,12 +1128,13 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
     else:
         meta_data_filter = req.get("meta_data_filter") or {}
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
 
+    meta_scope = None
     if meta_data_filter:
-        local_doc_ids = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             meta_data_filter,
             None,
             question,
@@ -1122,7 +1142,9 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
             local_doc_ids,
             kb_ids=[dataset_id],
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs([dataset_id]),
+            chunk_meta=chunk_metadata.config_for_kbs([kb]),
         )
+        local_doc_ids = meta_scope.doc_ids
 
     tenant_ids = []
     tenants = UserTenantService.query(user_id=tenant_id)
@@ -1170,6 +1192,7 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
         rank_feature=labels,
         trace_id=search_id,
         rerank_candidates_count=rerank_candidates_count,
+        **(meta_scope.retrieval_kwargs() if meta_scope else {}),
     )
 
     if use_kg:
@@ -1428,8 +1451,9 @@ async def search_datasets(tenant_id: str, req: dict):
     from api.db.services.llm_service import LLMBundle
     from api.db.services.search_service import SearchService
     from api.db.services.user_service import UserTenantService
+    from common import chunk_metadata
     from common.constants import LLMType
-    from common.metadata_utils import apply_meta_data_filter
+    from common.metadata_utils import apply_meta_data_scope, needs_llm
     from rag.app.tag import label_question
     from rag.prompts.generator import cross_languages, keyword_extraction
 
@@ -1497,7 +1521,7 @@ async def search_datasets(tenant_id: str, req: dict):
             similarity_threshold,
             knn_top_k,
         )
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_id = search_config.get("chat_id", "")
             if chat_id:
                 chat_model_config = resolve_model_config(tenant_id, LLMType.CHAT, search_config["chat_id"])
@@ -1506,13 +1530,14 @@ async def search_datasets(tenant_id: str, req: dict):
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
     else:
         meta_data_filter = req.get("meta_data_filter") or {}
-        if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+        if needs_llm(meta_data_filter):
             chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
 
+    meta_scope = None
     if meta_data_filter:
         logging.debug("Metadata filter applied: %s, question length: %d, chat_mdl=%s", meta_data_filter, len(question), "None" if chat_mdl is None else "configured")
-        local_doc_ids = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             meta_data_filter,
             None,
             question,
@@ -1520,7 +1545,9 @@ async def search_datasets(tenant_id: str, req: dict):
             local_doc_ids,
             kb_ids=kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
+            chunk_meta=chunk_metadata.config_for_kbs(kbs),
         )
+        local_doc_ids = meta_scope.doc_ids
 
     tenant_ids = []
     tenants = UserTenantService.query(user_id=tenant_id)
@@ -1573,6 +1600,7 @@ async def search_datasets(tenant_id: str, req: dict):
         trace_id=search_id,
         must_not=None if req.get("include_knowledge_compilation", True) else {"exists": "compile_kwd"},
         rerank_candidates_count=rerank_candidates_count,
+        **(meta_scope.retrieval_kwargs() if meta_scope else {}),
     )
 
     if use_kg:
@@ -5800,3 +5828,48 @@ async def clear_wiki(dataset_id: str, tenant_id: str):
         deleted["file_commit_history"] = False
 
     return True, {"deleted": deleted}
+
+
+def run_chunk_metadata_backfill(dataset_id: str, tenant_id: str):
+    """Queue the dataset-wide copy of document metadata onto chunks.
+
+    See ``common.chunk_metadata``. Requires ``parser_config.chunk_metadata.enabled``
+    with a non-empty whitelist; sets ``ready`` when the task completes.
+    """
+    from common import chunk_metadata
+
+    if not dataset_id:
+        return False, 'Lack of "Dataset ID"'
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return False, "no authorization"
+    ok, kb = KnowledgebaseService.get_by_id(dataset_id)
+    if not ok:
+        return False, "Invalid Dataset ID"
+    cfg = chunk_metadata.parse_config(kb.parser_config)
+    if cfg is None or not cfg.enabled or not cfg.fields:
+        return False, "parser_config.chunk_metadata must be enabled with at least one field"
+    if not chunk_metadata.store_supports(settings.docStoreConn):
+        return False, f"The document engine ({type(settings.docStoreConn).__name__}) does not support chunk metadata fields"
+
+    documents, _ = DocumentService.get_by_kb_id(kb_id=dataset_id, page_number=1, items_per_page=1, orderby="create_time", desc=False, keywords="", run_status=[], types=[], suffix=[])
+    if not documents:
+        return False, f"No documents in Dataset {dataset_id}"
+
+    task_id = queue_raptor_o_graphrag_tasks(sample_doc=documents[0], ty="chunk_metadata", priority=0, fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID)
+    return True, {"task_id": task_id, "fields": cfg.fields}
+
+
+def chunk_metadata_status(dataset_id: str, tenant_id: str):
+    from common import chunk_metadata
+
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return False, "no authorization"
+    ok, kb = KnowledgebaseService.get_by_id(dataset_id)
+    if not ok:
+        return False, "Invalid Dataset ID"
+    cfg = chunk_metadata.parse_config(kb.parser_config)
+    return True, {
+        "supported": chunk_metadata.store_supports(settings.docStoreConn),
+        "config": cfg.to_dict() if cfg else None,
+        "active": bool(cfg and cfg.active and chunk_metadata.store_supports(settings.docStoreConn)),
+    }

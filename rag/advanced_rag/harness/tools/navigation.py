@@ -541,6 +541,7 @@ async def _content_recall_docs(tools, query: str, doc_scope: list[str] | None = 
             doc_ids=doc_scope,
             aggs=True,
             highlight=False,
+            **(getattr(tools, "meta_retrieval_kwargs", dict)()),
         )
     except Exception:
         _LOG.exception("[Dataset navigation] content-recall retrieval failed")

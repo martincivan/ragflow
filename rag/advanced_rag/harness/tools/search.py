@@ -110,6 +110,12 @@ def _normalize(kbinfos: dict, tenant_ids: list[str] | str | None) -> dict:
     return kbinfos
 
 
+def _meta_kwargs(tools) -> dict:
+    """Chunk-level metadata filter/boost of the owning RAGTools, if any."""
+    fn = getattr(tools, "meta_retrieval_kwargs", None)
+    return fn() if callable(fn) else {}
+
+
 async def hybrid_search(
     tools, query: str, kb_ids: list[str] | None = None, top_n: int | None = None, doc_scope: list[str] | None = None, keywords: str = "", retrieval_query: str = "", use_compiled: bool = False
 ) -> dict:
@@ -170,6 +176,7 @@ async def hybrid_search(
         doc_ids=doc_scope,
         must_not={"exists": "compile_kwd"},  # plain retrieval = document chunks only; compiled products have their own tools
         rerank_candidates_count=rerank_candidates_count,
+        **_meta_kwargs(tools),
     )
     kbinfos = _normalize(kbinfos, tools.tenant_ids)
     # Preserve the RAW retrieved chunks in the central memory store BEFORE any
@@ -235,6 +242,7 @@ async def vector_search(tools, query: str, kb_ids: list[str] | None = None, top_
         doc_ids=doc_scope,
         must_not={"exists": "compile_kwd"},
         rerank_candidates_count=rerank_candidates_count,
+        **_meta_kwargs(tools),
     )
     kbinfos = _normalize(kbinfos, tools.tenant_ids)
     try:
@@ -272,6 +280,7 @@ async def bm25_search(tools, query: str, kb_ids: list[str] | None = None, top_n:
         doc_ids=doc_scope,
         must_not={"exists": "compile_kwd"},
         rerank_candidates_count=rerank_candidates_count,
+        **_meta_kwargs(tools),
     )
     kbinfos = _normalize(kbinfos, tools.tenant_ids)
     try:

@@ -510,7 +510,7 @@ async def rank_memories_async(chat_mdl, goal: str, sub_goal: str, tool_call_summ
     return re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
 
 
-async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: dict = None, descriptions: dict = None) -> dict:
+async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: dict = None, descriptions: dict = None, allow_soft: bool = False) -> dict:
     """Generate metadata filter conditions from a user query using an LLM.
 
     Args:
@@ -521,6 +521,9 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: di
         descriptions: Optional dict of {key: description} explaining what a key means,
             for value spaces whose values are codes the model cannot interpret on
             sight ("SP", "DRP"). Sourced from the dataset's own metadata config.
+        allow_soft: Ask the model to tag each condition "hard" (a requirement,
+            applied as a filter) or "soft" (a preference or inference, applied
+            as a score boost — see common.chunk_metadata). One call serves both.
 
     Returns:
         Dict with "logic" ("and"/"or") and "conditions" list.
@@ -529,7 +532,7 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: di
                 "logic": "and",
                 "conditions": [
                     {"key": "year", "value": "2026", "op": "="},
-                    {"key": "character", "value": "Caocao", "op": "="}
+                    {"key": "character", "value": "Caocao", "op": "=", "strength": "soft"}
                 ]
             }
 
@@ -551,6 +554,7 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: di
         user_question=query,
         constraints=json.dumps(constraints) if constraints else None,
         metadata_descriptions=json.dumps(offered, ensure_ascii=False) if offered else None,
+        allow_soft=allow_soft,
     )
     user_prompt = "Generate filters:"
 
