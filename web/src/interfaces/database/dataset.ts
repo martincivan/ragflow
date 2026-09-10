@@ -202,12 +202,30 @@ export interface ITestingResult {
   labels?: Record<string, number>;
 }
 
+export interface IRetrievalMetaFilterCondition {
+  key: string;
+  op: string;
+  value: unknown;
+}
+
+/** The metadata filter the backend actually ran, LLM-generated ones included. */
+export interface IRetrievalMetaFilter {
+  method: 'auto' | 'semi_auto' | 'manual';
+  logic: string;
+  conditions: IRetrievalMetaFilterCondition[];
+  /** Documents the filter narrowed the search to. */
+  document_count: number;
+  /** The conditions matched nothing, so the search ran unfiltered. */
+  ignored: boolean;
+}
+
 export interface INextTestingResult {
   chunks: ITestingChunk[];
   doc_aggs: ITestingDocument[];
   total: number;
   labels?: Record<string, number>;
   isRuned?: boolean;
+  meta_filter?: IRetrievalMetaFilter;
 }
 
 export type IRenameTag = { fromTag: string; toTag: string };
