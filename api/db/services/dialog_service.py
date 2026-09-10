@@ -36,7 +36,8 @@ from api.db.services.knowledgebase_service import KnowledgebaseService, validate
 from api.db.services.langfuse_service import TenantLangfuseService
 from api.db.services.llm_service import LLMBundle, resolve_llm_setting
 from api.db.services.user_service import TenantService
-from common.metadata_utils import apply_meta_data_filter
+from common import chunk_metadata
+from common.metadata_utils import apply_meta_data_filter, apply_meta_data_scope
 from api.utils.reference_metadata_utils import (
     enrich_chunks_with_document_metadata,
     resolve_reference_metadata_preferences,
@@ -662,8 +663,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
         scoped_doc_ids = [doc_id for doc_id in kwargs["doc_ids"].split(",") if doc_id]
     if "doc_ids" in messages[-1]:
         scoped_doc_ids = [doc_id for doc_id in messages[-1]["doc_ids"] if doc_id]
+    meta_scope = None
     if dialog.meta_data_filter:
-        scoped_doc_ids = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             dialog.meta_data_filter,
             None,
             questions[-1],
@@ -671,7 +673,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
             scoped_doc_ids,
             kb_ids=dialog.kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(dialog.kb_ids),
+            chunk_meta=chunk_metadata.config_for_kbs(kbs, settings.docStoreConn),
         )
+        scoped_doc_ids = meta_scope.doc_ids
 
     # Get chat attachments
     text_attachments_content, image_attachments, image_files = get_files_content(messages[-1], llm_model_config["model_type"])
@@ -769,6 +773,9 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                 rerank_mdl=rerank_mdl,
                 rank_feature=label_question(" ".join(questions), kbs),
                 rerank_candidates_count=rerank_candidates_count,
+                meta_filter=meta_scope.chunk_filter if meta_scope else None,
+                meta_boost=meta_scope.boosts if meta_scope else None,
+                meta_boost_max_total=meta_scope.boost_max_total if meta_scope else 0.3,
             )
             if prompt_config.get("toc_enhance"):
                 cks = await retriever.retrieval_by_toc(" ".join(questions), kbinfos["chunks"], tenant_ids, chat_mdl, dialog.top_n)

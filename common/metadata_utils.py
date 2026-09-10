@@ -15,9 +15,12 @@
 #
 import ast
 import logging
+from dataclasses import dataclass
 from typing import Any, Callable, Dict
 
 import json_repair
+
+from common.metadata_es_filter import UnsupportedMetaFilter
 
 
 def convert_conditions(metadata_condition):
@@ -185,14 +188,89 @@ async def apply_meta_data_filter(
         list of doc_ids, ["-999"] when manual filters yield no result, or None
         when auto/semi_auto filters return empty.
     """
+    scope = await apply_meta_data_scope(
+        meta_data_filter,
+        metas,
+        question,
+        chat_mdl,
+        base_doc_ids,
+        manual_value_resolver,
+        kb_ids=kb_ids,
+        metas_loader=metas_loader,
+        chunk_meta=None,
+    )
+    return scope.doc_ids
+
+
+@dataclass
+class MetaScope:
+    """What a metadata configuration resolved to for one query.
+
+    ``doc_ids`` keeps the contract of ``apply_meta_data_filter`` (a list, or
+    ``["-999"]`` for "manual matched nothing", or ``None`` for "auto matched
+    nothing → no filter"). ``chunk_filter`` carries the conditions that the
+    doc store applies directly on chunk metadata fields instead — see
+    ``common.chunk_metadata`` — and ``boosts`` the weighted preferences that
+    raise a chunk's score without excluding the others.
+    """
+
+    doc_ids: list[str] | None
+    chunk_filter: dict | None = None
+    boosts: list = None  # list[common.chunk_metadata.BoostCondition]
+    boost_max_total: float = 0.3
+
+    def __post_init__(self):
+        if self.boosts is None:
+            self.boosts = []
+
+    @property
+    def chunk_filter_conditions(self) -> list[dict]:
+        return (self.chunk_filter or {}).get("conditions", [])
+
+
+async def apply_meta_data_scope(
+    meta_data_filter: dict | None,
+    metas: dict | None = None,
+    question: str = "",
+    chat_mdl: Any = None,
+    base_doc_ids: list[str] | None = None,
+    manual_value_resolver: Callable[[dict], dict] | None = None,
+    kb_ids: list[str] | None = None,
+    metas_loader: Callable[[], dict] | None = None,
+    chunk_meta=None,
+) -> MetaScope:
+    """``apply_meta_data_filter`` that can also scope on chunk metadata fields
+    and produce score boosts.
+
+    ``chunk_meta`` is the ``common.chunk_metadata.ChunkMetadataConfig`` the
+    queried datasets have in common, or ``None`` when any of them has not
+    opted in / been backfilled — then this is exactly the doc-id path.
+
+    With an active ``chunk_meta``:
+    - hard conditions whose keys are whitelisted and whose operators are
+      chunk-safe are returned in ``chunk_filter`` and never resolved to
+      document ids;
+    - ``meta_data_filter["boost"]`` (manual preferences) and the conditions the
+      LLM tags ``"strength": "soft"`` become ``boosts``;
+    - the LLM is called once for both, with ``allow_soft`` so it can tell a
+      requirement from a preference.
+    """
+    from common import chunk_metadata as cm
     from rag.prompts.generator import gen_meta_filter  # move from the top of the file to avoid circular import
 
     doc_ids = list(base_doc_ids) if base_doc_ids else []
+    scope = MetaScope(doc_ids=doc_ids)
 
     if not meta_data_filter:
-        return doc_ids
+        return scope
 
     method = meta_data_filter.get("method")
+    active_keys = list(chunk_meta.fields) if (chunk_meta is not None and getattr(chunk_meta, "active", False)) else None
+    boost_cfg = cm.parse_boost(meta_data_filter.get("boost"), active_keys) if active_keys is not None else cm.BoostConfig()
+    scope.boost_max_total = boost_cfg.max_total
+    if active_keys is not None:
+        scope.boosts.extend(boost_cfg.manual)
+    allow_soft = active_keys is not None and boost_cfg.uses_llm
 
     # Memoised metadata loader. ``_get_metas`` materialises the dict at most
     # once per call; downstream branches that never reach an in-memory eval
@@ -209,12 +287,48 @@ async def apply_meta_data_filter(
         """Run conditions through ES/Infinity push-down when possible, in-memory otherwise."""
         return filter_doc_ids_by_metadata(kb_ids or [], conditions, logic, _get_metas)
 
+    def _take_soft(conditions: list[dict]) -> list[dict]:
+        """Split LLM output: soft conditions become boosts, hard ones are returned."""
+        hard, soft = cm.split_conditions(conditions)
+        if soft and allow_soft:
+            scope.boosts.extend(cm.boosts_from_conditions(soft, boost_cfg.auto_weight, active_keys))
+        elif soft:
+            # No chunk fields to score on: a preference we cannot honour is
+            # dropped rather than turned into a hard filter the user did not ask for.
+            logging.debug(f"Dropping {len(soft)} soft metadata condition(s): chunk metadata not active")
+        return hard
+
+    def _apply_hard(conditions: list[dict], logic: str, manual: bool) -> bool:
+        """Chunk filter when possible, doc ids otherwise. Returns False when the
+        filter matched nothing in the sense the caller must act on."""
+        if active_keys is not None and cm.is_chunk_filterable(conditions, active_keys):
+            try:
+                cm.build_chunk_filter(conditions, logic)
+            except UnsupportedMetaFilter as e:
+                logging.debug(f"Chunk metadata filter not expressible ({e}); falling back to doc ids")
+            else:
+                scope.chunk_filter = {"conditions": conditions, "logic": logic}
+                logging.debug(f"Metadata filter applied on chunk fields: {scope.chunk_filter}")
+                return True
+        found = _run_metadata_filter(conditions, logic)
+        scope.doc_ids.extend(found)
+        if conditions and not scope.doc_ids:
+            if manual:
+                scope.doc_ids = ["-999"]
+                return True
+            return False
+        return True
+
     if method == "auto":
-        filters: dict = await gen_meta_filter(chat_mdl, _get_metas(), question)
+        filters: dict = await gen_meta_filter(chat_mdl, _get_metas(), question, allow_soft=allow_soft)
         logging.debug(f"Metadata filter(auto) generated: {filters}")
-        doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
-        if not doc_ids:
-            return None
+        hard = _take_soft(filters["conditions"])
+        if hard and not _apply_hard(hard, filters.get("logic", "and"), manual=False):
+            scope.doc_ids = None
+            return scope
+        if not hard and not scope.doc_ids and not scope.chunk_filter:
+            scope.doc_ids = None
+            return scope
     elif method == "semi_auto":
         selected_keys = []
         constraints = {}
@@ -227,27 +341,35 @@ async def apply_meta_data_filter(
                 selected_keys.append(key)
                 if op:
                     constraints[key] = op
+        # Preference keys share the single LLM call; they can only ever come
+        # back as soft conditions because they are offered without constraints.
+        for key in boost_cfg.semi_auto:
+            if key not in selected_keys:
+                selected_keys.append(key)
 
         if selected_keys:
             current_metas = _get_metas()
             filtered_metas = {key: current_metas[key] for key in selected_keys if key in current_metas}
             if filtered_metas:
-                filters: dict = await gen_meta_filter(chat_mdl, filtered_metas, question, constraints=constraints)
+                filters: dict = await gen_meta_filter(chat_mdl, filtered_metas, question, constraints=constraints, allow_soft=allow_soft)
                 logging.debug(f"Metadata filter(semi_auto) generated: {filters}")
-                doc_ids.extend(_run_metadata_filter(filters["conditions"], filters.get("logic", "and")))
-                if not doc_ids:
-                    return None
+                hard = _take_soft(filters["conditions"])
+                if hard and not _apply_hard(hard, filters.get("logic", "and"), manual=False):
+                    scope.doc_ids = None
+                    return scope
+                if not hard and not scope.doc_ids and not scope.chunk_filter:
+                    scope.doc_ids = None
+                    return scope
     elif method == "manual":
         filters = meta_data_filter.get("manual", [])
         if manual_value_resolver:
             filters = [manual_value_resolver(flt) for flt in filters]
         logging.debug(f"Metadata filter(manual): {filters}")
-        doc_ids.extend(_run_metadata_filter(filters, meta_data_filter.get("logic", "and")))
-        if filters and not doc_ids:
-            doc_ids = ["-999"]
+        if filters:
+            _apply_hard(filters, meta_data_filter.get("logic", "and"), manual=True)
 
-    logging.debug(f"apply_meta_data_filter meta_filter={meta_data_filter}, returning doc_ids={doc_ids}")
-    return doc_ids
+    logging.debug(f"apply_meta_data_scope meta_filter={meta_data_filter}, returning doc_ids={scope.doc_ids}, chunk_filter={scope.chunk_filter}, boosts={len(scope.boosts)}")
+    return scope
 
 
 def _try_meta_pushdown(

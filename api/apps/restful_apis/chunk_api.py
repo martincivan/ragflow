@@ -58,7 +58,8 @@ from api.utils.reference_metadata_utils import (
 from common import settings
 from common.constants import LLMType, ParserType, RetCode, TaskStatus
 from common.doc_store.doc_store_base import OrderByExpr
-from common.metadata_utils import apply_meta_data_filter, convert_conditions, filter_doc_ids_by_metadata
+from common import chunk_metadata
+from common.metadata_utils import apply_meta_data_scope, convert_conditions, filter_doc_ids_by_metadata
 from common.misc_utils import thread_pool_exec
 from common.string_utils import is_content_empty, remove_redundant_spaces
 from common.tag_feature_utils import validate_tag_features
@@ -389,6 +390,11 @@ async def retrieval_test(tenant_id, dataset_id=None):
                 return get_error_data_result(f"The datasets don't own the document {doc_id}")
     metadata_condition = req.get("metadata_condition")
     meta_data_filter = None if "metadata_condition" in request_fields else req.get("meta_data_filter")
+    # Chunk-level metadata (common.chunk_metadata): active only when every
+    # requested dataset opted in and was backfilled on a doc store that carries
+    # the fields; otherwise the doc-id path below is used unchanged.
+    chunk_meta = chunk_metadata.config_for_kbs(kbs, settings.docStoreConn)
+    chunk_meta_filter, meta_boost, meta_boost_max_total = None, None, chunk_metadata.DEFAULT_MAX_TOTAL
     if meta_data_filter:
         chat_mdl = None
         if meta_data_filter.get("method") in ["auto", "semi_auto"]:
@@ -398,7 +404,7 @@ async def retrieval_test(tenant_id, dataset_id=None):
             else:
                 chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
             chat_mdl = LLMBundle(tenant_id, chat_model_config)
-        doc_ids = await apply_meta_data_filter(
+        meta_scope = await apply_meta_data_scope(
             meta_data_filter,
             None,
             question,
@@ -406,25 +412,44 @@ async def retrieval_test(tenant_id, dataset_id=None):
             doc_ids,
             kb_ids=kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
+            chunk_meta=chunk_meta,
         )
+        doc_ids = meta_scope.doc_ids
+        chunk_meta_filter, meta_boost, meta_boost_max_total = meta_scope.chunk_filter, meta_scope.boosts, meta_scope.boost_max_total
     elif metadata_condition:
-        filtered_doc_ids = filter_doc_ids_by_metadata(
-            kb_ids,
-            convert_conditions(metadata_condition),
-            metadata_condition.get("logic", "and"),
-            lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
-        )
-        if doc_ids:
-            filtered_doc_id_set = set(filtered_doc_ids)
-            doc_ids = [doc_id for doc_id in doc_ids if doc_id in filtered_doc_id_set]
+        conditions = convert_conditions(metadata_condition)
+        logic = metadata_condition.get("logic", "and")
+        if chunk_meta is not None and chunk_metadata.is_chunk_filterable(conditions, chunk_meta.fields) and not doc_ids:
+            # Applied on the chunk fields directly: no doc-id list, no result-window cap.
+            chunk_meta_filter = {"conditions": conditions, "logic": logic}
+            doc_ids = None
         else:
-            doc_ids = filtered_doc_ids
-        if not doc_ids and metadata_condition.get("conditions"):
-            return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}})
-        if metadata_condition and not doc_ids:
-            doc_ids = ["-999"]
+            filtered_doc_ids = filter_doc_ids_by_metadata(
+                kb_ids,
+                conditions,
+                logic,
+                lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
+            )
+            if doc_ids:
+                filtered_doc_id_set = set(filtered_doc_ids)
+                doc_ids = [doc_id for doc_id in doc_ids if doc_id in filtered_doc_id_set]
+            else:
+                doc_ids = filtered_doc_ids
+            if not doc_ids and metadata_condition.get("conditions"):
+                return get_result(data={"total": 0, "chunks": [], "doc_aggs": {}})
+            if metadata_condition and not doc_ids:
+                doc_ids = ["-999"]
     elif not doc_ids:
         doc_ids = None
+    metadata_boost = req.get("metadata_boost")
+    if metadata_boost:
+        if not isinstance(metadata_boost, (list, dict)):
+            return get_error_data_result("`metadata_boost` should be a list of {key, op, value, weight} or {manual: [...], max_total}")
+        if chunk_meta is None:
+            logging.info("`metadata_boost` ignored: chunk metadata is not active on every dataset of this request")
+        else:
+            boost_cfg = chunk_metadata.parse_boost({"method": "manual", "manual": metadata_boost} if isinstance(metadata_boost, list) else {"method": "manual", **metadata_boost}, chunk_meta.fields)
+            meta_boost, meta_boost_max_total = boost_cfg.manual, boost_cfg.max_total
     try:
         similarity_threshold = float(req.get("similarity_threshold", 0.2))
     except (TypeError, ValueError):
@@ -506,6 +531,9 @@ async def retrieval_test(tenant_id, dataset_id=None):
             trace_id=search_id,
             must_not=None if include_knowledge_compilation else {"exists": "compile_kwd"},
             rerank_candidates_count=rerank_candidates_count,
+            meta_filter=chunk_meta_filter,
+            meta_boost=meta_boost,
+            meta_boost_max_total=meta_boost_max_total,
         )
         if toc_enhance:
             chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)

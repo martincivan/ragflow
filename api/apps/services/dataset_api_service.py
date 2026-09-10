@@ -5800,3 +5800,48 @@ async def clear_wiki(dataset_id: str, tenant_id: str):
         deleted["file_commit_history"] = False
 
     return True, {"deleted": deleted}
+
+
+def run_chunk_metadata_backfill(dataset_id: str, tenant_id: str):
+    """Queue the dataset-wide copy of document metadata onto chunks.
+
+    See ``common.chunk_metadata``. Requires ``parser_config.chunk_metadata.enabled``
+    with a non-empty whitelist; sets ``ready`` when the task completes.
+    """
+    from common import chunk_metadata
+
+    if not dataset_id:
+        return False, 'Lack of "Dataset ID"'
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return False, "no authorization"
+    ok, kb = KnowledgebaseService.get_by_id(dataset_id)
+    if not ok:
+        return False, "Invalid Dataset ID"
+    cfg = chunk_metadata.parse_config(kb.parser_config)
+    if cfg is None or not cfg.enabled or not cfg.fields:
+        return False, "parser_config.chunk_metadata must be enabled with at least one field"
+    if not chunk_metadata.store_supports(settings.docStoreConn):
+        return False, f"The document engine ({type(settings.docStoreConn).__name__}) does not support chunk metadata fields"
+
+    documents, _ = DocumentService.get_by_kb_id(kb_id=dataset_id, page_number=1, items_per_page=1, orderby="create_time", desc=False, keywords="", run_status=[], types=[], suffix=[])
+    if not documents:
+        return False, f"No documents in Dataset {dataset_id}"
+
+    task_id = queue_raptor_o_graphrag_tasks(sample_doc=documents[0], ty="chunk_metadata", priority=0, fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID)
+    return True, {"task_id": task_id, "fields": cfg.fields}
+
+
+def chunk_metadata_status(dataset_id: str, tenant_id: str):
+    from common import chunk_metadata
+
+    if not KnowledgebaseService.accessible(dataset_id, tenant_id):
+        return False, "no authorization"
+    ok, kb = KnowledgebaseService.get_by_id(dataset_id)
+    if not ok:
+        return False, "Invalid Dataset ID"
+    cfg = chunk_metadata.parse_config(kb.parser_config)
+    return True, {
+        "supported": chunk_metadata.store_supports(settings.docStoreConn),
+        "config": cfg.to_dict() if cfg else None,
+        "active": bool(cfg and cfg.active and chunk_metadata.store_supports(settings.docStoreConn)),
+    }

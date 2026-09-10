@@ -26,6 +26,7 @@ import numpy as np
 from common.doc_store.doc_store_base import MatchDenseExpr, FusionExpr, OrderByExpr, DocStoreConnection
 from common.string_utils import remove_redundant_spaces
 from common.float_utils import get_float
+from common.chunk_metadata import boost_scores, fields_for_boosts
 from common.constants import PAGERANK_FLD, TAG_FLD
 from common.tag_feature_utils import parse_tag_features
 from common import settings
@@ -173,6 +174,12 @@ class Dealer:
                 condition[key] = req[key]
         if isinstance(req.get("must_not"), dict):
             condition["must_not"] = req["must_not"]
+        # Chunk-level metadata scope and preferences; only ever set by callers
+        # that verified the doc store supports them (see common.chunk_metadata).
+        if isinstance(req.get("meta_filter"), dict) and req["meta_filter"].get("conditions"):
+            condition["meta_filter"] = req["meta_filter"]
+        if req.get("meta_boost"):
+            condition["meta_boost"] = req["meta_boost"]
         return condition
 
     async def search(self, req, idx_names: str | list[str], kb_ids: list[str], emb_mdl=None, highlight: bool | list | None = None, rank_feature: dict | None = None, min_match: bool = True):
@@ -217,6 +224,10 @@ class Dealer:
                 "row_id()",
             ],
         )
+        # The boost scorer reads the chunk's metadata fields back from the hit.
+        for fld in fields_for_boosts(req.get("meta_boost") or []):
+            if fld not in src:
+                src.append(fld)
         kwds = set([])
 
         qst = req.get("question", "")
@@ -271,7 +282,7 @@ class Dealer:
 
                 # If result is empty, try again with lower min_match
                 if total == 0:
-                    if filters.get("doc_id"):
+                    if filters.get("doc_id") or filters.get("meta_filter"):
                         res = await thread_pool_exec(self.dataStore.search, src, [], filters, [], orderBy, offset, limit, idx_names, kb_ids)
                         total = self.dataStore.get_total(res)
                     else:
@@ -423,6 +434,19 @@ class Dealer:
         ## For rank feature(tag_fea) scores.
         pageranks = np.array([search_res.field[chunk_id].get(PAGERANK_FLD, 0) for chunk_id in search_res.ids], dtype=float)
         return self._tag_feature_scores(query_rfea, search_res) + pageranks
+
+    @staticmethod
+    def _meta_boost_scores(meta_boost, max_total, search_res):
+        """Additive metadata preference per candidate (common.chunk_metadata).
+
+        Added to the fused score after text/vector similarity — and after a
+        reranker model, when there is one — so a configured preference such
+        as "newest expedition" survives every ranking stage.
+        """
+        if not meta_boost or not search_res.ids:
+            return np.zeros(len(search_res.ids), dtype=np.float64)
+        chunks = [search_res.field[chunk_id] for chunk_id in search_res.ids]
+        return np.array(boost_scores(meta_boost, chunks, max_total), dtype=np.float64)
 
     async def _knn_scores(self, sres: "Dealer.SearchResult", idx_names: str | list[str], kb_ids: list[str]) -> dict[str, float]:
         """
@@ -610,6 +634,9 @@ class Dealer:
         rerank_candidates_count=64,
         knn_top_k=1024,  # Advanced knn parameter
         knn_num_candidates=2048,  # Advanced knn parameter
+        meta_filter: dict | None = None,
+        meta_boost: list | None = None,
+        meta_boost_max_total: float = 0.3,
     ):
         """
         Pagination is neither efficient nor reliable for this retrieval when rerank is enabled because the system must:
@@ -647,6 +674,10 @@ class Dealer:
         }
         if isinstance(must_not, dict) and must_not:
             req["must_not"] = must_not
+        if isinstance(meta_filter, dict) and meta_filter.get("conditions"):
+            req["meta_filter"] = meta_filter
+        if meta_boost:
+            req["meta_boost"] = list(meta_boost)
         logging.debug(f"[Search] page={page}, page_size={page_size}, rerank_candidates_count={rerank_candidates_count}")
 
         if isinstance(tenant_ids, str):
@@ -726,6 +757,8 @@ class Dealer:
         if sim_np.size == 0:
             ranks["doc_aggs"] = []
             return ranks
+        if meta_boost:
+            sim_np = sim_np + self._meta_boost_scores(meta_boost, meta_boost_max_total, sres)
 
         # Use stable sort for deterministic ordering when scores are tied
         sorted_idx = np.argsort(sim_np * -1, kind="stable")
