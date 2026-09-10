@@ -218,6 +218,9 @@ def _cache_similar(
 
 
 class RAGTools:
+    # Dataset language for retrieval (see __init__); None means English.
+    language: str | None = None
+
     def __init__(
         self,
         tenant_ids: list[str],
@@ -287,6 +290,12 @@ class RAGTools:
         elif kbs:
             for kb in kbs:
                 _exclude_sql_kb(kb)
+
+        # Dataset language for retrieval; None whenever the datasets disagree,
+        # since one query cannot be tokenized two ways.
+        from rag.nlp import dataset_language  # local: rag.nlp is stubbed in several test modules
+
+        self.language = dataset_language(self.kbs)
 
         self.web_search = web_search
         self.meta_data_filter = meta_data_filter
@@ -678,6 +687,7 @@ class RAGTools:
             rank_feature=label_question(question, self.kbs),
             rerank_candidates_count=rerank_candidates_count,
             **self.meta_retrieval_kwargs(),
+            language=self.language,
         )
         if not kbinfos:
             return {"chunks": [], "doc_aggs": []}

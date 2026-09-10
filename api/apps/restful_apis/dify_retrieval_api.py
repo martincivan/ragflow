@@ -289,6 +289,7 @@ async def retrieval(tenant_id):
             doc_ids=doc_ids,
             rank_feature=label_question(question, [kb]),
             meta_filter=chunk_meta_filter,
+            language=kb.language,
         )
         ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], [kb.tenant_id])
 

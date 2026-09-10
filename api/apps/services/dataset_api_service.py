@@ -1193,6 +1193,7 @@ async def search(dataset_id: str, tenant_id: str, req: dict):
         trace_id=search_id,
         rerank_candidates_count=rerank_candidates_count,
         **(meta_scope.retrieval_kwargs() if meta_scope else {}),
+        language=kb.language,
     )
 
     if use_kg:
@@ -1582,6 +1583,8 @@ async def search_datasets(tenant_id: str, req: dict):
         _question += await keyword_extraction(chat_mdl, _question)
 
     labels = label_question(_question, kbs)
+    from rag.nlp import dataset_language
+
     ranks = await settings.retriever.retrieval(
         _question,
         embd_mdl,
@@ -1601,6 +1604,7 @@ async def search_datasets(tenant_id: str, req: dict):
         must_not=None if req.get("include_knowledge_compilation", True) else {"exists": "compile_kwd"},
         rerank_candidates_count=rerank_candidates_count,
         **(meta_scope.retrieval_kwargs() if meta_scope else {}),
+        language=dataset_language(kbs),
     )
 
     if use_kg:
@@ -4218,6 +4222,7 @@ async def _search_layers_chunk_agg(tenant_id, dataset_id, query, top_k, embd_mdl
             # shrink the pool this strategy depends on.
             rerank_candidates_count=pool,
             must_not={"exists": "compile_kwd"} if _NAV_CHUNK_AGG_EXCLUDE_COMPILED else None,
+            language=kb.language if kb else None,
             **kwargs,
         )
     except Exception:
@@ -4765,6 +4770,7 @@ async def _search_layers_chunks(tenant_id, dataset_id, query, top_k, embd_mdl, k
             # Chunk mode reports raw chunks; compiled rows are served by their
             # own tools, so they must not be attributed to a document here.
             must_not={"exists": "compile_kwd"} if _NAV_CHUNK_AGG_EXCLUDE_COMPILED else None,
+            language=kb.language if kb else None,
             **kwargs,
         )
     except Exception:
