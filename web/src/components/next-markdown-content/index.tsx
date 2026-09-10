@@ -55,6 +55,7 @@ import { getDirAttribute } from '@/utils/text-direction';
 import { useFetchDocumentThumbnailsByIds } from '@/hooks/use-document-request';
 import { useLoadingPause } from '@/hooks/use-loading-pause';
 import { cn } from '@/lib/utils';
+import { ReferenceDuplicates } from '@/components/reference-duplicates';
 import classNames from 'classnames';
 import { omit } from 'lodash';
 import pipe from 'lodash/fp/pipe';
@@ -364,6 +365,7 @@ function MarkdownContent({
                 </Button>
               </div>
             )}
+            <ReferenceDuplicates duplicates={chunkItem?.duplicates} />
           </div>
         </div>
       );
