@@ -615,7 +615,7 @@ class Dealer:
         """
         collapse_duplicates: chunks whose text is identical (after whitespace normalization) are
           returned once, as the highest ranked copy. The copies are listed under that chunk's
-          ``duplicates`` (chunk_id, doc_id, docnm_kwd, kb_id, similarity) but do not count towards
+          ``duplicates`` (chunk_id, document_id, document_name, dataset_id, similarity) but do not count towards
           ``total``, the page, or ``doc_aggs``, so duplicate files cannot crowd out distinct content.
 
         Pagination is neither efficient nor reliable for this retrieval when rerank is enabled because the system must:
@@ -790,12 +790,14 @@ class Dealer:
                 "row_id": chunk.get("row_id()"),
             }
             if collapse_duplicates:
+                # Presentation-only, so it already uses the public field names
+                # and passes through chunks_format() and the REST key mapping.
                 d["duplicates"] = [
                     {
                         "chunk_id": sres.ids[j],
-                        "doc_id": sres.field[sres.ids[j]].get("doc_id", ""),
-                        "docnm_kwd": sres.field[sres.ids[j]].get("docnm_kwd", ""),
-                        "kb_id": sres.field[sres.ids[j]].get("kb_id", ""),
+                        "document_id": sres.field[sres.ids[j]].get("doc_id", ""),
+                        "document_name": sres.field[sres.ids[j]].get("docnm_kwd", ""),
+                        "dataset_id": sres.field[sres.ids[j]].get("kb_id", ""),
                         "similarity": float(sim_np[j]),
                     }
                     for j in duplicates_of.get(i, [])

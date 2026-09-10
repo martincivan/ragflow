@@ -90,8 +90,8 @@ async def test_retrieval_returns_distinct_texts_with_their_duplicates(monkeypatc
     assert ranks["total"] == 2
     assert [c["chunk_id"] for c in ranks["chunks"]] == ["c1", "c3"]
     assert ranks["chunks"][0]["duplicates"] == [
-        {"chunk_id": "c2", "doc_id": "d2", "docnm_kwd": "d2.pdf", "kb_id": "kb", "similarity": 0.8},
-        {"chunk_id": "c4", "doc_id": "d4", "docnm_kwd": "d4.pdf", "kb_id": "kb", "similarity": 0.6},
+        {"chunk_id": "c2", "document_id": "d2", "document_name": "d2.pdf", "dataset_id": "kb", "similarity": 0.8},
+        {"chunk_id": "c4", "document_id": "d4", "document_name": "d4.pdf", "dataset_id": "kb", "similarity": 0.6},
     ]
     assert ranks["chunks"][1]["duplicates"] == []
     # Documents that only contributed duplicates are not counted as distinct hits.
@@ -107,3 +107,13 @@ async def test_retrieval_can_keep_duplicates(monkeypatch):
     assert ranks["total"] == 2
     assert [c["chunk_id"] for c in ranks["chunks"]] == ["c1", "c2"]
     assert "duplicates" not in ranks["chunks"][0]
+
+
+def test_chunks_format_keeps_duplicates_for_chat_and_agent_references():
+    from rag.prompts.generator import chunks_format
+
+    dup = {"chunk_id": "c2", "document_id": "d2", "document_name": "d2.pdf", "dataset_id": "kb", "similarity": 0.8}
+    formatted = chunks_format({"chunks": [{"chunk_id": "c1", "doc_id": "d1", "docnm_kwd": "d1.pdf", "kb_id": "kb", "duplicates": [dup]}, {"chunk_id": "c3"}]})
+
+    assert formatted[0]["duplicates"] == [dup]
+    assert formatted[1]["duplicates"] == []

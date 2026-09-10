@@ -61,6 +61,7 @@ import {
 import styles from './index.module.less';
 import { sanitizeHtmlWithImagesAsText } from '@/utils/dom-util';
 import { SafeImg } from '@/components/safe-img';
+import { ReferenceDuplicates } from '@/components/reference-duplicates';
 
 const getChunkIndex = (match: string) => parseCitationIndex(match);
 
@@ -306,6 +307,7 @@ const MarkdownContent = ({
                 </Button>
               </section>
             )}
+            <ReferenceDuplicates duplicates={chunkItem?.duplicates} />
           </div>
         </div>
       );
