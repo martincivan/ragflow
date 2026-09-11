@@ -22,6 +22,7 @@ import time
 from elastic_transport import ConnectionTimeout
 from elasticsearch_dsl import Q, Search, UpdateByQuery
 
+from common.chunk_metadata import boost_should_clauses, build_chunk_filter
 from common.constants import PAGERANK_FLD, TAG_FLD
 from common.decorator import singleton
 from common.doc_store.doc_store_base import FusionExpr, MatchDenseExpr, MatchExpr, MatchTextExpr, OrderByExpr
@@ -200,7 +201,17 @@ class ESConnection(ESConnectionBase):
 
         bool_query = Q("bool", must=[])
         condition["kb_id"] = knowledgebase_ids
+        # Chunk-level metadata (common.chunk_metadata): a filter is one bool
+        # clause on ``meta_*`` fields, a boost a set of ``should`` clauses that
+        # only add score because the query always has ``must``/``filter``.
+        meta_filter = condition.get("meta_filter")
+        if isinstance(meta_filter, dict) and meta_filter.get("conditions"):
+            bool_query.filter.append(Q(build_chunk_filter(meta_filter["conditions"], meta_filter.get("logic", "and"))))
+        for clause in boost_should_clauses(condition.get("meta_boost") or []):
+            bool_query.should.append(Q(clause))
         for k, v in condition.items():
+            if k in ("meta_filter", "meta_boost"):
+                continue
             if k == "available_int":
                 if v == 0:
                     bool_query.filter.append(Q("range", available_int={"lt": 1}))
@@ -554,6 +565,76 @@ class ESConnection(ESConnectionBase):
                     continue
                 break
         return False
+
+    def update_chunk_metadata(self, index_name: str, knowledgebase_id: str, doc_ids: list[str], set_fields: dict, remove_fields: list[str], refresh: bool = True) -> bool:
+        """Set/remove ``meta_*`` fields on every chunk of the given documents.
+
+        One ``update_by_query`` for any number of documents that share the
+        same metadata (the backfill groups by value), so a dataset is covered
+        in a few hundred requests instead of one per document. Values are
+        passed as params, so lists stay lists — ``update()`` above serialises
+        them to JSON text, which is fine for ``_with_weight`` fields but would
+        break a multi-valued keyword.
+        """
+        if not doc_ids:
+            return True
+        scripts = []
+        params: dict = {}
+        for k, v in set_fields.items():
+            params[f"s_{k}"] = v
+            scripts.append(f"ctx._source['{k}'] = params['s_{k}'];")
+        for k in remove_fields:
+            if k in set_fields:
+                continue
+            scripts.append(f"ctx._source.remove('{k}');")
+        if not scripts:
+            return True
+        ubq = UpdateByQuery(index=index_name).using(self.es).query(Q("bool", filter=[Q("term", kb_id=knowledgebase_id), Q("terms", doc_id=list(doc_ids))]))
+        ubq = ubq.script(source="".join(scripts), params=params)
+        ubq = ubq.params(refresh=refresh, slices="auto", conflicts="proceed", wait_for_completion=True)
+        for _ in range(ATTEMPT_TIME):
+            try:
+                ubq.execute()
+                return True
+            except ConnectionTimeout:
+                self.logger.exception("ES request timeout")
+                time.sleep(3)
+                self._connect()
+                continue
+            except Exception as e:
+                self.logger.error("ESConnection.update_chunk_metadata got exception: " + str(e))
+                break
+        return False
+
+    def iter_doc_metadata(self, index_name: str, knowledgebase_id: str, page_size: int = 1000):
+        """Yield ``(doc_id, meta_fields)`` for every row of a doc-meta index,
+        paged with ``search_after`` so it is not cut at ``max_result_window``."""
+        body = {
+            "size": page_size,
+            "query": {"term": {"kb_id": knowledgebase_id}},
+            "sort": [{"id": "asc"}],
+            "_source": ["id", "meta_fields"],
+        }
+        after = None
+        while True:
+            if after is not None:
+                body["search_after"] = after
+            res = self.es.search(index=index_name, body=body)
+            hits = res.get("hits", {}).get("hits", [])
+            if not hits:
+                return
+            for hit in hits:
+                src = hit.get("_source") or {}
+                meta = src.get("meta_fields")
+                if isinstance(meta, str):
+                    try:
+                        meta = json.loads(meta)
+                    except Exception:
+                        meta = {}
+                yield src.get("id") or hit.get("_id"), meta if isinstance(meta, dict) else {}
+            after = hits[-1].get("sort")
+            if after is None or len(hits) < page_size:
+                return
 
     def delete(self, condition: dict, index_name: str, knowledgebase_id: str) -> int:
         assert "_id" not in condition

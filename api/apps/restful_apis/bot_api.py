@@ -32,7 +32,8 @@ from api.db.services.doc_metadata_service import DocMetadataService
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.llm_service import LLMBundle
 from api.db.services.user_service import TenantService
-from common.metadata_utils import apply_meta_data_filter
+from common import chunk_metadata
+from common.metadata_utils import apply_meta_data_scope, needs_llm
 from api.db.services.search_service import SearchService
 from api.db.services.user_service import UserTenantService
 from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type, resolve_model_config
@@ -389,7 +390,7 @@ async def retrieval_test_embedded(tenant_id=None):
             if detail:
                 search_config = detail.get("search_config", {})
                 meta_data_filter = search_config.get("meta_data_filter", {})
-            if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+            if needs_llm(meta_data_filter):
                 chat_id = search_config.get("chat_id", "")
                 if chat_id:
                     chat_model_config = await thread_pool_exec(resolve_model_config, tenant_id, LLMType.CHAT, chat_id)
@@ -409,12 +410,13 @@ async def retrieval_test_embedded(tenant_id=None):
                 rerank_candidates_count = int(search_config.get("rerank_candidates_count", 100))
         else:
             meta_data_filter = req.get("meta_data_filter") or {}
-            if meta_data_filter.get("method") in ["auto", "semi_auto"]:
+            if needs_llm(meta_data_filter):
                 chat_model_config = await thread_pool_exec(get_tenant_default_model_by_type, tenant_id, LLMType.CHAT)
                 chat_mdl = LLMBundle(tenant_id, chat_model_config)
 
+        meta_scope = None
         if meta_data_filter:
-            local_doc_ids = await apply_meta_data_filter(
+            meta_scope = await apply_meta_data_scope(
                 meta_data_filter,
                 None,
                 _question,
@@ -422,7 +424,9 @@ async def retrieval_test_embedded(tenant_id=None):
                 local_doc_ids,
                 kb_ids=kb_ids,
                 metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
+                chunk_meta=chunk_metadata.config_for_kbs(await thread_pool_exec(KnowledgebaseService.get_by_ids, kb_ids)),
             )
+            local_doc_ids = meta_scope.doc_ids
 
         for kb_id in kb_ids:
             if not await thread_pool_exec(KnowledgebaseService.accessible, kb_id, tenant_id):
@@ -466,6 +470,7 @@ async def retrieval_test_embedded(tenant_id=None):
             highlight=req.get("highlight"),
             rank_feature=labels,
             rerank_candidates_count=rerank_candidates_count,
+            **(meta_scope.retrieval_kwargs() if meta_scope else {}),
         )
         if use_kg:
             default_chat_model = await thread_pool_exec(get_tenant_default_model_by_type, kb.tenant_id, LLMType.CHAT)
