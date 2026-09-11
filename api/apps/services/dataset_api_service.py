@@ -5855,7 +5855,9 @@ def run_chunk_metadata_backfill(dataset_id: str, tenant_id: str):
     if not documents:
         return False, f"No documents in Dataset {dataset_id}"
 
-    task_id = queue_raptor_o_graphrag_tasks(sample_doc=documents[0], ty="chunk_metadata", priority=0, fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID)
+    # ``doc_ids`` is what lets ``TaskService.get_task`` join through a real
+    # document to hydrate tenant_id/kb_id; the sentinel doc_id matches none.
+    task_id = queue_raptor_o_graphrag_tasks(sample_doc=documents[0], ty="chunk_metadata", priority=0, fake_doc_id=GRAPH_RAPTOR_FAKE_DOC_ID, doc_ids=[documents[0]["id"]])
     return True, {"task_id": task_id, "fields": cfg.fields}
 
 
