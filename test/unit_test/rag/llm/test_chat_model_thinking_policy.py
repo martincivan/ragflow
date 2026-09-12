@@ -125,6 +125,43 @@ def test_qwen3_24t_a95b_ignores_disabled_thinking():
     assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is True
 
 
+@pytest.mark.parametrize("env_value", [None, "1"])
+def test_qwen3_chat_template_kwargs_injected_by_default(monkeypatch, env_value):
+    """Unset or LLM_QWEN3_CHAT_TEMPLATE_KWARGS=1 keeps the chat_template_kwargs injection."""
+    if env_value is None:
+        monkeypatch.delenv("LLM_QWEN3_CHAT_TEMPLATE_KWARGS", raising=False)
+    else:
+        monkeypatch.setenv("LLM_QWEN3_CHAT_TEMPLATE_KWARGS", env_value)
+
+    gen_conf, kwargs = _apply_model_family_policies(
+        "Qwen3.6-27B",
+        backend="base",
+        gen_conf={},
+        request_kwargs={},
+    )
+
+    assert gen_conf == {}
+    assert kwargs["extra_body"]["chat_template_kwargs"]["enable_thinking"] is False
+
+
+def test_qwen3_chat_template_kwargs_opt_out(monkeypatch):
+    """LLM_QWEN3_CHAT_TEMPLATE_KWARGS=0 sends no chat_template_kwargs and still strips generic thinking controls."""
+    monkeypatch.setenv("LLM_QWEN3_CHAT_TEMPLATE_KWARGS", "0")
+
+    gen_conf, kwargs = _apply_model_family_policies(
+        "Qwen3.6-27B",
+        backend="base",
+        gen_conf={"thinking": "disabled", "enable_thinking": False, "temperature": 0.2},
+        request_kwargs={"extra_body": {"seed": 1}},
+    )
+
+    assert gen_conf == {"temperature": 0.2}
+    assert "thinking" not in gen_conf
+    assert "enable_thinking" not in gen_conf
+    assert kwargs == {"extra_body": {"seed": 1}}
+    assert "chat_template_kwargs" not in kwargs["extra_body"]
+
+
 @pytest.mark.parametrize(
     "provider",
     [SupportedLiteLLMProvider.Tongyi_Qianwen, SupportedLiteLLMProvider.Dashscope],
