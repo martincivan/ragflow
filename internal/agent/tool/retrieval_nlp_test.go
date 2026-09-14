@@ -509,9 +509,10 @@ type fakeKnowledgebaseLookup struct {
 }
 
 type fakeModelResolver struct {
-	call      string
-	modelName string
-	err       error
+	call          string
+	modelName     string
+	contextLength int
+	err           error
 }
 
 func (f *fakeModelResolver) GetModelConfigByID(
@@ -541,6 +542,22 @@ func (f *fakeModelResolver) GetTenantDefaultModelByType(
 ) (modelModule.ModelDriver, string, *modelModule.APIConfig, int, error) {
 	f.call = "default"
 	return nil, f.modelName, &modelModule.APIConfig{}, 512, f.err
+}
+
+func (f *fakeModelResolver) GetTenantDefaultModelRef(
+	_ context.Context,
+	_ string,
+	_ entity.ModelType,
+) (string, error) {
+	return f.modelName, f.err
+}
+
+func (f *fakeModelResolver) ResolveModelContextLength(
+	_ context.Context,
+	_ string,
+	_ string,
+) (int, error) {
+	return f.contextLength, f.err
 }
 
 func (f fakeKnowledgebaseLookup) GetByIDs(ctx context.Context, db *gorm.DB, ids []string) ([]*entity.Knowledgebase, error) {
