@@ -8293,6 +8293,7 @@ dependencies = [
     { name = "selenium-wire" },
     { name = "setuptools" },
     { name = "slack-sdk" },
+    { name = "snowballstemmer" },
     { name = "socksio" },
     { name = "spacy" },
     { name = "sqlglotrs" },
@@ -8460,6 +8461,7 @@ requires-dist = [
     { name = "selenium-wire", specifier = "==5.1.0" },
     { name = "setuptools", specifier = ">=78.1.1,<81.0.0" },
     { name = "slack-sdk", specifier = "==3.37.0" },
+    { name = "snowballstemmer", specifier = ">=3.1.0,<4.0.0" },
     { name = "socksio", specifier = "==1.0.0" },
     { name = "spacy", specifier = "==3.8.14" },
     { name = "sqlglotrs", specifier = "==0.9.0" },
@@ -9149,11 +9151,11 @@ wheels = [
 
 [[package]]
 name = "snowballstemmer"
-version = "2.2.0"
+version = "3.1.1"
 source = { registry = "https://mirrors.aliyun.com/pypi/simple" }
-sdist = { url = "https://mirrors.aliyun.com/pypi/packages/44/7b/af302bebf22c749c56c9c3e8ae13190b5b5db37a33d9068652e8f73b7089/snowballstemmer-2.2.0.tar.gz", hash = "sha256:09b16deb8547d3412ad7b590689584cd0fe25ec8db3be37788be3810cbf19cb1" }
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/43/f8/0a71edf031f03c40db17503cb8ca78a69a171254e568e7db241b0ab57ea1/snowballstemmer-3.1.1.tar.gz", hash = "sha256:e07bbc54a0d798fe6010a12398422e62a8bfbba95c394fd0956ef58cb4d3e260" }
 wheels = [
-    { url = "https://mirrors.aliyun.com/pypi/packages/ed/dc/c02e01294f7265e63a7315fe086dd1df7dacb9f840a804da846b96d01b96/snowballstemmer-2.2.0-py2.py3-none-any.whl", hash = "sha256:c8e1716e83cc398ae16824e5572ae04e0d9fc2c6b985fb0f900f5f0c96ecba1a" },
+    { url = "https://mirrors.aliyun.com/pypi/packages/4c/07/2ebca9b11fb9be7340a818d8d6f63feaebb146be2c4afbd6061701d6df6e/snowballstemmer-3.1.1-py3-none-any.whl", hash = "sha256:7e207fa178741da09cdee59d3ecec3827ad5f92b1fc5c9ff3755b639f71f5752" },
 ]
 
 [[package]]
