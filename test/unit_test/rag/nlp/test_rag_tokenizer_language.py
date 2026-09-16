@@ -16,16 +16,10 @@
 
 from types import SimpleNamespace
 
-import infinity.rag_tokenizer
 import pytest
 
 from common import settings
 from rag.nlp import dataset_language, rag_tokenizer
-
-# Slovak/Czech stemming and folding are implemented in infinity-sdk; skip on
-# releases that predate them instead of failing on the pinned version.
-_SDK_STEMS_AND_FOLDS = hasattr(infinity.rag_tokenizer, "lower_latin")
-needs_stemming_sdk = pytest.mark.skipif(not _SDK_STEMS_AND_FOLDS, reason="infinity-sdk without Slovak/Czech stemming")
 
 
 @pytest.fixture(autouse=True)
@@ -37,7 +31,6 @@ def non_infinity_engine(monkeypatch):
     rag_tokenizer.tokenizer.set_language("English")
 
 
-@needs_stemming_sdk
 @pytest.mark.p2
 @pytest.mark.parametrize("language", ["Slovak", "slovak", "Czech", "czech"])
 @pytest.mark.parametrize(
@@ -55,7 +48,6 @@ def test_stem_and_fold_languages_keep_words_whole(language, text, expected):
     assert rag_tokenizer.tokenize(text) == expected
 
 
-@needs_stemming_sdk
 @pytest.mark.p2
 def test_stem_and_fold_languages_match_unaccented_queries():
     # Users routinely type Slovak without diacritics; index and query
@@ -65,7 +57,6 @@ def test_stem_and_fold_languages_match_unaccented_queries():
     assert rag_tokenizer.tokenize("požiarna bezpečnosť") == rag_tokenizer.tokenize("poziarna bezpecnost")
 
 
-@needs_stemming_sdk
 @pytest.mark.p2
 @pytest.mark.parametrize(
     ("language", "text"),
@@ -99,7 +90,6 @@ def test_stem_and_fold_languages_leave_english_words_alone():
     assert rag_tokenizer.tokenize("running") == "running"
 
 
-@needs_stemming_sdk
 @pytest.mark.p2
 def test_fine_grained_tokenize_preserves_stemmed_tokens():
     # fine_grained_tokenize runs over tokens tokenize() already stemmed and
@@ -110,7 +100,17 @@ def test_fine_grained_tokenize_preserves_stemmed_tokens():
     assert rag_tokenizer.fine_grained_tokenize(tks).split() == tks.split()
 
 
-@needs_stemming_sdk
+@pytest.mark.p2
+def test_switching_to_an_unmapped_language_does_not_keep_the_slovak_stemmer():
+    # Chinese has no Snowball entry, so the SDK keeps the previous stemmer by
+    # design. That stemmer must still be the English one: Slovak and Czech
+    # stem from their own slot and never replace it.
+    rag_tokenizer.tokenizer.set_language("Slovak")
+    rag_tokenizer.tokenizer.set_language("Chinese")
+
+    assert rag_tokenizer.tokenize("running skoly") == "run skoli"
+
+
 @pytest.mark.p2
 def test_switching_back_to_english_restores_stemming():
     rag_tokenizer.tokenizer.set_language("Slovak")
