@@ -178,6 +178,7 @@ async def hybrid_search(
         rerank_candidates_count=rerank_candidates_count,
         allow_dense_fallback=False,
         **_meta_kwargs(tools),
+        language=getattr(tools, "language", None),
     )
     kbinfos = _normalize(kbinfos, tools.tenant_ids)
     # Preserve the RAW retrieved chunks in the central memory store BEFORE any
@@ -245,6 +246,7 @@ async def vector_search(tools, query: str, kb_ids: list[str] | None = None, top_
         rerank_candidates_count=rerank_candidates_count,
         allow_dense_fallback=False,
         **_meta_kwargs(tools),
+        language=getattr(tools, "language", None),
     )
     kbinfos = _normalize(kbinfos, tools.tenant_ids)
     try:
@@ -284,6 +286,7 @@ async def bm25_search(tools, query: str, kb_ids: list[str] | None = None, top_n:
         rerank_candidates_count=rerank_candidates_count,
         allow_dense_fallback=False,
         **_meta_kwargs(tools),
+        language=getattr(tools, "language", None),
     )
     kbinfos = _normalize(kbinfos, tools.tenant_ids)
     try:
