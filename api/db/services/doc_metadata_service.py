@@ -451,6 +451,44 @@ class DocMetadataService:
     @classmethod
     @DB.connection_context()
     def update_document_metadata(cls, doc_id: str, meta_fields: dict) -> bool:
+        """Write ``meta_fields`` to the doc-meta index and, when the dataset
+        copies metadata onto chunks (common.chunk_metadata), fan the change
+        out to the document's chunks — the same way a rename updates
+        ``docnm_kwd`` on them."""
+        ok = cls._update_document_metadata_store(doc_id, meta_fields)
+        if ok:
+            cls.sync_chunk_metadata(doc_id, meta_fields)
+        return ok
+
+    @classmethod
+    def sync_chunk_metadata(cls, doc_id: str, meta_fields: dict | None) -> bool:
+        """Set/remove the ``meta_*`` fields on every chunk of ``doc_id``.
+
+        Cheap when the dataset has not opted in (one DB read, no doc-store
+        call). Failures are logged, not raised: the doc-meta write already
+        succeeded and the backfill can repair chunks at any time.
+        """
+        from common import chunk_metadata
+
+        if not chunk_metadata.store_supports(settings.docStoreConn):
+            return False
+        try:
+            doc = Document.select(Document, Knowledgebase.tenant_id, Knowledgebase.parser_config).join(Knowledgebase, on=(Knowledgebase.id == Document.kb_id)).where(Document.id == doc_id).first()
+            if not doc:
+                return False
+            cfg = chunk_metadata.parse_config(doc.knowledgebase.parser_config)
+            if cfg is None or not cfg.enabled:
+                return False
+            set_fields = chunk_metadata.chunk_fields(meta_fields or {}, cfg.fields)
+            remove_fields = chunk_metadata.removal_fields(meta_fields or {}, cfg.fields)
+            index_name = f"ragflow_{doc.knowledgebase.tenant_id}"
+            return settings.docStoreConn.update_chunk_metadata(index_name, doc.kb_id, [doc_id], set_fields, remove_fields)
+        except Exception:
+            logging.exception("Chunk metadata sync failed for document %s", doc_id)
+            return False
+
+    @classmethod
+    def _update_document_metadata_store(cls, doc_id: str, meta_fields: dict) -> bool:
         """
         Update document metadata in ES/Infinity.
 
