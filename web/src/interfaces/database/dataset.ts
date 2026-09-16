@@ -2,6 +2,7 @@
 // The data structures returned by the `datasets` interface and `/api/v1/datasets/{id}` are inconsistent.
 
 import { IngestionTaskStatus, RunningStatus } from '@/constants/knowledge';
+import { IDuplicateChunk } from '@/interfaces/database/chat';
 import { DataSourceKey } from '@/pages/user-setting/data-source/constant';
 
 export interface IConnector {
@@ -190,6 +191,7 @@ export interface ITestingChunk {
   positions: number[][];
   doc_type_kwd: string;
   document_metadata?: Record<string, any>;
+  duplicates?: IDuplicateChunk[];
 }
 
 export interface ITestingDocument {
