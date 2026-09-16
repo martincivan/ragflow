@@ -183,7 +183,12 @@ def _apply_model_family_policies(
     gen_conf: dict | None = None,
     request_kwargs: dict | None = None,
 ):
-    """Normalize reasoning controls for a model/provider without mutating inputs."""
+    """Normalize reasoning controls for a model/provider without mutating inputs.
+
+    ``LLM_QWEN3_CHAT_TEMPLATE_KWARGS=0`` stops the Qwen3 policy from injecting
+    ``extra_body.chat_template_kwargs`` on OpenAI-compatible backends; the generic
+    ``thinking``/``enable_thinking`` controls are still stripped from gen_conf.
+    """
     model_name_lower = (model_name or "").lower()
     sanitized_gen_conf = deepcopy(gen_conf) if gen_conf else {}
     sanitized_kwargs = dict(request_kwargs) if request_kwargs else {}
@@ -242,6 +247,9 @@ def _apply_model_family_policies(
             SupportedLiteLLMProvider.Dashscope,
         }:
             sanitized_gen_conf["enable_thinking"] = enable_thinking
+        elif os.environ.get("LLM_QWEN3_CHAT_TEMPLATE_KWARGS", "1") == "0":
+            # Some OpenAI-compatible hosts (e.g. OVH AI Endpoints) reject unknown body fields with HTTP 400.
+            logger.debug("Skipped Qwen3 chat_template_kwargs injection (LLM_QWEN3_CHAT_TEMPLATE_KWARGS=0): backend=%s provider=%s", backend, provider)
         else:
             target = sanitized_gen_conf if backend == "litellm" else sanitized_kwargs
             _merge_qwen_chat_template_kwargs(target, enable_thinking)
