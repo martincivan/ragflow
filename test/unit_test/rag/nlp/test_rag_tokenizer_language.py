@@ -22,10 +22,10 @@ import pytest
 from common import settings
 from rag.nlp import dataset_language, rag_tokenizer
 
-# Slovak/Czech folding is implemented in infinity-sdk; skip on releases
-# that predate it instead of failing on the pinned version.
-_SDK_FOLDS = hasattr(infinity.rag_tokenizer, "fold_diacritics")
-needs_folding_sdk = pytest.mark.skipif(not _SDK_FOLDS, reason="infinity-sdk without Slovak/Czech diacritics folding")
+# Slovak/Czech stemming and folding are implemented in infinity-sdk; skip on
+# releases that predate them instead of failing on the pinned version.
+_SDK_STEMS_AND_FOLDS = hasattr(infinity.rag_tokenizer, "lower_latin")
+needs_stemming_sdk = pytest.mark.skipif(not _SDK_STEMS_AND_FOLDS, reason="infinity-sdk without Slovak/Czech stemming")
 
 
 @pytest.fixture(autouse=True)
@@ -37,27 +37,27 @@ def non_infinity_engine(monkeypatch):
     rag_tokenizer.tokenizer.set_language("English")
 
 
-@needs_folding_sdk
+@needs_stemming_sdk
 @pytest.mark.p2
 @pytest.mark.parametrize("language", ["Slovak", "slovak", "Czech", "czech"])
 @pytest.mark.parametrize(
     ("text", "expected"),
     [
-        ("škola", "skola"),
-        ("daňové priznanie", "danove priznanie"),
-        ("požiarna bezpečnosť", "poziarna bezpecnost"),
-        ("příliš žluťoučký kůň", "prilis zlutoucky kun"),
+        ("škola", "skol"),
+        ("daňové priznanie", "dan priznani"),
+        ("požiarna bezpečnosť", "poziarn bezpecnost"),
+        ("příliš žluťoučký kůň", "prilis zlutouck kun"),
     ],
 )
-def test_folding_languages_keep_words_whole(language, text, expected):
+def test_stem_and_fold_languages_keep_words_whole(language, text, expected):
     rag_tokenizer.tokenizer.set_language(language)
 
     assert rag_tokenizer.tokenize(text) == expected
 
 
-@needs_folding_sdk
+@needs_stemming_sdk
 @pytest.mark.p2
-def test_folding_languages_match_unaccented_queries():
+def test_stem_and_fold_languages_match_unaccented_queries():
     # Users routinely type Slovak without diacritics; index and query
     # tokens must agree either way.
     rag_tokenizer.tokenizer.set_language("Slovak")
@@ -65,31 +65,60 @@ def test_folding_languages_match_unaccented_queries():
     assert rag_tokenizer.tokenize("požiarna bezpečnosť") == rag_tokenizer.tokenize("poziarna bezpecnost")
 
 
-@needs_folding_sdk
+@needs_stemming_sdk
 @pytest.mark.p2
-def test_folding_languages_do_not_stem():
+@pytest.mark.parametrize(
+    ("language", "text"),
+    [
+        ("Slovak", "školy škôl školám školách"),
+        ("Czech", "školy škol školám ve školách"),
+    ],
+)
+def test_stem_and_fold_languages_collapse_case_forms(language, text):
+    # The point of stemming on top of folding: the case forms of "škola"
+    # become one term, which folding alone cannot do.
+    rag_tokenizer.tokenizer.set_language(language)
+    tokens = [tk for tk in rag_tokenizer.tokenize(text).split() if tk != "ve"]
+
+    assert set(tokens) == {"skol"}
+
+
+@pytest.mark.p2
+def test_slovak_strips_the_superlative_prefix():
     rag_tokenizer.tokenizer.set_language("Slovak")
 
-    assert rag_tokenizer.tokenize("skoly running") == "skoly running"
+    assert rag_tokenizer.tokenize("najlepšie lepšie") == "lepsi lepsi"
 
 
-@needs_folding_sdk
 @pytest.mark.p2
-def test_fine_grained_tokenize_preserves_folded_tokens():
+def test_stem_and_fold_languages_leave_english_words_alone():
+    # English lemmatization and Snowball stemming are off, and no Slovak rule
+    # matches this word, so it survives unchanged.
+    rag_tokenizer.tokenizer.set_language("Slovak")
+
+    assert rag_tokenizer.tokenize("running") == "running"
+
+
+@needs_stemming_sdk
+@pytest.mark.p2
+def test_fine_grained_tokenize_preserves_stemmed_tokens():
+    # fine_grained_tokenize runs over tokens tokenize() already stemmed and
+    # folded, so it must not stem them a second time.
     rag_tokenizer.tokenizer.set_language("Slovak")
     tks = rag_tokenizer.tokenize("daňové priznanie k dani z nehnuteľností")
 
     assert rag_tokenizer.fine_grained_tokenize(tks).split() == tks.split()
 
 
-@needs_folding_sdk
+@needs_stemming_sdk
 @pytest.mark.p2
 def test_switching_back_to_english_restores_stemming():
     rag_tokenizer.tokenizer.set_language("Slovak")
     rag_tokenizer.tokenizer.set_language("English")
 
     assert rag_tokenizer.tokenize("running") == "run"
-    # Accented words keep the legacy fragmentation outside folding languages.
+    # Accented words keep the legacy fragmentation outside stem-and-fold
+    # languages.
     assert rag_tokenizer.tokenize("škola") == "š kola"
 
 
