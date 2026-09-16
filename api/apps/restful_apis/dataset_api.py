@@ -1318,6 +1318,37 @@ async def run_index(tenant_id, dataset_id):
         return get_error_data_result(message="Internal server error")
 
 
+@manager.route("/datasets/<dataset_id>/chunk_metadata/backfill", methods=["POST"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+def run_chunk_metadata_backfill(tenant_id, dataset_id):
+    """Copy the dataset's whitelisted document metadata onto every existing
+    chunk (parser_config.chunk_metadata) and mark the dataset ready for
+    chunk-level metadata filters and boosts."""
+    try:
+        success, result = dataset_api_service.run_chunk_metadata_backfill(dataset_id, tenant_id)
+        if success:
+            return get_result(data=result)
+        return get_error_data_result(message=result)
+    except Exception as e:
+        logging.exception(e)
+        return get_error_data_result(message="Internal server error")
+
+
+@manager.route("/datasets/<dataset_id>/chunk_metadata/status", methods=["GET"])  # noqa: F821
+@login_required
+@add_tenant_id_to_kwargs
+def chunk_metadata_status(tenant_id, dataset_id):
+    try:
+        success, result = dataset_api_service.chunk_metadata_status(dataset_id, tenant_id)
+        if success:
+            return get_result(data=result)
+        return get_error_data_result(message=result)
+    except Exception as e:
+        logging.exception(e)
+        return get_error_data_result(message="Internal server error")
+
+
 @manager.route("/datasets/<dataset_id>/index", methods=["GET"])  # noqa: F821
 @login_required
 @add_tenant_id_to_kwargs
