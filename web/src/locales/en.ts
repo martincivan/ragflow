@@ -512,6 +512,15 @@ Example: A 1 KB message with 1024-dim embedding uses ~9 KB. The 5 MB default lim
       chunkMethodTab: 'Chunk method',
       testResults: 'Results',
       openChunkInDocument: 'Open this chunk in the document (new tab)',
+      metadataFilterAuto: 'Metadata filter (auto)',
+      metadataFilterSemiAuto: 'Metadata filter (semi-auto)',
+      metadataFilterManual: 'Metadata filter (manual)',
+      metadataFilterAnd: 'and',
+      metadataFilterOr: 'or',
+      metadataFilterNoConditions: 'No conditions were generated.',
+      metadataFilterIgnored:
+        'Matched no documents, so the whole dataset was searched.',
+      metadataFilterDocumentCount: 'Narrowed to {{count}} documents',
       testSetting: 'Setting',
       retrievalTesting: 'Retrieval testing',
       retrievalTestingDescription:
@@ -987,7 +996,8 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
     chunk: {
       type: 'Type',
       copyChunkId: 'Copy chunk ID',
-      showingRetrievedChunk: 'Showing only the chunk you opened from retrieval testing.',
+      showingRetrievedChunk:
+        'Showing only the chunk you opened from retrieval testing.',
       showAllChunks: 'Show all chunks',
       docType: {
         image: 'Image',
