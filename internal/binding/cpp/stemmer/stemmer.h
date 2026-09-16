@@ -35,6 +35,8 @@ enum Language
     STEM_LANG_SPANISH,
     STEM_LANG_SWEDISH,
     STEM_LANG_TURKISH,
+    STEM_LANG_CZECH,
+    STEM_LANG_SLOVAK, // Not a Snowball algorithm; implemented in slovak_stemmer.h
     STEM_LANG_EOS,
 };
 
@@ -53,6 +55,8 @@ public:
 
 private:
     // int stemLang_; ///< language for stemming
+
+    Language language_; ///< selected language, so Stem() can route Slovak away from Snowball
 
     void* stem_function_; ///< stemming function
 };
