@@ -1050,7 +1050,14 @@ def build_agentic_graph(
             "kbinfos": {"chunks": [], "doc_aggs": []},
             "partial_answer": False,
             "abstain": False,
-            "empty_result": True,
+            # False, not True: nothing has been searched yet at the entry node.
+            # No node ever clears this flag, so seeding it True made
+            # _compose_answer_from_evidence take the no-evidence branch on every
+            # run and return the configured empty_response, however much
+            # evidence the research rounds gathered. An actually empty search is
+            # still caught by direct_search setting it True and by the
+            # `not kbinfos["chunks"]` arm of the same check.
+            "empty_result": False,
             "current_queries": [],
             "research_feedback": [],
             "rag_answer": "",
