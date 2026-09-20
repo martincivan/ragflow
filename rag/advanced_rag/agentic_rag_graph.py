@@ -1800,6 +1800,21 @@ def _looks_like_negative_candidate(cand) -> bool:
     return s in _NEGATIVE_CANDIDATES
 
 
+# The session model reads passages with their chunk ids and ordinals attached and
+# habitually quotes those back into its clues ("doc 23d4…, chunk 1: '…'"). The
+# draft they land in is rendered into the answer prompt as the Research Summary,
+# where every identifier is a token the answer model will cite — and a citation
+# naming anything but an evidence-block number resolves to no chunk, so it reaches
+# the user as literal marker text. Clues keep their words, not their pointers; the
+# SCA verifies candidates through ``slot_evidence`` instead.
+_CLUE_POINTER_RE = re.compile(r"\b(?:docs?|chunks?)\s+(?:[0-9a-f]{8,32}|\d+)\s*[:,]?\s*", flags=re.IGNORECASE)
+
+
+def _strip_internal_pointers(text: str) -> str:
+    """Drop chunk/document pointers from a clue, keeping its quoted content."""
+    return _CLUE_POINTER_RE.sub("", str(text or "")).strip()
+
+
 def _render_slot_draft(slot_table, collected_answer: str | None = None, slot_evidence: dict | None = None) -> str:
     """Render a slot table into a fact-preserving draft for the SCA.
 
@@ -1835,7 +1850,7 @@ def _render_slot_draft(slot_table, collected_answer: str | None = None, slot_evi
             cs = getattr(v, "candidate_strength", None)
             strength = f"{float(cs):.2f}" if isinstance(cs, (int, float)) else "?"
             clues = list(getattr(v, "discovered_clues", None) or [])
-            tail = "; ".join(str(c)[:240] for c in clues[-4:])
+            tail = "; ".join(_strip_internal_pointers(c)[:240] for c in clues[-4:])
             meta = (slot_evidence or {}).get(str(vid), {})
             evidence_ids = meta.get("evidence_ids") or []
             terminal = meta.get("terminal_type")
@@ -2238,6 +2253,12 @@ async def _run_slot_research_pass(tools, question: str, state: AgenticState, ans
         for v in slot_table.unresolved()
     ]
     draft = _render_slot_draft(out_table, collected, slot_evidence=slot_evidence)
+    # The answer prompt gets the same table WITHOUT the evidence ids: it reaches the
+    # answer model as the Research Summary, and "evidence_ids=['a1b2c3d4e5f60718']"
+    # there is read as a citable source — the model then writes [ID:a1b2c3d4e5f60718],
+    # which indexes nothing in the published chunk list. The SCA still verifies
+    # candidates against their passages through ``slot_draft`` / ``slot_evidence``.
+    summary = _render_slot_draft(out_table, collected)
     _LOG.info(
         "[SlotResearch] round done — %d slot(s) filled, unresolved=%d, collected_answer=%s",
         sum(1 for v in getattr(out_table, "state", []) if getattr(v, "candidate", None)),
@@ -2251,7 +2272,7 @@ async def _run_slot_research_pass(tools, question: str, state: AgenticState, ans
         "unresolved_slots": unresolved_slots,
         "slot_evidence": slot_evidence,
         "slot_draft": draft,
-        "rag_answer": draft or (state.get("rag_answer") or ""),
+        "rag_answer": summary or (state.get("rag_answer") or ""),
         "kbinfos": tools.kbinfos,
         "attempted": ledger,
     }
@@ -2393,6 +2414,7 @@ async def _naive_rag(tools, messages: list, gen_conf: dict | None = None):
 
     # Accumulate onto the shared pool so the composed answer can be cited, and so
     # callers reading tools.kbinfos see the same shape as the agentic path.
+    from rag.advanced_rag.harness.chunk_utils import admit_chunk
     from rag.advanced_rag.harness.tools.search import _chunk_id
 
     kbinfos = getattr(tools, "kbinfos", None)
@@ -2400,7 +2422,7 @@ async def _naive_rag(tools, messages: list, gen_conf: dict | None = None):
         existing = {_chunk_id(c) for c in (kbinfos.get("chunks") or [])}
         for c in chunks:
             if _chunk_id(c) not in existing:
-                kbinfos["chunks"].append(c)
+                admit_chunk(kbinfos, c)
         tools.kbinfos = kbinfos
 
     evidence = "\n\n".join(f"[{i}] {str(c.get('content_with_weight') or c.get('content') or '')[:1500]}" for i, c in enumerate(chunks[:8], 1))
