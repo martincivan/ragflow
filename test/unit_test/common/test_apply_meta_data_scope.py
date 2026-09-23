@@ -31,8 +31,8 @@ def _llm(conditions, logic="and"):
     """Fake gen_meta_filter that records what it was asked for."""
     calls = []
 
-    async def fake(chat_mdl, meta_data, query, constraints=None, allow_soft=False):
-        calls.append({"keys": sorted(meta_data.keys()), "constraints": constraints, "allow_soft": allow_soft})
+    async def fake(chat_mdl, meta_data, query, constraints=None, descriptions=None, allow_soft=False):
+        calls.append({"keys": sorted(meta_data.keys()), "constraints": constraints, "descriptions": descriptions, "allow_soft": allow_soft})
         return {"logic": logic, "conditions": conditions}
 
     return fake, calls
