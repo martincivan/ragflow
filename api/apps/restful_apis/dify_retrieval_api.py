@@ -28,6 +28,7 @@ from api.db.services.doc_metadata_service import DocMetadataService
 from api.db.services.knowledgebase_service import KnowledgebaseService
 from api.db.services.llm_service import LLMBundle
 from api.db.joint_services.tenant_model_service import get_tenant_default_model_by_type, resolve_model_config
+from common import chunk_metadata
 from common.metadata_utils import meta_filter, convert_conditions
 from api.apps import login_required
 from api.utils.api_utils import add_tenant_id_to_kwargs, build_error_result, get_request_json, get_json_result
@@ -263,10 +264,18 @@ async def retrieval(tenant_id):
             return build_error_result(message="no authorization", code=RetCode.AUTHENTICATION_ERROR)
         model_config = resolve_model_config(kb.tenant_id, LLMType.EMBEDDING, kb.embd_id)
         embd_mdl = LLMBundle(kb.tenant_id, model_config)
+        chunk_meta_filter = None
         if metadata_condition:
-            doc_ids.extend(meta_filter(metas, convert_conditions(metadata_condition), metadata_condition.get("logic", "and")))
-        if not doc_ids and metadata_condition:
-            doc_ids = ["-999"]
+            conditions = convert_conditions(metadata_condition)
+            logic = metadata_condition.get("logic", "and")
+            chunk_meta = chunk_metadata.config_for_kbs([kb])
+            if chunk_meta is not None and chunk_metadata.is_chunk_filterable(conditions, chunk_meta.fields):
+                # On the chunk fields directly: exact and not capped by the result window.
+                chunk_meta_filter = {"conditions": conditions, "logic": logic}
+            else:
+                doc_ids.extend(meta_filter(metas, conditions, logic))
+                if not doc_ids:
+                    doc_ids = ["-999"]
         ranks = await settings.retriever.retrieval(
             question,
             embd_mdl,
@@ -279,6 +288,7 @@ async def retrieval(tenant_id):
             knn_top_k=top,
             doc_ids=doc_ids,
             rank_feature=label_question(question, [kb]),
+            meta_filter=chunk_meta_filter,
         )
         ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], [kb.tenant_id])
 

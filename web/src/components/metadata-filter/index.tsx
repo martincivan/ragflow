@@ -20,6 +20,7 @@ import { useFormContext, useWatch } from 'react-hook-form';
 import { z } from 'zod';
 import { SelectWithSearch } from '../originui/select-with-search';
 import { RAGFlowFormItem } from '../ragflow-form';
+import { MetadataBoost, MetadataBoostSchema } from './metadata-boost';
 import { MetadataFilterConditions } from './metadata-filter-conditions';
 import { MetadataSemiAutoFields } from './metadata-semi-auto-fields';
 
@@ -53,6 +54,7 @@ export const MetadataFilterSchema = {
           ]),
         )
         .optional(),
+      boost: MetadataBoostSchema,
     })
     .optional(),
 };
@@ -118,6 +120,7 @@ export function MetadataFilter({
           prefix={prefix}
         ></MetadataSemiAutoFields>
       )}
+      {hasKnowledge && <MetadataBoost kbIds={kbIds} prefix={prefix} />}
     </>
   );
 }

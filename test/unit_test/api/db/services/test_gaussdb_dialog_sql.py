@@ -232,7 +232,12 @@ def _install_settings_import_stubs(monkeypatch):
         get_model_config_by_id=lambda *_args, **_kwargs: {},
     )
     install_module("api.db.db_models", DB=_DummyDB, Dialog=_Dummy)
-    install_module("common.metadata_utils", apply_meta_data_filter=lambda *_args, **_kwargs: None)
+    install_module(
+        "common.metadata_utils",
+        apply_meta_data_filter=lambda *_args, **_kwargs: None,
+        apply_meta_data_scope=lambda *_args, **_kwargs: None,
+        needs_llm=lambda *_args, **_kwargs: False,
+    )
     install_module(
         "api.utils.reference_metadata_utils",
         enrich_chunks_with_document_metadata=lambda chunks, *_args, **_kwargs: chunks,
@@ -1704,6 +1709,9 @@ def test_tc_sql_1001_use_sql_none_falls_back_to_retrieval(
         rerank_mdl=None,
         rank_feature=None,
         rerank_candidates_count=64,
+        meta_filter=None,
+        meta_boost=None,
+        meta_boost_max_total=0.3,
     )
     assert results[-1]["answer"] == "fallback answer"
     assert results[-1]["reference"] == _expected_fallback_reference(kb_id)
@@ -1753,6 +1761,9 @@ def test_tc_sql_1002_validator_rejection_falls_back_to_retrieval(
         rerank_mdl=None,
         rank_feature=None,
         rerank_candidates_count=64,
+        meta_filter=None,
+        meta_boost=None,
+        meta_boost_max_total=0.3,
     )
     assert results[-1]["answer"] == "fallback answer"
     assert results[-1]["reference"] == _expected_fallback_reference(kb_id)
@@ -1804,6 +1815,9 @@ def test_tc_sql_1003_sql_timeout_falls_back_to_retrieval(
         rerank_mdl=None,
         rank_feature=None,
         rerank_candidates_count=64,
+        meta_filter=None,
+        meta_boost=None,
+        meta_boost_max_total=0.3,
     )
     assert results[-1]["answer"] == "fallback answer"
     assert results[-1]["reference"] == _expected_fallback_reference(kb_id)

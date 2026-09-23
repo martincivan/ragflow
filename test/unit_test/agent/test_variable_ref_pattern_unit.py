@@ -164,7 +164,13 @@ def retrieval_module(monkeypatch, base_module):
 
     install_module("common", package=True)
     install_module("common.constants", LLMType=SimpleNamespace(EMBEDDING="embedding", RERANK="rerank", CHAT="chat"))
-    install_module("common.metadata_utils", apply_meta_data_filter=lambda *_args, **_kwargs: [])
+    install_module("common.chunk_metadata", config_for_kbs=lambda *_args, **_kwargs: None)
+    install_module(
+        "common.metadata_utils",
+        apply_meta_data_filter=lambda *_args, **_kwargs: [],
+        apply_meta_data_scope=lambda *_args, **_kwargs: None,
+        needs_llm=lambda *_args, **_kwargs: False,
+    )
     install_module("common.settings")
     install_module("common.connection_utils", timeout=lambda _seconds: lambda function: function)
 
