@@ -527,60 +527,80 @@ def convert_last_user_msg_to_multimodal(msg: list[dict], image_data_uris: list[s
 # the web client stamps on every turn, and strict providers reject those.
 LLM_MESSAGE_FIELDS = frozenset({"role", "content", "name", "tool_calls", "tool_call_id", "function_call", "refusal", "audio"})
 
+# What a model actually puts inside a citation: the index of an evidence block, or
+# — when it copies an identifier out of the research summary or a tool result — a
+# chunk id. Only the index is resolvable by the client, which uses it to look up the
+# published chunk list; ids are mapped back to that index below.
+_CITATION_INDEX = r"[0-9\u0660-\u0669\u06F0-\u06F9]+"
+_CITATION_ID = r"[0-9A-Za-z\u0660-\u0669\u06F0-\u06F9_-]+"
+
 BAD_CITATION_PATTERNS = [
-    re.compile(r"\(\s*ID\s*[: ]*\s*(\d+)\s*\)"),  # (ID: 12)
-    re.compile(r"\[\s*ID\s*[: ]*\s*(\d+)\s*\]"),  # [ID: 12]
-    re.compile(r"【\s*ID\s*[: ]*\s*(\d+)\s*】"),  # 【ID: 12】
-    re.compile(r"ref\s*(\d+)", flags=re.IGNORECASE),  # ref12、REF 12
+    re.compile(r"\(\s*ID\s*[:： ]*\s*(" + _CITATION_ID + r")\s*\)"),  # (ID: 12)
+    re.compile(r"\[\s*ID\s*[:： ]*\s*(" + _CITATION_ID + r")\s*\]"),  # [ID: 12]
+    re.compile(r"【\s*ID\s*[:： ]*\s*(" + _CITATION_ID + r")\s*】"),  # 【ID: 12】 — the form OpenAI-family models cite in
 ]
-CITATION_MARKER_PATTERN = re.compile(r"\[(?:ID:)?([0-9\u0660-\u0669\u06F0-\u06F9]+)\]")
+# "ref12" reads as prose, so it becomes a citation only when its number names a
+# chunk: a sentence that merely mentions "ref 5" must not lose those words.
+REF_CITATION_PATTERN = re.compile(r"ref\s*(\d+)", flags=re.IGNORECASE)
+CITATION_MARKER_PATTERN = re.compile(r"\[(?:ID:)?(" + _CITATION_INDEX + r")\]")
+# A marker the resolve pass rewrites or drops. The bare "[12]" form is accepted for
+# digits only — requiring "ID:" for anything else keeps ordinary markdown link text
+# ("[Project Brief](...)") out of the citation pass. The space in front is part of
+# the match so that dropping a marker does not strand it before the punctuation.
+_CITATION_MARKER_ANY = re.compile(r"(?P<lead>[ \t]?)\[\s*(?:ID\s*[:： ]*\s*(?P<id>" + _CITATION_ID + r")|(?P<index>" + _CITATION_INDEX + r"))\s*\]")
+
+
+def has_citation_markers(answer: str) -> bool:
+    """True when the model already cited, in the canonical form or a malformed one.
+
+    Used to decide whether similarity-based citation insertion still has to run:
+    an answer that is already cited must not be tagged a second time, whichever
+    bracket style the model reached for.
+    """
+    normalized = normalize_arabic_digits(answer) or ""
+    return bool(CITATION_MARKER_PATTERN.search(normalized) or any(p.search(normalized) for p in BAD_CITATION_PATTERNS))
 
 
 def repair_bad_citation_formats(answer: str, kbinfos: dict, idx: set):
-    max_index = len(kbinfos["chunks"])
-    normalized_answer = normalize_arabic_digits(answer) or ""
+    """Make every citation in ``answer`` one the client can open, and collect ``idx``.
 
-    def safe_add(i):
-        if 0 <= i < max_index:
-            idx.add(i)
-            return True
-        return False
-
-    def find_and_replace(pattern, group_index=1, repl=lambda digits: f"ID:{digits}"):
-        nonlocal answer
-        nonlocal normalized_answer
-
-        matches = list(pattern.finditer(normalized_answer))
-        if not matches:
-            return
-
-        parts = []
-        last_idx = 0
-        for match in matches:
-            parts.append(answer[last_idx : match.start()])
-            try:
-                i = int(match.group(group_index))
-            except Exception:
-                parts.append(answer[match.start() : match.end()])
-                last_idx = match.end()
-                continue
-
-            if safe_add(i):
-                digit_start, digit_end = match.span(group_index)
-                digits_original = answer[digit_start:digit_end]
-                parts.append(f"[{repl(digits_original)}]")
-            else:
-                parts.append(answer[match.start() : match.end()])
-            last_idx = match.end()
-
-        parts.append(answer[last_idx:])
-        answer = "".join(parts)
-        normalized_answer = normalize_arabic_digits(answer) or ""
+    Two passes. The first rewrites the malformed shapes models emit — "(ID:5)",
+    "【ID:5】", "ref5" — into the canonical "[ID:5]". The second resolves each marker
+    against the published chunk list: an index is kept, a chunk id is rewritten to
+    that chunk's index, and a marker that names neither is REMOVED. Leaving it in
+    place is what puts raw "【ID:a1b2c3d4e5f60718】" text in front of the user, since
+    the client renders only markers it can resolve.
+    """
+    chunks = kbinfos.get("chunks") or []
 
     for pattern in BAD_CITATION_PATTERNS:
-        find_and_replace(pattern)
+        answer = pattern.sub(lambda m: f"[ID:{normalize_arabic_digits(m.group(1)) or m.group(1)}]", answer)
 
-    return answer, idx
+    def _ref_to_marker(match):
+        i = int(match.group(1))
+        return f"[ID:{i}]" if 0 <= i < len(chunks) else match.group(0)
+
+    answer = REF_CITATION_PATTERN.sub(_ref_to_marker, answer)
+
+    # Chunk ids reach the answer whenever the model reads one out of its context;
+    # they name a real passage, so they resolve to its position rather than being
+    # thrown away with the citation.
+    index_by_id: dict[str, int] = {}
+    for position, chunk in enumerate(chunks):
+        for key in (chunk.get("chunk_id"), chunk.get("id")):
+            if key and str(key) not in index_by_id:
+                index_by_id[str(key)] = position
+
+    def _resolve(match):
+        token = match.group("id") or match.group("index") or ""
+        token = normalize_arabic_digits(token) or token
+        position = int(token) if token.isdigit() else index_by_id.get(token, -1)
+        if not 0 <= position < len(chunks):
+            return ""
+        idx.add(position)
+        return f"{match.group('lead')}[ID:{position}]"
+
+    return _CITATION_MARKER_ANY.sub(_resolve, answer), idx
 
 
 def _empty_response_applies(knowledges: list, text_attachments_content: str, image_attachments: list, image_files: list) -> bool:
@@ -864,8 +884,7 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
 
         if knowledges and (prompt_config.get("quote", True) and kwargs.get("quote", True)):
             idx = set([])
-            normalized_answer = normalize_arabic_digits(answer) or ""
-            if embd_mdl and not CITATION_MARKER_PATTERN.search(normalized_answer):
+            if embd_mdl and not has_citation_markers(answer):
                 # Main retrieval no longer ships chunk vectors back from ES.
                 # Pull them on demand for the chunks we are about to cite.
                 await _hydrate_chunk_vectors(retriever, kbinfos.get("chunks", []), tenant_ids, dialog.kb_ids)
@@ -877,11 +896,6 @@ async def async_chat(dialog, messages, stream=True, **kwargs):
                     tkweight=1 - dialog.vector_similarity_weight,
                     vtweight=dialog.vector_similarity_weight,
                 )
-            else:
-                for match in CITATION_MARKER_PATTERN.finditer(normalized_answer):
-                    i = int(match.group(1))
-                    if i < len(kbinfos["chunks"]):
-                        idx.add(i)
 
             answer, idx = repair_bad_citation_formats(answer, kbinfos, idx)
 
@@ -2131,27 +2145,13 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
             think = ans[0] + "</think>"
             answer = ans[1]
 
-        idx = set([])
-        normalized_answer = normalize_arabic_digits(answer) or ""
-        for match in CITATION_MARKER_PATTERN.finditer(normalized_answer):
-            i = int(match.group(1))
-            if i < len(rag_tools.kbinfos["chunks"]):
-                idx.add(i)
-
-        answer, idx = repair_bad_citation_formats(answer, rag_tools.kbinfos, idx)
+        answer, idx = repair_bad_citation_formats(answer, rag_tools.kbinfos, set())
 
         doc_ids = set()
-        for citation in idx:
-            try:
-                chunk_index = int(citation)
-            except (TypeError, ValueError):
-                if citation:
-                    doc_ids.add(str(citation))
-                continue
-            if 0 <= chunk_index < len(rag_tools.kbinfos["chunks"]):
-                doc_id = rag_tools.kbinfos["chunks"][chunk_index].get("doc_id")
-                if doc_id:
-                    doc_ids.add(doc_id)
+        for chunk_index in idx:
+            doc_id = rag_tools.kbinfos["chunks"][chunk_index].get("doc_id")
+            if doc_id:
+                doc_ids.add(doc_id)
 
         recall_docs = [d for d in rag_tools.kbinfos["doc_aggs"] if d["doc_id"] in doc_ids]
         if not recall_docs:
@@ -2221,6 +2221,13 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
         token = set_think_log_sink(_log_sink)
         drive = asyncio.create_task(_drive_stream())
         answer_deltas = []
+        think_deltas = []
+
+        def _think_event(value: str) -> dict:
+            """Emit one progress/reasoning delta, remembering it for the final event."""
+            think_deltas.append(value)
+            return {"answer": value, "reference": {}, "audio_binary": None, "final": False}
+
         answer_started = False
         think_closed = False
         outer_tool_started = False
@@ -2246,12 +2253,12 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
                 if item[0] == "log":
                     if think_closed:
                         continue
-                    yield {"answer": item[1] + "\n", "reference": {}, "audio_binary": None, "final": False}
+                    yield _think_event(item[1] + "\n")
                     continue
                 if item[0] == "tool_started":
                     outer_tool_started = True
                     for value in pending_outer_text:
-                        yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
+                        yield _think_event(value)
                     pending_outer_text.clear()
                     continue
                 if item[0] == "answer":
@@ -2266,7 +2273,7 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
                         continue
                     value = re.sub(r"</?think>", "", item[1])
                     if value:
-                        yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
+                        yield _think_event(value)
                     continue
                 if item[0] == "stream_done":
                     if not outer_tool_started and pending_outer_text:
@@ -2292,7 +2299,7 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
                 if in_think:
                     value = re.sub(r"</?think>", "", value)
                     if value:
-                        yield {"answer": value, "reference": {}, "audio_binary": None, "final": False}
+                        yield _think_event(value)
                 elif not outer_tool_started:
                     # Some providers omit explicit reasoning metadata and
                     # emit plain text before the tool call. Keep it pending
@@ -2318,7 +2325,16 @@ async def rag_agent(dialog, messages, stream=True, **kwargs):
         answer_text = "".join(answer_deltas)
         final = await decorate_answer(answer_text)
         final["final"] = True
-        final["answer"] = ""
+        # The final event carries the WHOLE message, not just the reference:
+        # decorate_answer is where citation markers are canonicalised and the ones
+        # that name no published chunk are dropped, so a client left holding the
+        # streamed deltas would render the model's raw markers instead. Both the web
+        # client and structure_answer() replace the accumulated message with this
+        # text, so the progress block is replayed alongside the answer rather than
+        # being lost with it.
+        think_text = "".join(think_deltas).strip()
+        if final["answer"] and think_text:
+            final["answer"] = f"<think>{think_text}</think>\n\n{final['answer']}"
         final["audio_binary"] = None
         yield final
     else:

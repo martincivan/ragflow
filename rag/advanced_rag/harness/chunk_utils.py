@@ -53,3 +53,29 @@ def _snippet(s: str, n: int) -> str:
     if len(s) <= n:
         return s
     return s[:n].rstrip() + "..."
+
+
+def admit_chunk(kbinfos: dict, chunk: dict) -> None:
+    """Add ``chunk`` to the shared evidence pool, keeping ``doc_aggs`` in step.
+
+    The chat layer publishes ``kbinfos`` as the answer's reference, and the client
+    resolves a citation's document through ``doc_aggs`` — a pool that grows without
+    it yields citations that open nothing, because the chunk behind the marker names
+    a document the reference never lists.
+    """
+    kbinfos.setdefault("chunks", []).append(chunk)
+    doc_id = _doc_id(chunk)
+    if not doc_id:
+        return
+    name = _doc_title(chunk)
+    aggs = kbinfos.setdefault("doc_aggs", [])
+    for agg in aggs:
+        if agg.get("doc_id") != doc_id:
+            continue
+        agg["count"] = (agg.get("count") or 0) + 1
+        # Pseudo-chunks (claim rows) carry a doc_id but no title; a later passage
+        # from the same document supplies the name the UI puts on the link.
+        if name and not agg.get("doc_name"):
+            agg["doc_name"] = name
+        return
+    aggs.append({"doc_id": doc_id, "doc_name": name, "count": 1})
