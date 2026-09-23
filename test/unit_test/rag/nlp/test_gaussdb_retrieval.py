@@ -573,8 +573,8 @@ async def _run_gaussdb_rank_feature_retrieval(dealer_cls, fields, rank_feature):
 @pytest.mark.asyncio
 async def test_tc_ret_704_gaussdb_retrieval_adds_tag_feature_score_to_sql_score(dealer_cls):
     fields = {
-        "without-tag": retrieval_chunk(0.4, "doc-plain", "Plain"),
-        "with-tag": {**retrieval_chunk(0.4, "doc-tagged", "Tagged"), "tag_feas": {"risk": 1.0}},
+        "without-tag": retrieval_chunk(0.4, "doc-plain", "Plain", content="risk contract plain"),
+        "with-tag": {**retrieval_chunk(0.4, "doc-tagged", "Tagged", content="risk contract tagged"), "tag_feas": {"risk": 1.0}},
     }
 
     ranks = await _run_gaussdb_rank_feature_retrieval(dealer_cls, fields, {"risk": 1.0})
@@ -588,8 +588,8 @@ async def test_tc_ret_704_gaussdb_retrieval_adds_tag_feature_score_to_sql_score(
 @pytest.mark.asyncio
 async def test_tc_ret_704_gaussdb_retrieval_does_not_add_pagerank_twice(dealer_cls):
     fields = {
-        "higher-sql-score": {**retrieval_chunk(0.8, "doc-high", "High"), "pagerank_fea": 0.1},
-        "higher-pagerank": {**retrieval_chunk(0.7, "doc-pagerank", "PageRank"), "pagerank_fea": 0.9},
+        "higher-sql-score": {**retrieval_chunk(0.8, "doc-high", "High", content="risk contract high"), "pagerank_fea": 0.1},
+        "higher-pagerank": {**retrieval_chunk(0.7, "doc-pagerank", "PageRank", content="risk contract pagerank"), "pagerank_fea": 0.9},
     }
 
     ranks = await _run_gaussdb_rank_feature_retrieval(dealer_cls, fields, {"pagerank_fea": 10})
@@ -613,8 +613,8 @@ async def test_tc_ret_311_retrieval_keeps_term_only_gaussdb_scores_when_vector_w
             query_vector=[0.1, 0.2],
             highlight={},
             field={
-                "term-low": retrieval_chunk(0.1, "doc-low", "Low"),
-                "term-zero": retrieval_chunk(0.0, "doc-zero", "Zero"),
+                "term-low": retrieval_chunk(0.1, "doc-low", "Low", content="risk contract low"),
+                "term-zero": retrieval_chunk(0.0, "doc-zero", "Zero", content="risk contract zero"),
             },
         )
 
