@@ -552,6 +552,7 @@ async def _content_recall_docs(tools, query: str, doc_scope: list[str] | None = 
             highlight=False,
             allow_dense_fallback=False,
             **(getattr(tools, "meta_retrieval_kwargs", dict)()),
+            language=getattr(tools, "language", None),
         )
     except Exception:
         _LOG.exception("[Dataset navigation] content-recall retrieval failed")
@@ -1482,6 +1483,7 @@ async def _recall_chunk_ids_in_doc(tools, query: str, doc_id: str, top_n: int) -
             # compile_kwd), so they survive this filter and stay retrievable —
             # which is the point, since they are the structure.
             must_not={"exists": "compile_kwd"},
+            language=getattr(tools, "language", None),
         )
     except Exception:
         _LOG.exception("[navigate_structure] chunk recall failed for doc=%s", doc_id)

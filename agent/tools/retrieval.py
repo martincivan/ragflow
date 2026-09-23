@@ -198,6 +198,8 @@ class Retrieval(ToolBase, ABC):
             query = await cross_languages(kbs[0].tenant_id, None, query, self._param.cross_languages)
 
         if kbs:
+            from rag.nlp import dataset_language  # local: rag.nlp is stubbed in several test modules
+
             query = re.sub(r"^user[:：\s]*", "", query, flags=re.IGNORECASE)
             kbinfos = await settings.retriever.retrieval(
                 query,
@@ -217,6 +219,7 @@ class Retrieval(ToolBase, ABC):
                 meta_filter=meta_scope.chunk_filter if meta_scope else None,
                 meta_boost=meta_scope.boosts if meta_scope else None,
                 meta_boost_max_total=meta_scope.boost_max_total if meta_scope else 0.3,
+                language=dataset_language(kbs),
             )
             if self.check_if_canceled("Retrieval processing"):
                 return
