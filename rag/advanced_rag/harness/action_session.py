@@ -32,6 +32,7 @@ from langchain_core.messages import HumanMessage, SystemMessage, convert_to_open
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 
+from rag.advanced_rag.harness.chunk_utils import admit_chunk
 from rag.advanced_rag.harness.config import resolve_mode
 
 _LOG = logging.getLogger(__name__)
@@ -765,7 +766,7 @@ def _admit_evidence(kbinfos, kb_seen, c, out, ids, seen, include_doc_id=True) ->
     out.append(entry)
     if isinstance(c, dict) and cid not in kb_seen:
         kb_seen.add(cid)
-        kbinfos["chunks"].append(c)
+        admit_chunk(kbinfos, c)
         return True
     return False
 
@@ -826,7 +827,7 @@ async def _claim_prefetch(tools, query: str, kbinfos: dict, kb_seen: set) -> tup
         # source_chunk_ids ride along so a later deep-read of the underlying
         # chunk can retire this pseudo-chunk (its quote would then duplicate
         # the full text already in the pool).
-        kbinfos["chunks"].append({"chunk_id": cid, "content_with_weight": content, "doc_id": doc_id, "source_chunk_ids": c["chunk_ids"]})
+        admit_chunk(kbinfos, {"chunk_id": cid, "content_with_weight": content, "doc_id": doc_id, "source_chunk_ids": c["chunk_ids"]})
     _LOG.info(
         "[Claim] prefetch q=%r -> recalled=%d new=%d (exclusive=%s)",
         str(query)[:60],
