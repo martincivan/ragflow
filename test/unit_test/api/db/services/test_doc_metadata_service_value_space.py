@@ -43,6 +43,17 @@ TOTAL_DOCS = 12000
 # Carried only by the last document, i.e. beyond RESULT_WINDOW. This is the
 # value the paged path cannot see.
 LATE_PHASE = "late-phase"
+# The default ignore_above of the keyword subfield a dynamic string mapping
+# creates, and a value one character past it.
+IGNORE_ABOVE = 256
+TOO_LONG = "over-" + "x" * IGNORE_ABOVE
+
+
+def _elements(value) -> list:
+    """The values ES sees for one key: an array is indexed element by element."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
 
 
 class _FakeEs:
@@ -55,9 +66,18 @@ class _FakeEs:
     hands back everything.
     """
 
-    def __init__(self, docs: list[dict], keys: list[str], shards: dict | None = None, timed_out: bool = False, drop_key: str | None = None):
+    def __init__(
+        self,
+        docs: list[dict],
+        keys: list[str],
+        shards: dict | None = None,
+        timed_out: bool = False,
+        drop_key: str | None = None,
+        unaggregatable: list[str] | None = None,
+    ):
         self._docs = docs
         self._keys = keys
+        self._unaggregatable = unaggregatable or []
         self.requested_sizes: dict[str, int] = {}
         self.searches = 0
         self.partial_kwarg = None
@@ -68,11 +88,58 @@ class _FakeEs:
     @property
     def indices(self):
         properties = {key: {"type": "text", "fields": {"keyword": {"type": "keyword"}}} for key in self._keys}
+        # A dict-valued metadata entry maps as an object: no type, no bucket.
+        properties.update({key: {"properties": {"inner": {"type": "text"}}} for key in self._unaggregatable})
         mapping = {"idx": {"mappings": {"properties": {"meta_fields": {"properties": properties}}}}}
         return SimpleNamespace(get_mapping=lambda index: mapping)
 
+    def _field_state(self, doc) -> tuple[set[str], set[str]]:
+        """What one document indexed, and what the indexer dropped.
+
+        ignore_above is applied to each array element on its own, so a key
+        holding a short and an over-limit value has a perfectly present
+        ``.keyword`` subfield *and* an ``_ignored`` entry naming it -- which is
+        why existence alone cannot tell the two apart.
+        """
+        indexed: set[str] = set()
+        ignored: set[str] = set()
+        for key, value in doc["_source"]["meta_fields"].items():
+            elements = _elements(value)
+            if not elements:
+                continue
+            indexed.add(f"meta_fields.{key}")
+            if key in self._unaggregatable:
+                continue
+            subfield = f"meta_fields.{key}.keyword"
+            if any(len(str(element)) <= IGNORE_ABOVE for element in elements):
+                indexed.add(subfield)
+            if any(len(str(element)) > IGNORE_ABOVE for element in elements):
+                ignored.add(subfield)
+        return indexed, ignored
+
+    def _matches(self, doc, clause: dict) -> bool:
+        """Evaluate the filter the caller actually sent, not a canned answer."""
+        indexed, ignored = self._field_state(doc)
+        if "exists" in clause:
+            return clause["exists"]["field"] in indexed
+        if "term" in clause:
+            field, value = next(iter(clause["term"].items()))
+            assert field == "_ignored", f"unsupported term field {field}"
+            return value in ignored
+        if "bool" in clause:
+            spec = clause["bool"]
+            if not all(self._matches(doc, sub) for sub in spec.get("filter", [])):
+                return False
+            if any(self._matches(doc, sub) for sub in spec.get("must_not", [])):
+                return False
+            should = spec.get("should")
+            return not should or any(self._matches(doc, sub) for sub in should)
+        raise AssertionError(f"unsupported filter clause {clause}")
+
     def _values(self, key: str) -> list[str]:
-        values = {str(doc["_source"]["meta_fields"][key]) for doc in self._docs if doc["_source"]["meta_fields"].get(key) is not None}
+        """The buckets the composite source can build: an element past
+        ignore_above never reached the subfield, so it has none."""
+        values = {str(element) for doc in self._docs for element in _elements(doc["_source"]["meta_fields"].get(key)) if len(str(element)) <= IGNORE_ABOVE}
         return sorted(values)
 
     def search(self, index, body, allow_partial_search_results=None):
@@ -80,6 +147,9 @@ class _FakeEs:
         self.partial_kwarg = allow_partial_search_results
         aggregations = {}
         for name, spec in (body.get("aggs") or {}).items():
+            if name == "uncovered":
+                aggregations[name] = {"buckets": {key: {"doc_count": sum(1 for doc in self._docs if self._matches(doc, clause))} for key, clause in spec["filters"]["filters"].items()}}
+                continue
             composite = spec["composite"]
             size = composite["size"]
             source = composite["sources"][0]
@@ -249,6 +319,63 @@ def test_incomplete_response_does_not_degrade_to_the_paged_scan(monkeypatch):
     assert store.paged_searches == 0
 
 
+def test_values_too_long_to_aggregate_refuse_the_space(monkeypatch):
+    """A dynamically mapped string aggregates through its ``.keyword``
+    subfield, which drops values longer than ignore_above (256 by default).
+    Such a value has no bucket, so the generator would never be offered it and
+    would pick a value that scopes the search to the wrong documents."""
+    docs = [
+        {"_id": "doc-0", "_source": {"meta_fields": {"phase": "early-phase", "project": "p1"}}},
+        {"_id": "doc-1", "_source": {"meta_fields": {"phase": TOO_LONG, "project": "p1"}}},
+    ]
+    store = _FakeDocStoreConn(docs, ["phase", "project"])
+    _patch(monkeypatch, store)
+
+    with pytest.raises(MetaValueSpaceIncomplete):
+        DocMetadataService.get_meta_value_space_by_kbs(["kb-1"])
+    # the paged path is incomplete in the same way, so it is not a substitute
+    assert store.paged_searches == 0
+
+
+def test_a_too_long_value_beside_a_short_one_refuses_the_space(monkeypatch):
+    """ignore_above is applied to each array element, while existence is a
+    property of the document: a key holding ``["early-phase", <too long>]``
+    still has its ``.keyword`` subfield, so only the long element is missing
+    from the buckets and nothing about the document looks wrong. ``_ignored``
+    is what names the subfield the indexer dropped that element from."""
+    docs = [{"_id": "doc-0", "_source": {"meta_fields": {"phase": ["early-phase", TOO_LONG], "project": "p1"}}}]
+    store = _FakeDocStoreConn(docs, ["phase", "project"])
+    _patch(monkeypatch, store)
+
+    with pytest.raises(MetaValueSpaceIncomplete):
+        DocMetadataService.get_meta_value_space_by_kbs(["kb-1"])
+    assert store.paged_searches == 0
+
+
+def test_a_key_no_aggregation_can_read_refuses_the_space(monkeypatch):
+    """A dict-valued metadata entry maps as an object: it has no aggregatable
+    field at all, so the space would be missing a whole key without saying so."""
+    docs = _docs()
+    for doc in docs:
+        doc["_source"]["meta_fields"]["payload"] = {"inner": "x"}
+    store = _FakeDocStoreConn(docs, ["phase", "project"], unaggregatable=["payload"])
+    _patch(monkeypatch, store)
+
+    with pytest.raises(MetaValueSpaceIncomplete):
+        DocMetadataService.get_meta_value_space_by_kbs(["kb-1"])
+
+
+def test_a_key_no_document_in_scope_carries_costs_nothing(monkeypatch):
+    """The mapping enumerates every key the tenant ever indexed, so a key no
+    document in these knowledge bases carries must not disable filtering."""
+    store = _FakeDocStoreConn(_docs(), ["phase", "project"], unaggregatable=["payload"])
+    _patch(monkeypatch, store)
+
+    space = DocMetadataService.get_meta_value_space_by_kbs(["kb-1"])
+
+    assert space["project"] == ["p1"]
+
+
 def test_falls_back_to_the_paged_path_without_an_es_client(monkeypatch):
     """Non-ES backends keep their previous behaviour."""
     _patch(monkeypatch, _FakeDocStoreConn(_docs(), ["phase", "project"], with_es=False))
@@ -313,7 +440,7 @@ def test_value_space_formats_a_date_field(monkeypatch):
                 "vs_phase": [{"key": {"phase": "AD"}}],
             }
             return {
-                "aggregations": {name: {"buckets": buckets[name]} for name in body["aggs"]},
+                "aggregations": {name: {"buckets": buckets.get(name, {})} for name in body["aggs"]},
                 "_shards": {"total": 1, "successful": 1, "failed": 0},
                 "timed_out": False,
             }
