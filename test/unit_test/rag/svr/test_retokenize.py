@@ -14,6 +14,7 @@
 #  limitations under the License.
 #
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -107,6 +108,10 @@ def test_retokenize_dataset_scans_a_slice_and_writes_only_stale_chunks(monkeypat
             return len(bulks[-1]), []
 
     kb = SimpleNamespace(id="kb1", name="dataset", language="English", tenant_id="t1")
+    # rag/advanced_rag/knowlege_compile/conftest.py replaces index_name with a
+    # MagicMock at import time and never restores it. Pin it back on the module
+    # object ``from rag.nlp.search import index_name`` actually reads.
+    monkeypatch.setattr(sys.modules["rag.nlp.search"], "index_name", lambda uid: f"ragflow_{uid}")
     monkeypatch.setattr(retokenize, "_helpers", lambda es: FakeHelpers)
     monkeypatch.setattr(settings, "docStoreConn", SimpleNamespace(es=object()), raising=False)
     monkeypatch.setattr(KnowledgebaseService, "get_by_id", classmethod(lambda cls, _id: (True, kb)))
