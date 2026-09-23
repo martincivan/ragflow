@@ -125,6 +125,7 @@ dependencies = [
     "pt-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/pt_core_news_sm-3.8.0/pt_core_news_sm-3.8.0-py3-none-any.whl",
     "ja-core-news-sm @ https://github.com/explosion/spacy-models/releases/download/ja_core_news_sm-3.8.0/ja_core_news_sm-3.8.0-py3-none-any.whl",
     "slack-sdk==3.37.0",
+    "snowballstemmer>=3.1.0,<4.0.0",  # Czech stemmer; nltk has none
     "socksio==1.0.0",
     "agentrun-sdk>=0.0.51,<1.0.0",
     "nest-asyncio>=1.6.0,<2.0.0",  # Needed for agent/component/message.py
