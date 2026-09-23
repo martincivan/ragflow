@@ -61,6 +61,7 @@ import { useIsDarkTheme } from './theme-provider';
 import { Button } from './ui/button';
 import { HoverCard, HoverCardContent, HoverCardTrigger } from './ui/hover-card';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
+import { ReferenceDuplicates } from './reference-duplicates';
 
 const getChunkIndex = (match: string) =>
   parseCitationIndex(match.replace(/\[|\]/g, ''));
@@ -260,6 +261,7 @@ const FloatingChatWidgetMarkdown = ({
                 </Tooltip>
               </section>
             )}
+            <ReferenceDuplicates duplicates={chunkItem?.duplicates} />
           </div>
         </div>
       );
