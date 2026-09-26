@@ -15,7 +15,7 @@ async def test_auto_reports_the_conditions_the_llm_generated():
         doc_ids = await apply_meta_data_filter({"method": "auto"}, metas, "2026", MagicMock(), diagnostics=resolved)
 
     assert doc_ids == ["doc1"]
-    assert resolved == {"method": "auto", "logic": "and", "conditions": generated["conditions"]}
+    assert resolved == {"method": "auto", "status": "applied", "logic": "and", "conditions": generated["conditions"], "matched_document_count": 1}
 
 
 @pytest.mark.asyncio
@@ -28,7 +28,7 @@ async def test_semi_auto_reports_the_method_even_without_usable_keys():
         mock_gen.assert_not_called()
 
     assert doc_ids == []
-    assert resolved == {"method": "semi_auto", "logic": "and", "conditions": []}
+    assert resolved == {"method": "semi_auto", "status": "not_generated", "logic": "and", "conditions": [], "matched_document_count": 0}
 
 
 @pytest.mark.asyncio
@@ -49,12 +49,12 @@ async def test_manual_reports_the_conditions_after_value_resolution():
     )
 
     assert doc_ids == ["doc1"]
-    assert resolved == {"method": "manual", "logic": "or", "conditions": [{"key": "year", "op": "=", "value": "2026"}]}
+    assert resolved == {"method": "manual", "status": "applied", "logic": "or", "conditions": [{"key": "year", "op": "=", "value": "2026"}], "matched_document_count": 1}
 
 
 @pytest.mark.asyncio
-async def test_no_filter_leaves_the_sink_untouched():
+async def test_no_filter_reports_disabled():
     resolved: dict = {}
 
     assert await apply_meta_data_filter(None, {}, diagnostics=resolved) == []
-    assert resolved == {}
+    assert resolved == {"method": "disabled", "status": "disabled", "logic": "and", "conditions": [], "matched_document_count": 0}

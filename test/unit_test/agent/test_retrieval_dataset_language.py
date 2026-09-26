@@ -70,8 +70,9 @@ def _tool(kbs, monkeypatch):
         use_kg=False,
         empty_response="",
         outputs={},
+        function_name="retrieval",
     )
-    tool._canvas = SimpleNamespace(is_reff=lambda _exp: False)
+    tool._canvas = SimpleNamespace(is_reff=lambda _exp: False, add_reference=lambda *_a, **_kw: None)
     tool.check_if_canceled = lambda _message="": False
     return tool, calls
 

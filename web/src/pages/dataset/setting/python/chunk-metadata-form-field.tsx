@@ -1,5 +1,5 @@
 import { RAGFlowFormItem } from '@/components/ragflow-form';
-import { SwitchFormField } from '@/components/switch-fom-field';
+import { SwitchFormField } from '@/components/switch-form-field';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { MultiSelect } from '@/components/ui/multi-select';
