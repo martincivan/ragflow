@@ -162,7 +162,7 @@ async def apply_meta_data_filter(
     manual_value_resolver: Callable[[dict], dict] | None = None,
     kb_ids: list[str] | None = None,
     metas_loader: Callable[[], dict] | None = None,
-    resolved_out: dict | None = None,
+    diagnostics: dict | None = None,
 ) -> list[str] | None:
     """
     Apply metadata filtering rules and return the filtered doc_ids.
@@ -185,10 +185,11 @@ async def apply_meta_data_filter(
     push-down path therefore skips the expensive
     ``get_flatted_meta_by_kbs`` round-trip entirely.
 
-    ``resolved_out`` is filled in with the conditions this call actually ran —
-    ``{"method", "logic", "conditions"}``. For ``auto`` / ``semi_auto`` those
-    are the LLM's, which the caller has no other way to see, so a UI can
-    explain why a given set of documents came back.
+    ``diagnostics`` is filled in with what this call actually did --
+    ``{"method", "status", "conditions", "logic", "matched_document_count"}``.
+    For ``auto`` / ``semi_auto`` the conditions are the LLM's, which the caller
+    has no other way to see, so a UI can explain why a given set of documents
+    came back. The return value is unchanged either way.
 
     Returns:
         list of doc_ids, ["-999"] when manual filters yield no result, or None
@@ -204,7 +205,7 @@ async def apply_meta_data_filter(
         kb_ids=kb_ids,
         metas_loader=metas_loader,
         chunk_meta=None,
-        resolved_out=resolved_out,
+        diagnostics=diagnostics,
     )
     return scope.doc_ids
 
@@ -259,7 +260,7 @@ async def apply_meta_data_scope(
     kb_ids: list[str] | None = None,
     metas_loader: Callable[[], dict] | None = None,
     chunk_meta=None,
-    resolved_out: dict | None = None,
+    diagnostics: dict | None = None,
 ) -> MetaScope:
     """``apply_meta_data_filter`` that can also scope on chunk metadata fields
     and produce score boosts.
@@ -291,11 +292,29 @@ async def apply_meta_data_scope(
 
     doc_ids = list(base_doc_ids) if base_doc_ids else []
     scope = MetaScope(doc_ids=doc_ids)
+    filter_method = (meta_data_filter or {}).get("method") or "disabled"
+
+    def _record(status: str, conditions: list[dict] | None = None, logic: str = "and", matched_document_count: int = 0) -> None:
+        """Report what the filter did: ``applied``, ``no_matches``,
+        ``not_generated``, ``disabled`` or ``unsupported``. A chunk-field
+        filter leaves the count at 0 -- it never enumerates documents."""
+        if diagnostics is None:
+            return
+        diagnostics.clear()
+        diagnostics.update(
+            {
+                "method": filter_method,
+                "status": status,
+                "conditions": list(conditions or []),
+                "logic": logic,
+                "matched_document_count": matched_document_count,
+            }
+        )
 
     if not meta_data_filter:
+        _record("disabled")
         return scope
 
-    filter_method = meta_data_filter.get("method")
     active_keys = list(chunk_meta.fields) if (chunk_meta is not None and getattr(chunk_meta, "active", False)) else None
     boost_cfg = cm.parse_boost(meta_data_filter.get("boost"), active_keys) if active_keys is not None else cm.BoostConfig()
     boost_method = boost_cfg.method if active_keys is not None else "off"
@@ -305,14 +324,12 @@ async def apply_meta_data_scope(
     elif isinstance(meta_data_filter.get("boost"), dict):
         logging.debug("Metadata boost ignored: chunk metadata is not active on every queried dataset")
 
-    def _record(conditions: list[dict], logic: str) -> None:
-        if resolved_out is None:
-            return
-        resolved_out.update({"method": filter_method, "logic": logic, "conditions": list(conditions)})
-
     # Report the method even when it yields nothing, so a caller can tell "the
     # LLM found nothing to filter on" apart from "no filter was asked for".
-    _record([], meta_data_filter.get("logic", "and"))
+    if filter_method in ("auto", "semi_auto", "manual"):
+        _record("not_generated", logic=meta_data_filter.get("logic", "and"))
+    else:
+        _record("unsupported")
 
     # Memoised metadata loader. ``_get_metas`` materialises the dict at most
     # once per call; downstream branches that never reach an in-memory eval
@@ -465,9 +482,17 @@ async def apply_meta_data_scope(
         if manual_value_resolver:
             filters = [manual_value_resolver(flt) for flt in filters]
         logging.debug(f"Metadata filter(manual): {filters}")
-        _record(filters, meta_data_filter.get("logic", "and"))
+        logic = meta_data_filter.get("logic", "and")
         if filters:
-            _apply_hard(filters, meta_data_filter.get("logic", "and"), manual=True)
+            _apply_hard(filters, logic, manual=True)
+            if scope.chunk_filter:
+                _record("applied", filters, logic)
+            elif scope.doc_ids == ["-999"]:
+                _record("no_matches", filters, logic)
+            else:
+                _record("applied", filters, logic, len(scope.doc_ids or []))
+        else:
+            _record("not_generated", filters, logic)
 
     # --- LLM part: one call for the filter and the boost --------------------
     llm_filter = filter_method in ("auto", "semi_auto")
@@ -501,6 +526,7 @@ async def apply_meta_data_scope(
         # exclude matching documents. Drop the filter rather than narrow wrongly.
         if llm_filter:
             scope.doc_ids = None
+            _record("not_generated")
         return scope
     if filter_method == "auto" or boost_method == "auto":
         offered = current_metas
@@ -508,6 +534,8 @@ async def apply_meta_data_scope(
         offered = {k: current_metas[k] for k in list(dict.fromkeys(filter_keys + list(boost_keys))) if k in current_metas}
     if not offered:
         logging.debug("Metadata filter/boost: no offered keys carry values; skipping the LLM call")
+        if llm_filter:
+            _record("not_generated")
         return scope
 
     semi = filter_method == "semi_auto" or boost_method == "semi_auto"
@@ -541,8 +569,15 @@ async def apply_meta_data_scope(
 
     if llm_filter:
         logic = filters.get("logic", "and")
-        _record(hard, logic)
         matched_nothing = not _apply_hard(hard, logic, manual=False) if hard else (not scope.doc_ids and not scope.chunk_filter)
+        if not hard:
+            _record("not_generated", [], logic)
+        elif matched_nothing:
+            _record("no_matches", hard, logic)
+        elif scope.chunk_filter:
+            _record("applied", hard, logic)
+        else:
+            _record("applied", hard, logic, len(scope.doc_ids or []))
         if matched_nothing:
             # auto/semi_auto contract: an LLM filter that matches nothing means "no filter"
             scope.doc_ids = None

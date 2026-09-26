@@ -168,6 +168,7 @@ class Retrieval(ToolBase, ABC):
         doc_ids = []
 
         meta_scope = None
+        metadata_filter_diagnostics = {}
         if self._param.meta_data_filter != {}:
             # Defer the (potentially expensive) metadata table load — manual
             # filters served by ES push-down never need it. The loader is
@@ -191,8 +192,19 @@ class Retrieval(ToolBase, ABC):
                 kb_ids=kb_ids,
                 metas_loader=_load_metas,
                 chunk_meta=chunk_metadata.config_for_kbs(kbs),
+                diagnostics=metadata_filter_diagnostics,
             )
             doc_ids = meta_scope.doc_ids
+        else:
+            metadata_filter_diagnostics.update(
+                {
+                    "method": "disabled",
+                    "status": "disabled",
+                    "conditions": [],
+                    "logic": "and",
+                    "matched_document_count": 0,
+                }
+            )
 
         if self._param.cross_languages:
             query = await cross_languages(kbs[0].tenant_id, None, query, self._param.cross_languages)
@@ -261,14 +273,21 @@ class Retrieval(ToolBase, ABC):
             if "content_ltks" in ck:
                 del ck["content_ltks"]
 
+        metadata_filter_diagnostics.update(
+            {
+                "tool_name": self._param.function_name,
+                "query": query,
+                "dataset_ids": filtered_kb_ids,
+            }
+        )
+        self._canvas.add_reference(kbinfos["chunks"], kbinfos["doc_aggs"], metadata_filter=metadata_filter_diagnostics)
+
         if not kbinfos["chunks"]:
             self.set_output("formalized_content", self._param.empty_response)
             return
 
         # Format the chunks for JSON output (similar to how other tools do it)
         json_output = kbinfos["chunks"].copy()
-
-        self._canvas.add_reference(kbinfos["chunks"], kbinfos["doc_aggs"])
         form_cnt = "\n".join(kb_prompt(kbinfos, 200000, True))
 
         # Set both formalized content and JSON output

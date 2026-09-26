@@ -468,7 +468,7 @@ async def retrieval_test(tenant_id, dataset_id=None):
             doc_ids,
             kb_ids=kb_ids,
             metas_loader=lambda: DocMetadataService.get_flatted_meta_by_kbs(kb_ids),
-            resolved_out=resolved_meta_filter,
+            diagnostics=resolved_meta_filter,
             chunk_meta=chunk_meta,
         )
         doc_ids = meta_scope.doc_ids
