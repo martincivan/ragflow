@@ -1309,9 +1309,10 @@ This auto-tagging feature enhances retrieval by adding another layer of domain-s
       metadataKeys: 'Filterable items',
       metadataBoost: 'Metadata boost',
       metadataBoostTip:
-        'Preferences on metadata that rank matching chunks higher without excluding the others, for example "prefer the newest expedition" or "prefer the phase named in the question". Requires chunk metadata to be enabled and backfilled on every selected dataset; otherwise it is ignored. Manual: fixed preferences. Semi-automatic: the model fills in values for the listed keys. Automatic: the model marks each condition it derives as a requirement or a preference.',
+        'Preferences on metadata that rank matching chunks higher without excluding the others, for example "prefer the newest expedition" or "prefer the phase named in the question". Requires chunk metadata to be enabled and backfilled on every selected dataset; otherwise it is ignored. Manual: fixed preferences only. Semi-automatic: the model fills in values for the listed keys. Automatic: the model marks each condition it derives as a requirement or a preference. Fixed preferences apply in every mode except Disabled.',
       boostConditions: 'Preferred values',
-      boostKeys: 'Preference items',
+      boostKeys: 'Model-chosen keys (value taken from the question)',
+      boostFixedConditions: 'Fixed preferences (always applied)',
       boostWeight: 'Weight',
       boostOpMax: 'newest / highest',
       boostOpMin: 'oldest / lowest',

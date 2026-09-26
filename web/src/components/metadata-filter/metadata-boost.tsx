@@ -148,13 +148,15 @@ function WeightField({
   );
 }
 
-/** Manual mode: fixed preferences — key, operator, value (none for max/min), weight. */
+/** Fixed preferences — key, operator, value (none for max/min), weight. Applied in every enabled mode. */
 function BoostManualRows({
   name,
   metadata,
+  label,
 }: {
   name: string;
   metadata: ReturnType<typeof useFetchKnowledgeMetadata>;
+  label: string;
 }) {
   const { t } = useTranslation();
   const form = useFormContext();
@@ -195,7 +197,7 @@ function BoostManualRows({
   return (
     <section className="flex flex-col gap-2">
       <div className="flex items-center justify-between">
-        <FormLabel>{t('chat.boostConditions')}</FormLabel>
+        <FormLabel>{label}</FormLabel>
         <Button
           variant={'outline'}
           type="button"
@@ -433,11 +435,19 @@ export function MetadataBoost({ kbIds, prefix = '' }: MetadataBoostProps) {
           triggerClassName="!bg-bg-input"
         />
       </RAGFlowFormItem>
-      {method === DatasetMetadata.Manual && (
-        <BoostManualRows name={`${base}.manual`} metadata={metadata} />
-      )}
       {method === DatasetMetadata.SemiAutomatic && (
         <BoostSemiAutoRows name={`${base}.semi_auto`} metadata={metadata} />
+      )}
+      {enabled && (
+        <BoostManualRows
+          name={`${base}.manual`}
+          metadata={metadata}
+          label={
+            method === DatasetMetadata.Manual
+              ? t('boostConditions')
+              : t('boostFixedConditions')
+          }
+        />
       )}
       {(method === DatasetMetadata.Automatic ||
         method === DatasetMetadata.SemiAutomatic) && (

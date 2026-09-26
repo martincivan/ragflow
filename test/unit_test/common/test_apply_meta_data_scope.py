@@ -123,6 +123,31 @@ async def test_manual_boosts_are_carried_when_active():
 
 
 @pytest.mark.asyncio
+async def test_disabled_boost_ignores_manual_rows_left_in_the_config():
+    filt = {"method": "manual", "manual": [], "boost": {"method": "disabled", "manual": [{"key": "flow", "op": "=", "value": "expedition", "weight": 0.2}]}}
+    scope = await metadata_utils.apply_meta_data_scope(filt, METAS, "q", None, None, kb_ids=["kb"], chunk_meta=ACTIVE)
+    assert scope.boosts == []
+
+
+@pytest.mark.asyncio
+async def test_semi_auto_boost_applies_manual_rows_next_to_model_chosen_keys(monkeypatch):
+    fake, calls = _llm([{"key": "phase", "op": "=", "value": "sp"}])
+    monkeypatch.setattr(generator, "gen_meta_filter", fake)
+    filt = {
+        "method": "manual",
+        "manual": [],
+        "boost": {
+            "method": "semi_auto",
+            "semi_auto": [{"key": "phase", "weight": 0.03}],
+            "manual": [{"key": "flow", "op": "in", "value": ["expedition"], "weight": 0.05}],
+        },
+    }
+    scope = await metadata_utils.apply_meta_data_scope(filt, METAS, "q", object(), None, kb_ids=["kb"], chunk_meta=ACTIVE)
+    assert sorted((b.key, b.weight) for b in scope.boosts) == [("flow", 0.05), ("phase", 0.03)]
+    assert calls and calls[0]["keys"] == ["phase"]
+
+
+@pytest.mark.asyncio
 async def test_auto_splits_hard_and_soft_in_one_llm_call(monkeypatch):
     fake, calls = _llm(
         [
