@@ -133,8 +133,14 @@ func (d *DatasetService) SearchDatasets(ctx context.Context, req *service.Search
 		return nil, err
 	}
 
+	// chatID names the chat model for metadata filtering, cross-language and
+	// keyword extraction; a saved search config overrides it below.
+	chatID := ""
+	if req.ChatID != nil {
+		chatID = *req.ChatID
+	}
+
 	// Override request fields with values from saved search config
-	var chatID string
 	if searchID != "" {
 		if d.searchService == nil {
 			common.Warn("Search service is not initialized for search_id", zap.String("searchID", searchID))
@@ -197,7 +203,9 @@ func (d *DatasetService) SearchDatasets(ctx context.Context, req *service.Search
 			if scRerankID, ok := searchConfig["rerank_id"].(string); ok {
 				rerankID = scRerankID
 			}
-			chatID, _ = searchConfig["chat_id"].(string)
+			if scChatID, ok := searchConfig["chat_id"].(string); ok && scChatID != "" {
+				chatID = scChatID
+			}
 		} else {
 			common.Warn("Invalid search_id: search_config missing or invalid", zap.String("searchID", searchID))
 			return nil, fmt.Errorf("invalid search_id")
@@ -213,7 +221,7 @@ func (d *DatasetService) SearchDatasets(ctx context.Context, req *service.Search
 			if chatID != "" {
 				target, err := modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeChat, chatID)
 				if err != nil {
-					common.Warn("Failed to get chat model config from search_config chat_id, using tenant default", zap.String("chatID", chatID), zap.Error(err))
+					common.Warn("Failed to get chat model config from chat_id, using tenant default", zap.String("chatID", chatID), zap.Error(err))
 				} else {
 					chatModelForFilter = modelModule.NewChatModel(target.Driver, &target.ModelName, target.APIConfig)
 					// The context window, not the max_output the target carries
@@ -255,17 +263,23 @@ func (d *DatasetService) SearchDatasets(ctx context.Context, req *service.Search
 	// Apply cross_languages and keyword extraction
 	modifiedQuestion := question
 	if len(crossLanguages) > 0 {
-		translated, err := service.CrossLanguages(ctx, tenantIDs[0], "", question, crossLanguages)
+		translated, err := service.CrossLanguages(ctx, tenantIDs[0], chatID, question, crossLanguages)
 		if err != nil {
-			common.Warn("Failed to translate question", zap.String("llmID", ""), zap.Error(err))
+			common.Warn("Failed to translate question", zap.String("llmID", chatID), zap.Error(err))
 		} else {
 			modifiedQuestion = translated
 		}
 	}
 	if keyword {
-		target, err := modelSolver.ResolveDefaultModelConfig(ctx, tenantIDs[0], entity.ModelTypeChat)
+		var target *service.ModelTarget
+		var err error
+		if chatID != "" {
+			target, err = modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeChat, chatID)
+		} else {
+			target, err = modelSolver.ResolveDefaultModelConfig(ctx, tenantIDs[0], entity.ModelTypeChat)
+		}
 		if err != nil {
-			common.Warn("Failed to get default chat model for LLM transformations", zap.Error(err))
+			common.Warn("Failed to get chat model for keyword extraction", zap.String("chatID", chatID), zap.Error(err))
 		} else {
 			chatModel := modelModule.NewChatModel(target.Driver, &target.ModelName, target.APIConfig)
 			extractedKeywords, err := service.KeywordExtraction(ctx, chatModel, modifiedQuestion, 3)

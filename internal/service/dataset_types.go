@@ -54,6 +54,7 @@ type SearchDatasetsRequest struct {
 	MetadataCondition      map[string]interface{} `json:"metadata_condition,omitempty"`
 	MetadataFilter         map[string]interface{} `json:"meta_data_filter,omitempty"`
 	RerankID               *string                `json:"rerank_id,omitempty"`
+	ChatID                 *string                `json:"chat_id,omitempty"` // Chat model ID for the LLM-assisted steps.
 	Keyword                *bool                  `json:"keyword,omitempty"`
 	Highlight              *bool                  `json:"highlight,omitempty"`
 	SimilarityThreshold    *float64               `json:"similarity_threshold,omitempty"`
@@ -88,6 +89,7 @@ type SearchDatasetRequest struct {
 	MetadataCondition      map[string]interface{} `json:"metadata_condition,omitempty"`
 	MetadataFilter         map[string]interface{} `json:"meta_data_filter,omitempty"`
 	RerankID               *string                `json:"rerank_id,omitempty"`
+	ChatID                 *string                `json:"chat_id,omitempty"` // Chat model ID for the LLM-assisted steps.
 	Keyword                *bool                  `json:"keyword,omitempty"`
 	SimilarityThreshold    *float64               `json:"similarity_threshold,omitempty"`
 	VectorSimilarityWeight *float64               `json:"vector_similarity_weight,omitempty"`
@@ -117,6 +119,7 @@ func (req *SearchDatasetRequest) ToSearchDatasetsRequest(datasetID string) *Sear
 		MetadataCondition:      req.MetadataCondition,
 		MetadataFilter:         req.MetadataFilter,
 		RerankID:               req.RerankID,
+		ChatID:                 req.ChatID,
 		Keyword:                req.Keyword,
 		SimilarityThreshold:    req.SimilarityThreshold,
 		VectorSimilarityWeight: req.VectorSimilarityWeight,

@@ -13,13 +13,16 @@
 #  See the License for the specific language governing permissions and
 #  limitations under the License.
 #
-"""metadata_condition handling in POST /api/v1/retrieval (chunk_api.retrieval_test).
+"""Request handling in POST /api/v1/retrieval (chunk_api.retrieval_test).
 
 A metadata_condition with an empty conditions list must not filter anything:
 the Go search service (internal/service/metadata_filter.go) returns the base
 doc ids unchanged when the manual filter list is empty, but the Python route
 scoped the search to the nonexistent doc "-999" and returned zero chunks.
-These tests stub the HTTP/service layer and drive the real handler.
+A `chat_id` names the chat model used by every LLM-assisted step, so a test run
+reproduces a chat assistant's query rewriting instead of using the tenant
+default model. These tests stub the HTTP/service layer and drive the real
+handler.
 """
 
 import asyncio
@@ -242,3 +245,52 @@ def test_nonempty_metadata_condition_with_no_match_returns_empty(monkeypatch):
     assert res["code"] == 0, res
     assert res["data"] == {"total": 0, "chunks": [], "doc_aggs": {}}
     assert RETRIEVAL_CALLS == []
+
+
+def _record_chat_models(module):
+    calls = {"resolved": [], "default": [], "cross_languages": [], "keyword_models": []}
+
+    def resolve_model_config(tenant_id, model_type, model_id):
+        calls["resolved"].append((tenant_id, model_type, model_id))
+        return {"model": model_id}
+
+    def get_tenant_default_model_by_type(tenant_id, model_type):
+        calls["default"].append((tenant_id, model_type))
+        return {"model": "tenant-default"}
+
+    async def cross_languages(tenant_id, llm_id, question, langs):
+        calls["cross_languages"].append((tenant_id, llm_id))
+        return question
+
+    async def keyword_extraction(chat_mdl, question):
+        calls["keyword_models"].append(chat_mdl.config["model"])
+        return "kw"
+
+    module.resolve_model_config = resolve_model_config
+    module.get_tenant_default_model_by_type = get_tenant_default_model_by_type
+    module.cross_languages = cross_languages
+    module.keyword_extraction = keyword_extraction
+    module.LLMBundle = lambda _tenant_id, config: SimpleNamespace(config=config)
+    return calls
+
+
+@pytest.mark.p2
+def test_chat_id_drives_keyword_and_cross_language_models(monkeypatch):
+    module = _load_module(monkeypatch, _payload(chat_id="glm-4@ZHIPU", keyword=True, cross_languages=["English"]))
+    calls = _record_chat_models(module)
+    res = _run(module.retrieval_test())
+    assert res["code"] == 0, res
+    assert calls["cross_languages"] == [("tenant-1", "glm-4@ZHIPU")]
+    assert calls["keyword_models"] == ["glm-4@ZHIPU"]
+    assert calls["default"] == []
+
+
+@pytest.mark.p2
+def test_without_chat_id_keyword_and_cross_language_use_tenant_default(monkeypatch):
+    module = _load_module(monkeypatch, _payload(keyword=True, cross_languages=["English"]))
+    calls = _record_chat_models(module)
+    res = _run(module.retrieval_test())
+    assert res["code"] == 0, res
+    assert calls["cross_languages"] == [("tenant-1", None)]
+    assert calls["keyword_models"] == ["tenant-default"]
+    assert calls["resolved"] == [("tenant-1", "embedding", "embd-1")]
