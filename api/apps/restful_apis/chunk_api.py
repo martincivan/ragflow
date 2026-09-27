@@ -375,6 +375,16 @@ async def retrieval_test(tenant_id, dataset_id=None):
     if "page_size" not in req and "size" in req:
         req["page_size"] = req["size"]
     request_fields = set(req)
+    # `chat_id` is the chat model id that drives the LLM-assisted steps
+    # (metadata filter, cross-language, keyword extraction, TOC), so a test run
+    # can reproduce a chat assistant's retrieval.
+    chat_id = req.get("chat_id", "")
+
+    def chat_model_config_for(default_tenant_id):
+        if chat_id:
+            return resolve_model_config(tenant_id, LLMType.CHAT, chat_id)
+        return get_tenant_default_model_by_type(default_tenant_id, LLMType.CHAT)
+
     search_id = req.get("search_id", "")
     search_config = {}
     if search_id:
@@ -423,12 +433,7 @@ async def retrieval_test(tenant_id, dataset_id=None):
     if meta_data_filter:
         chat_mdl = None
         if meta_data_filter.get("method") in ["auto", "semi_auto"]:
-            chat_id = req.get("chat_id", "")
-            if chat_id:
-                chat_model_config = resolve_model_config(tenant_id, LLMType.CHAT, chat_id)
-            else:
-                chat_model_config = get_tenant_default_model_by_type(tenant_id, LLMType.CHAT)
-            chat_mdl = LLMBundle(tenant_id, chat_model_config)
+            chat_mdl = LLMBundle(tenant_id, chat_model_config_for(tenant_id))
         doc_ids = await apply_meta_data_filter(
             meta_data_filter,
             None,
@@ -518,10 +523,9 @@ async def retrieval_test(tenant_id, dataset_id=None):
             rerank_mdl = LLMBundle(kb.tenant_id, rerank_model_config)
 
         if langs:
-            question = await cross_languages(kb.tenant_id, None, question, langs)
+            question = await cross_languages(tenant_id if chat_id else kb.tenant_id, chat_id or None, question, langs)
         if req.get("keyword", False):
-            chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
-            question += "," + await keyword_extraction(LLMBundle(kb.tenant_id, chat_model_config), question)
+            question += "," + await keyword_extraction(LLMBundle(kb.tenant_id, chat_model_config_for(kb.tenant_id)), question)
 
         ranks = await settings.retriever.retrieval(
             question,
@@ -543,8 +547,7 @@ async def retrieval_test(tenant_id, dataset_id=None):
             rerank_candidates_count=rerank_candidates_count,
         )
         if toc_enhance:
-            chat_model_config = get_tenant_default_model_by_type(kb.tenant_id, LLMType.CHAT)
-            cks = await settings.retriever.retrieval_by_toc(question, ranks["chunks"], tenant_ids, LLMBundle(kb.tenant_id, chat_model_config), size)
+            cks = await settings.retriever.retrieval_by_toc(question, ranks["chunks"], tenant_ids, LLMBundle(kb.tenant_id, chat_model_config_for(kb.tenant_id)), size)
             if cks:
                 ranks["chunks"] = cks
         ranks["chunks"] = settings.retriever.retrieval_by_children(ranks["chunks"], tenant_ids)

@@ -17,6 +17,7 @@ func TestSearchDatasetRequestToSearchDatasetsRequest(t *testing.T) {
 	vectorSimilarityWeight := 0.8
 	searchID := "search-1"
 	rerankID := "rerank-1"
+	chatID := "glm-4@ZHIPU"
 	includeKnowledgeCompilation := false
 	req := &service.SearchDatasetRequest{
 		Question:               "hello world",
@@ -30,6 +31,7 @@ func TestSearchDatasetRequestToSearchDatasetsRequest(t *testing.T) {
 		SearchID:               &searchID,
 		MetadataCondition:      map[string]interface{}{"logic": "and"},
 		RerankID:               &rerankID,
+		ChatID:                 &chatID,
 		Keyword:                &keyword,
 		SimilarityThreshold:    &similarityThreshold,
 		VectorSimilarityWeight: &vectorSimilarityWeight,
@@ -49,7 +51,7 @@ func TestSearchDatasetRequestToSearchDatasetsRequest(t *testing.T) {
 	if converted.UseKG != req.UseKG || converted.KNNTopK != req.KNNTopK || converted.KNNNumCandidates != req.KNNNumCandidates || converted.SearchID != req.SearchID {
 		t.Fatalf("converted request did not preserve optional fields: %#v", converted)
 	}
-	if converted.MetadataCondition["logic"] != "and" || converted.RerankID != req.RerankID || converted.Keyword != req.Keyword {
+	if converted.MetadataCondition["logic"] != "and" || converted.RerankID != req.RerankID || converted.ChatID != req.ChatID || converted.Keyword != req.Keyword {
 		t.Fatalf("converted request did not preserve search config fields: %#v", converted)
 	}
 	if converted.SimilarityThreshold != req.SimilarityThreshold || converted.VectorSimilarityWeight != req.VectorSimilarityWeight {
