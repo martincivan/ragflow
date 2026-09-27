@@ -527,7 +527,10 @@ async def rank_memories_async(chat_mdl, goal: str, sub_goal: str, tool_call_summ
     return re.sub(r"^.*</think>", "", ans, flags=re.DOTALL)
 
 
-async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: dict = None, descriptions: dict = None, allow_soft: bool = False) -> dict:
+META_FILTER_INSTRUCTIONS_LIMIT = 4000
+
+
+async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: dict = None, descriptions: dict = None, allow_soft: bool = False, instructions: str | None = None) -> dict:
     """Generate metadata filter conditions from a user query using an LLM.
 
     Args:
@@ -541,6 +544,11 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: di
         allow_soft: Ask the model to tag each condition "hard" (a requirement,
             applied as a filter) or "soft" (a preference or inference, applied
             as a score boost — see common.chunk_metadata). One call serves both.
+        instructions: Optional free-text guidance from whoever configured the
+            chat, agent or search ("use phase=SP only for questions about
+            building permits"). It is configured per consumer, unlike anything
+            stored on the dataset, so two chats over the same dataset can filter
+            differently.
 
     Returns:
         Dict with "logic" ("and"/"or") and "conditions" list.
@@ -575,6 +583,12 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: di
             description = description[:META_FILTER_DESCRIPTION_LIMIT] + "…"
         offered[key] = description
 
+    instructions = instructions.strip() if isinstance(instructions, str) else ""
+    # The form bounds the field, but a config written through the API is not;
+    # this prompt carries no token budgeting.
+    if len(instructions) > META_FILTER_INSTRUCTIONS_LIMIT:
+        instructions = instructions[:META_FILTER_INSTRUCTIONS_LIMIT] + "…"
+
     sys_prompt = PROMPT_JINJA_ENV.from_string(META_FILTER).render(
         current_date=datetime.datetime.today().strftime("%Y-%m-%d"),
         metadata_keys=json.dumps(meta_data_structure),
@@ -582,6 +596,7 @@ async def gen_meta_filter(chat_mdl, meta_data: dict, query: str, constraints: di
         constraints=json.dumps(constraints) if constraints else None,
         metadata_descriptions=json.dumps(offered, ensure_ascii=False) if offered else None,
         allow_soft=allow_soft,
+        instructions=instructions or None,
     )
     user_prompt = "Generate filters:"
 

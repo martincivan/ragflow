@@ -285,7 +285,8 @@ async def apply_meta_data_scope(
       each condition ``"strength": "hard" | "soft"`` and soft ones become
       boosts of ``auto_weight``.
 
-    Filter and boost share ONE LLM call.
+    Filter and boost share ONE LLM call. ``meta_data_filter["instructions"]``,
+    free text set on the chat, agent or search, is passed to it as guidance.
     """
     from common import chunk_metadata as cm
     from rag.prompts.generator import gen_meta_filter  # move from the top of the file to avoid circular import
@@ -541,7 +542,15 @@ async def apply_meta_data_scope(
         return scope
 
     semi = filter_method == "semi_auto" or boost_method == "semi_auto"
-    filters = await gen_meta_filter(chat_mdl, offered, question, constraints=constraints if semi else None, descriptions=_get_key_descriptions(), allow_soft=(boost_method == "auto"))
+    filters = await gen_meta_filter(
+        chat_mdl,
+        offered,
+        question,
+        constraints=constraints if semi else None,
+        descriptions=_get_key_descriptions(),
+        allow_soft=(boost_method == "auto"),
+        instructions=meta_data_filter.get("instructions"),
+    )
     logging.debug(f"Metadata filter({filter_method})/boost({boost_method}) generated: {filters}")
 
     hard: list[dict] = []
