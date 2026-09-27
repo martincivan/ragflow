@@ -319,10 +319,12 @@ async def apply_meta_data_scope(
     boost_cfg = cm.parse_boost(meta_data_filter.get("boost"), active_keys) if active_keys is not None else cm.BoostConfig()
     boost_method = boost_cfg.method if active_keys is not None else "off"
     scope.boost_max_total = boost_cfg.max_total
-    if active_keys is not None:
+    if active_keys is None:
+        if isinstance(meta_data_filter.get("boost"), dict):
+            logging.debug("Metadata boost ignored: chunk metadata is not active on every queried dataset")
+    # "off" must switch the fixed preferences off too: the form keeps hidden manual rows on save.
+    elif boost_method != "off":
         scope.boosts.extend(boost_cfg.manual)
-    elif isinstance(meta_data_filter.get("boost"), dict):
-        logging.debug("Metadata boost ignored: chunk metadata is not active on every queried dataset")
 
     # Report the method even when it yields nothing, so a caller can tell "the
     # LLM found nothing to filter on" apart from "no filter was asked for".
