@@ -20,9 +20,18 @@ import { useFormContext, useWatch } from 'react-hook-form';
 import { z } from 'zod';
 import { SelectWithSearch } from '../originui/select-with-search';
 import { RAGFlowFormItem } from '../ragflow-form';
+import { Textarea } from '../ui/textarea';
 import { MetadataBoost, MetadataBoostSchema } from './metadata-boost';
 import { MetadataFilterConditions } from './metadata-filter-conditions';
 import { MetadataSemiAutoFields } from './metadata-semi-auto-fields';
+
+// Mirrors META_FILTER_INSTRUCTIONS_LIMIT in rag/prompts/generator.py.
+const META_FILTER_INSTRUCTIONS_LIMIT = 4000;
+
+const LLM_METHODS: string[] = [
+  DatasetMetadata.Automatic,
+  DatasetMetadata.SemiAutomatic,
+];
 
 type MetadataFilterProps = {
   prefix?: string;
@@ -55,6 +64,7 @@ export const MetadataFilterSchema = {
         )
         .optional(),
       boost: MetadataBoostSchema,
+      instructions: z.string().max(META_FILTER_INSTRUCTIONS_LIMIT).optional(),
     })
     .optional(),
 };
@@ -84,7 +94,13 @@ export function MetadataFilter({
     control: form.control,
     name: methodName,
   });
+  const boostMethod = useWatch({
+    control: form.control,
+    name: prefix + 'meta_data_filter.boost.method',
+  });
   const hasKnowledge = Array.isArray(kbIds) && kbIds.length > 0;
+  const usesLlm =
+    LLM_METHODS.includes(metadata) || LLM_METHODS.includes(boostMethod);
 
   const MetadataOptions = Object.values(DatasetMetadata).map((x) => {
     return {
@@ -121,6 +137,20 @@ export function MetadataFilter({
         ></MetadataSemiAutoFields>
       )}
       {hasKnowledge && <MetadataBoost kbIds={kbIds} prefix={prefix} />}
+      {hasKnowledge && usesLlm && (
+        <RAGFlowFormItem
+          label={t('metadataInstructions')}
+          name={prefix + 'meta_data_filter.instructions'}
+          tooltip={t('metadataInstructionsTip')}
+        >
+          <Textarea
+            rows={4}
+            maxLength={META_FILTER_INSTRUCTIONS_LIMIT}
+            placeholder={t('metadataInstructionsPlaceholder')}
+            className="bg-bg-input"
+          />
+        </RAGFlowFormItem>
+      )}
     </>
   );
 }

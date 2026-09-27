@@ -31,8 +31,8 @@ def _llm(conditions, logic="and"):
     """Fake gen_meta_filter that records what it was asked for."""
     calls = []
 
-    async def fake(chat_mdl, meta_data, query, constraints=None, allow_soft=False):
-        calls.append({"keys": sorted(meta_data.keys()), "constraints": constraints, "allow_soft": allow_soft})
+    async def fake(chat_mdl, meta_data, query, constraints=None, allow_soft=False, instructions=None):
+        calls.append({"keys": sorted(meta_data.keys()), "constraints": constraints, "allow_soft": allow_soft, "instructions": instructions})
         return {"logic": logic, "conditions": conditions}
 
     return fake, calls
@@ -286,6 +286,21 @@ async def test_key_in_both_semi_auto_lists_belongs_to_the_filter(monkeypatch):
     )
     assert calls[0]["keys"] == ["phase"]
     assert scope.chunk_filter["conditions"] == [{"key": "phase", "op": "=", "value": "sp"}] and scope.boosts == []
+
+
+@pytest.mark.asyncio
+async def test_instructions_reach_the_llm_call(monkeypatch):
+    fake, calls = _llm([])
+    monkeypatch.setattr(generator, "gen_meta_filter", fake)
+    await metadata_utils.apply_meta_data_scope(
+        {"method": "auto", "instructions": "SP only for building permits", "boost": {"method": "auto"}},
+        METAS,
+        "q",
+        object(),
+        None,
+        chunk_meta=ACTIVE,
+    )
+    assert calls[0]["instructions"] == "SP only for building permits"
 
 
 def test_needs_llm():
