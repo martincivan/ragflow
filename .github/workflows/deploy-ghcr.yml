@@ -98,6 +98,15 @@ jobs:
           echo "sha=$(git rev-parse --short HEAD)" >> "${GITHUB_OUTPUT}"
           git --no-pager log --oneline "${BASE_REF}"..HEAD
 
+      # The Dockerfile defaults GOPROXY to goproxy.cn first, which drops connections
+      # from GitHub-hosted runners (http2 GOAWAY mid-download fails `go mod download`
+      # instead of falling through). Pin the go-builder stage to proxy.golang.org.
+      # Applied to the throwaway build tree only, never committed to a branch.
+      - name: Use proxy.golang.org in the Go build stage
+        run: |
+          sed -i '/^FROM .* AS go-builder$/a ENV GOPROXY=https://proxy.golang.org,direct' Dockerfile
+          grep -n -A1 'AS go-builder' Dockerfile
+
       - name: Compute image name
         id: image
         run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/ragflow" >> "${GITHUB_OUTPUT}"
