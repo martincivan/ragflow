@@ -51,7 +51,7 @@ var jsonIterator = sonic.Config{
 var memoryMessageVectorFieldRE = regexp.MustCompile(`^q_\d+_vec$`)
 
 // CreateChunkStore creates an index
-func (e *Engine) CreateChunkStore(ctx context.Context, baseName, datasetID string, vectorSize int, parserID string) error {
+func (e *Engine) CreateChunkStore(ctx context.Context, baseName, datasetID string, vectorSize int, parserID, language string) error {
 	if baseName == "" {
 		return fmt.Errorf("index name cannot be empty")
 	}
@@ -158,8 +158,8 @@ func (e *Engine) CreateChunkStore(ctx context.Context, baseName, datasetID strin
 // chunks straight back (the chunk APIs, the debug endpoints) sees them right
 // away. Ingestion must use InsertChunksNoRefresh instead - see that method for
 // why the wait is the wrong trade there.
-func (e *Engine) InsertChunks(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string) ([]string, error) {
-	return e.insertChunks(ctx, chunks, baseName, datasetID, "wait_for")
+func (e *Engine) InsertChunks(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string, language string) ([]string, error) {
+	return e.insertChunks(ctx, chunks, baseName, datasetID, language, "wait_for")
 }
 
 // InsertChunksNoRefresh inserts chunks without waiting for an index refresh:
@@ -171,13 +171,16 @@ func (e *Engine) InsertChunks(ctx context.Context, chunks []map[string]interface
 // This is the ingestion path's contract, and it matches Python's: the Python
 // ingestion inserts chunks with refresh=False (rag/svr/task_executor_refactor/
 // chunk_service.py:386 and :423), while its API default stays "wait_for".
-func (e *Engine) InsertChunksNoRefresh(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string) ([]string, error) {
-	return e.insertChunks(ctx, chunks, baseName, datasetID, "")
+func (e *Engine) InsertChunksNoRefresh(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string, language string) ([]string, error) {
+	return e.insertChunks(ctx, chunks, baseName, datasetID, language, "")
 }
 
 // insertChunks is the shared bulk-insert body. An empty refresh omits the
 // parameter, which leaves the decision to the index (no forced refresh).
-func (e *Engine) insertChunks(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string, refresh string) ([]string, error) {
+// language is the dataset language, which only engines whose fulltext analyzer
+// is fixed at index creation need; Elasticsearch analyses client-side and
+// ignores it.
+func (e *Engine) insertChunks(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string, language string, refresh string) ([]string, error) {
 	common.Info("ElasticsearchConnection.InsertChunks called", zap.String("index_name", baseName), zap.Int("chunkCount", len(chunks)))
 
 	if len(chunks) == 0 {
@@ -709,34 +712,34 @@ func conditionTermsList(value interface{}) ([]interface{}, bool) {
 	return out, true
 }
 
-// mustNotExistsClauses renders the `must_not` exclusions a condition carries.
-// The only form RAGFlow produces is must_not={"exists": <field>} (e.g.
-// hybrid_search excluding compiled products); any other shape yields nothing.
+// mustNotExistsClauses renders field and existence exclusions.
 func mustNotExistsClauses(value interface{}) []map[string]interface{} {
 	exclusions, ok := value.(map[string]interface{})
 	if !ok {
 		return nil
 	}
-	clauses := make([]map[string]interface{}, 0, len(exclusions))
-	for field, value := range exclusions {
-		if field != "exists" {
-			continue
-		}
-		clauses = append(clauses, map[string]interface{}{
-			"exists": map[string]interface{}{"field": value},
-		})
+	if field, ok := exclusions["exists"]; ok && len(exclusions) == 1 {
+		return []map[string]interface{}{{"exists": map[string]interface{}{"field": field}}}
 	}
-	return clauses
+	if query := buildBoolQueryFromConditionRaw(exclusions, nil, false, false); query != nil {
+		return []map[string]interface{}{query}
+	}
+	return nil
 }
 
 // updateChunksByQuery handles multi-document update
 func (e *Engine) updateChunksByQuery(ctx context.Context, indexName string, condition map[string]interface{}, newValue map[string]interface{}) error {
 	common.Debug("ElasticsearchConnection.updateChunksByQuery called", zap.String("indexName", indexName))
+	condition = types.CompilationFilter(condition)
 
 	// Build bool query from condition
 	var mustClauses []map[string]interface{}
 	var mustNotClauses []map[string]interface{}
 	for k, v := range condition {
+		if k == "and" || k == "or" {
+			mustClauses = append(mustClauses, buildBoolQueryFromConditionRaw(map[string]interface{}{k: v}, nil, false, false))
+			continue
+		}
 		if k == "exists" {
 			mustClauses = append(mustClauses, map[string]interface{}{
 				"exists": map[string]interface{}{"field": v},
@@ -1010,6 +1013,7 @@ func (e *Engine) DeleteChunks(ctx context.Context, condition map[string]interfac
 		return 0, nil
 	}
 
+	condition = types.CompilationFilter(condition)
 	// Build bool query from condition
 	var mustClauses []map[string]interface{}
 	var filterClauses []map[string]interface{}
@@ -1045,6 +1049,10 @@ func (e *Engine) DeleteChunks(ctx context.Context, condition map[string]interfac
 
 	// Add all other conditions as filters/must/must_not
 	for k, v := range condition {
+		if k == "and" || k == "or" {
+			filterClauses = append(filterClauses, buildBoolQueryFromConditionRaw(map[string]interface{}{k: v}, nil, false, false))
+			continue
+		}
 		if k == "id" || k == "kb_id" {
 			continue // Already handled above
 		}
@@ -1169,7 +1177,8 @@ type SearchResponse struct {
 	Aggregations map[string]interface{} `json:"aggregations"`
 }
 
-// Search executes search with unified types.SearchRequest
+// Search executes a unified search across the requested indices. Ordinary
+// searches fail when any index request fails, without returning partial results.
 func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.SearchResult, error) {
 	types.LogSearchRequest("Elasticsearch", req)
 
@@ -1454,8 +1463,7 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 		for _, indexName := range req.IndexNames {
 			searchChunks, indexTotal, esErr := e.searchOneIndex(ctx, indexName, payload)
 			if esErr != nil {
-				common.Warn("Elasticsearch query failed", zap.String("index", indexName), zap.Error(esErr))
-				continue
+				return nil, fmt.Errorf("elasticsearch: search index %q: %w", indexName, esErr)
 			}
 			if hybrid {
 				// A window the backend could not fill is a candidate shortfall
@@ -1712,6 +1720,8 @@ func sortByFields(chunks []map[string]interface{}, expr *types.OrderByExpr) []ma
 	return chunks
 }
 
+// searchOneIndex sends an ordinary search with a fresh request body. A valid
+// missing-index response is empty; other request and response failures propagate.
 func (e *Engine) searchOneIndex(ctx context.Context, indexName string, payload []byte) ([]map[string]interface{}, int64, error) {
 	res, err := e.client.Search(
 		e.client.Search.WithContext(ctx),
@@ -1726,7 +1736,22 @@ func (e *Engine) searchOneIndex(ctx context.Context, indexName string, payload [
 	defer res.Body.Close()
 
 	if res.IsError() {
-		bodyBytes, _ := io.ReadAll(res.Body)
+		bodyBytes, readErr := io.ReadAll(res.Body)
+		if readErr != nil {
+			return nil, 0, fmt.Errorf("read elasticsearch error response: %w", readErr)
+		}
+		if res.StatusCode == http.StatusNotFound {
+			var failure struct {
+				Error struct {
+					Type string `json:"type"`
+				} `json:"error"`
+			}
+			// A tenant without indexed documents has no physical index yet.
+			// Preserve that empty result without hiding unrelated 404 errors.
+			if json.Unmarshal(bodyBytes, &failure) == nil && failure.Error.Type == "index_not_found_exception" {
+				return nil, 0, nil
+			}
+		}
 		common.Warn("Elasticsearch error response", zap.String("index", indexName), zap.String("body", string(bodyBytes)))
 		return nil, 0, fmt.Errorf("elasticsearch error response: %s", string(bodyBytes))
 	}
@@ -2121,6 +2146,10 @@ func memoryMessageStatusBool(value interface{}) bool {
 // Skill indexes use status, regular chunk indexes use kb_id, and memory
 // message indexes use memory_id plus message-specific storage fields.
 func buildBoolQueryFromCondition(filter map[string]interface{}, kbIDs []string, isSkillIndex, isMemoryIndex bool) map[string]interface{} {
+	return buildBoolQueryFromConditionRaw(types.CompilationFilter(filter), kbIDs, isSkillIndex, isMemoryIndex)
+}
+
+func buildBoolQueryFromConditionRaw(filter map[string]interface{}, kbIDs []string, isSkillIndex, isMemoryIndex bool) map[string]interface{} {
 	var mustClauses []interface{}
 	var mustNotClauses []interface{}
 	var filterClauses []interface{}
@@ -2151,6 +2180,20 @@ func buildBoolQueryFromCondition(filter map[string]interface{}, kbIDs []string, 
 	}
 
 	for k, v := range filter {
+		if k == "and" || k == "or" {
+			var children []interface{}
+			for _, child := range types.FilterClauses(v) {
+				children = append(children, buildBoolQueryFromConditionRaw(child, nil, false, isMemoryIndex))
+			}
+			if len(children) > 0 {
+				clause := map[string]interface{}{"filter": children}
+				if k == "or" {
+					clause = map[string]interface{}{"should": children, "minimum_should_match": 1}
+				}
+				filterClauses = append(filterClauses, map[string]interface{}{"bool": clause})
+			}
+			continue
+		}
 		if isMemoryIndex {
 			k = mapMemoryMessageESField(k, false)
 		}
@@ -2198,11 +2241,13 @@ func buildBoolQueryFromCondition(filter map[string]interface{}, kbIDs []string, 
 			continue
 		}
 		if k == "must_not" {
-			if condition, ok := v.(map[string]interface{}); ok {
-				if field, ok := condition["exists"].(string); ok && field != "" {
-					mustNotClauses = append(mustNotClauses, map[string]interface{}{"exists": map[string]interface{}{"field": field}})
-				}
+			for _, clause := range mustNotExistsClauses(v) {
+				mustNotClauses = append(mustNotClauses, clause)
 			}
+			continue
+		}
+		if k == "exists" {
+			filterClauses = append(filterClauses, map[string]interface{}{"exists": map[string]interface{}{"field": v}})
 			continue
 		}
 		if k == "knowledge_graph_kwd" {

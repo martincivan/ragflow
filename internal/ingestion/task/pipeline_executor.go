@@ -106,7 +106,7 @@ func validateTaskContext(taskCtx *TaskContext) error {
 // an engine that implements it can write chunks without waiting for an index
 // refresh.
 type noRefreshChunkInserter interface {
-	InsertChunksNoRefresh(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string) ([]string, error)
+	InsertChunksNoRefresh(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string, language string) ([]string, error)
 }
 
 // insertChunksForIngestion writes non-final chunks through the engine's
@@ -116,21 +116,24 @@ type noRefreshChunkInserter interface {
 // Refreshing every batch adds unnecessary latency. The writer uses the regular
 // inserter for its final batch, so all preceding batches become searchable
 // before the document task is acknowledged and its completion event is sent.
-func insertChunksForIngestion(eng engine.DocEngine) InsertFunc {
+//
+// The first write creates the chunk store, and on Infinity that fixes the
+// fulltext analyzer, so the dataset language has to travel with it.
+func insertChunksForIngestion(eng engine.DocEngine, language string) InsertFunc {
 	return func(ctx context.Context, chunks []map[string]any, baseName string, datasetID string) ([]string, error) {
 		if bulk, ok := eng.(noRefreshChunkInserter); ok {
-			return bulk.InsertChunksNoRefresh(ctx, chunks, baseName, datasetID)
+			return bulk.InsertChunksNoRefresh(ctx, chunks, baseName, datasetID, language)
 		}
-		return eng.InsertChunks(ctx, chunks, baseName, datasetID)
+		return eng.InsertChunks(ctx, chunks, baseName, datasetID, language)
 	}
 }
 
 // insertFinalChunksForIngestion waits for the index refresh before returning.
 // The final write makes every preceding no-refresh batch searchable before the
 // document task is acknowledged and its completion event is published.
-func insertFinalChunksForIngestion(eng engine.DocEngine) InsertFunc {
+func insertFinalChunksForIngestion(eng engine.DocEngine, language string) InsertFunc {
 	return func(ctx context.Context, chunks []map[string]any, baseName string, datasetID string) ([]string, error) {
-		return eng.InsertChunks(ctx, chunks, baseName, datasetID)
+		return eng.InsertChunks(ctx, chunks, baseName, datasetID, language)
 	}
 }
 
@@ -150,11 +153,11 @@ func NewPipelineExecutor(
 		canvasID:    canvasID,
 		docBulkSize: docBulkSize,
 		indexWriter: newChunkIndexWriter(
-			insertChunksForIngestion(engine.Get()),
+			insertChunksForIngestion(engine.Get(), datasetLanguage(taskCtx)),
 			fmt.Sprintf("ragflow_%s", taskCtx.Tenant.ID),
 			taskCtx.Doc.KbID,
 			docBulkSize,
-		).withFinalInsertFunc(insertFinalChunksForIngestion(engine.Get())),
+		).withFinalInsertFunc(insertFinalChunksForIngestion(engine.Get(), datasetLanguage(taskCtx))),
 		deleteChunksFunc: func(ctx context.Context, condition map[string]any, baseName, datasetID string) (int64, error) {
 			return engine.Get().DeleteChunks(ctx, condition, baseName, datasetID)
 		},
@@ -528,7 +531,7 @@ func (s *PipelineExecutor) loadDocumentCompiledState(ctx context.Context) ([]str
 			KbIDs:        []string{s.taskCtx.Doc.KbID},
 			Offset:       offset,
 			Limit:        pageSize,
-			SelectFields: []string{"id", "compile_kwd", "compilation_template_kind_kwd"},
+			SelectFields: []string{"id", "compile_kwd", "compilation_template_kind_kwd", "type_kwd"},
 			Filter:       map[string]any{"doc_id": []string{s.taskCtx.Doc.ID}},
 		})
 		if err != nil {
@@ -538,7 +541,7 @@ func (s *PipelineExecutor) loadDocumentCompiledState(ctx context.Context) ([]str
 			break
 		}
 		for _, row := range result.Chunks {
-			if strings.TrimSpace(asCompiledKwd(row)) == "" {
+			if strings.TrimSpace(asCompiledKwd(row)) == "" || enginetypes.IsNavigationRow(row) {
 				continue
 			}
 			oldProducts = append(oldProducts, row)
@@ -609,22 +612,16 @@ func applyDocumentAvailability(chunks []map[string]any, status *string) {
 	}
 }
 
-// compiledVariants returns the sorted, de-duplicated set of compile types a
-// document's compiled products carry. It reads the authoritative
-// `compilation_template_kind_kwd` the KnowledgeCompiler component stamps on each
-// compiled product (the resolved template's kind) and maps it through
-// common.KindToVariant (O2a whitelist: unknown kinds are skipped). Products
-// without an authoritative kind fall back to their `compile_kwd`-derived variant.
-// This surfaces the compiler's runtime variant inference to PublishCompleted so
-// the consumer can route the dataset-level re-compile per compile type.
+// compiledVariants returns the sorted, de-duplicated execution variants needed
+// to route document completion to the dataset consumer.
 func compiledVariants(chunks []map[string]any) []string {
 	seen := map[string]struct{}{}
 	for _, ck := range chunks {
-		if _, ok := ck["compile_kwd"]; !ok {
+		if _, ok := ck["compile_kwd"]; !ok || enginetypes.IsNavigationRow(ck) {
 			continue
 		}
 		var v kccommon.Variant
-		if kind, ok := ck["compilation_template_kind_kwd"].(string); ok && kind != "" {
+		if kind := enginetypes.CompilationKind(ck); kind != "" {
 			mapped, err := kccommon.KindToVariant(kind)
 			if err != nil {
 				continue // unknown template kind (O2a): skip, do not mis-route
@@ -662,11 +659,11 @@ func compiledVariants(chunks []map[string]any) []string {
 func compiledTaskTypes(chunks []map[string]any) []string {
 	seen := map[string]struct{}{}
 	for _, ck := range chunks {
-		if _, ok := ck["compile_kwd"]; !ok {
+		if _, ok := ck["compile_kwd"]; !ok || enginetypes.IsNavigationRow(ck) {
 			continue
 		}
 		taskType := ""
-		if kind, ok := ck["compilation_template_kind_kwd"].(string); ok && strings.TrimSpace(kind) != "" {
+		if kind := enginetypes.CompilationKind(ck); kind != "" {
 			if mapped, err := kccommon.KindToTaskType(kind); err == nil {
 				taskType = mapped
 			}
@@ -1274,4 +1271,14 @@ func injectDebugChunkCap(inputs map[string]any) map[string]any {
 		inputs[globals.DebugChunkCapKey] = DebugChunkCapDefault
 	}
 	return inputs
+}
+
+// datasetLanguage is the language of the dataset being ingested, or "" when it
+// is unset. It selects the fulltext analyzer on engines that fix it when the
+// chunk store is created.
+func datasetLanguage(taskCtx *TaskContext) string {
+	if taskCtx == nil || taskCtx.KB.Language == nil {
+		return ""
+	}
+	return *taskCtx.KB.Language
 }

@@ -53,17 +53,18 @@ var pagerankAdjustLocks [pagerankAdjustLockCount]sync.Mutex
 // baseName is the table name prefix (e.g., "ragflow_<tenant_id>")
 // The full table name is built as "{baseName}_{datasetID}"
 // For skill index (datasetID="skill"), tableName is just baseName and uses skill_infinity_mapping.json
-func (e *Engine) CreateChunkStore(ctx context.Context, baseName, datasetID string, vectorSize int, parserID string) error {
+// language is the dataset language, which selects the fulltext analyzer; see analyzerForLanguage.
+func (e *Engine) CreateChunkStore(ctx context.Context, baseName, datasetID string, vectorSize int, parserID, language string) error {
 	db, release, err := e.client.checkoutDatabase(ctx, "chunk.go")
 	if err != nil {
 		return fmt.Errorf("failed to get database: %w", err)
 	}
 	defer release()
 
-	return e.createChunkStoreWithDB(db, baseName, datasetID, vectorSize, parserID)
+	return e.createChunkStoreWithDB(db, baseName, datasetID, vectorSize, parserID, language)
 }
 
-func (e *Engine) createChunkStoreWithDB(db *infinity.Database, baseName, datasetID string, vectorSize int, parserID string) error {
+func (e *Engine) createChunkStoreWithDB(db *infinity.Database, baseName, datasetID string, vectorSize int, parserID, language string) error {
 	vecSize := vectorSize
 
 	// Determine table name and mapping file based on index type
@@ -204,7 +205,13 @@ func (e *Engine) createChunkStoreWithDB(db *infinity.Database, baseName, dataset
 	}
 	common.Info("Created vector index", zap.String("indexName", vectorIndexName), zap.String("column", vectorColName))
 
-	// Create full-text indexes for varchar fields with analyzers
+	// Create full-text indexes for varchar fields with analyzers. CreateTable
+	// above is ConflictTypeIgnore, so this may be an existing table whose
+	// analyzer was settled under another language.
+	existingIndexes, err := listIndexNames(table)
+	if err != nil {
+		return fmt.Errorf("failed to list indexes on %s: %w", tableName, err)
+	}
 	for _, fieldName := range schema.Keys {
 		fieldInfo := schema.Fields[fieldName]
 		if fieldInfo.Type != "varchar" || fieldInfo.Analyzer == nil {
@@ -223,11 +230,14 @@ func (e *Engine) createChunkStoreWithDB(db *infinity.Database, baseName, dataset
 			}
 		}
 
-		for _, analyzer := range analyzers {
-			indexNameFt := fmt.Sprintf("ft_%s_%s",
-				regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(fieldName, "_"),
-				regexp.MustCompile(`[^a-zA-Z0-9]`).ReplaceAllString(analyzer, "_"),
-			)
+		wanted := wantedFulltextIndexes(fieldName, analyzers, language)
+		if hasForeignRagIndex(existingIndexes, fieldName, wanted) {
+			common.Info("Table keeps its existing analyzer; this language needs a fresh table",
+				zap.String("tableName", tableName), zap.String("field", fieldName), zap.String("language", language))
+			continue
+		}
+
+		for indexNameFt, analyzer := range wanted {
 			_, err = table.CreateIndex(
 				indexNameFt,
 				infinity.NewIndexInfo(fieldName, infinity.IndexTypeFullText, map[string]string{"ANALYZER": analyzer}),
@@ -309,7 +319,7 @@ func (e *Engine) ensureChunkDataColumn(table *infinity.Table, exists bool) error
 // Table name format: {baseName}_{datasetID}
 // Auto-create the table if it doesn't exist
 // Delete existing rows with matching IDs before insert
-func (e *Engine) InsertChunks(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string) ([]string, error) {
+func (e *Engine) InsertChunks(ctx context.Context, chunks []map[string]interface{}, baseName string, datasetID string, language string) ([]string, error) {
 	tableName := buildChunkTableName(baseName, datasetID)
 	common.Info("InfinityConnection.InsertChunks called", zap.String("tableName", tableName), zap.Int("chunkCount", len(chunks)))
 
@@ -346,8 +356,9 @@ func (e *Engine) InsertChunks(ctx context.Context, chunks []map[string]interface
 			return nil, fmt.Errorf("cannot infer vector size from chunks")
 		}
 
-		// Create table
-		if err := e.createChunkStoreWithDB(db, baseName, datasetID, vectorSize, parserIDFromChunks(chunks)); err != nil {
+		// Create table. This is the path the ingestion pipeline actually takes,
+		// so the dataset language has to reach it here.
+		if err := e.createChunkStoreWithDB(db, baseName, datasetID, vectorSize, parserIDFromChunks(chunks), language); err != nil {
 			return nil, fmt.Errorf("failed to create table: %w", err)
 		}
 
@@ -2537,6 +2548,13 @@ func equivalentConditionToStr(condition map[string]interface{}, tableColumns map
 	Type    string
 	Default interface{}
 }) string {
+	return equivalentConditionToStrRaw(types.CompilationFilter(condition), tableColumns)
+}
+
+func equivalentConditionToStrRaw(condition map[string]interface{}, tableColumns map[string]struct {
+	Type    string
+	Default interface{}
+}) string {
 	if len(condition) == 0 {
 		return ""
 	}
@@ -2544,6 +2562,22 @@ func equivalentConditionToStr(condition map[string]interface{}, tableColumns map
 	var cond []string
 
 	for k, v := range condition {
+		if k == "and" || k == "or" {
+			var children []string
+			for _, child := range types.FilterClauses(v) {
+				if expr := equivalentConditionToStrRaw(child, tableColumns); expr != "" {
+					children = append(children, "("+expr+")")
+				}
+			}
+			operator := " AND "
+			if k == "or" {
+				operator = " OR "
+			}
+			if len(children) > 0 {
+				cond = append(cond, joinBalanced(children, operator))
+			}
+			continue
+		}
 		if k == "_id" || utility.IsEmpty(v) {
 			continue
 		}
@@ -2551,11 +2585,8 @@ func equivalentConditionToStr(condition map[string]interface{}, tableColumns map
 		// Handle must_not specially
 		if k == "must_not" {
 			if m, ok := v.(map[string]interface{}); ok {
-				for kk, vv := range m {
-					if kk == "exists" {
-						// For must_not exists, use !='' since we don't have table schema
-						cond = append(cond, fmt.Sprintf("NOT (%v!='')", vv))
-					}
+				if expr := equivalentConditionToStrRaw(m, tableColumns); expr != "" {
+					cond = append(cond, "NOT ("+expr+")")
 				}
 			}
 			continue

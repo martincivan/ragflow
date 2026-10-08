@@ -100,8 +100,8 @@ type ChunkService struct {
 	storeChunkImageFunc     func(string, string, []byte, string) error
 	removeChunkImageFunc    func(string, string) error
 	markWikiDirtyFunc       func(tenantID, datasetID, documentID string, chunkIDs []string)
-	tokenizeFunc            func(string) (string, error)
-	fineGrainedTokenizeFunc func(string) (string, error)
+	tokenizeFunc            func(text, language string) (string, error)
+	fineGrainedTokenizeFunc func(text, language string) (string, error)
 	numTokensFunc           func(string) int
 }
 
@@ -164,7 +164,7 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	if len(req.Datasets) == 0 {
 		return nil, fmt.Errorf("dataset_ids is required")
 	}
-	modelSolver := service.NewModelSolver()
+	modelFactory := service.NewModelFactory()
 
 	tenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, userID)
 	if err != nil {
@@ -255,40 +255,26 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	}
 
 	// If meta_data_filter method is auto/semi_auto, get chat model
+	var getErr error
 	if filter != nil {
 		method, _ := filter["method"].(string)
 		if method == "auto" || method == "semi_auto" {
+			access := service.ModelAccess{TenantID: tenantIDs[0]}
 			if chatID != "" {
-				// Use chat_id from search_config (it's actually the model name)
-				target, getErr := modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeChat, chatID)
+				chatModelForFilter, getErr = modelFactory.NewChatModel(ctx, access, chatID)
 				if getErr != nil {
 					common.Warn("Failed to get chat model from search_config chat_id, using tenant default", zap.String("chatID", chatID), zap.Error(getErr))
 				} else {
-					chatModelForFilter = models.NewChatModel(target.Driver, &target.ModelName, target.APIConfig)
 					common.Info("Fetched chat model (from search_config) for metadata filter",
 						zap.String("chatID", chatID),
 						zap.String("tenantID", tenantIDs[0]))
 				}
-
 			}
 
-			// If no chatID from search_config, or chatModel not found, use tenant default
 			if chatModelForFilter == nil {
-				tenantSvc := service.NewTenantService()
-				modelName, err := tenantSvc.GetDefaultModelName(ctx, tenantIDs[0], entity.ModelTypeChat)
-				if err != nil || modelName == "" {
-					common.Warn("Failed to get tenant default chat model name for meta_data_filter", zap.Error(err))
-				} else {
-					target, getErr := modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeChat, modelName)
-					if getErr != nil {
-						common.Warn("Failed to get chat model for meta_data_filter", zap.Error(getErr))
-					} else {
-						chatModelForFilter = models.NewChatModel(target.Driver, &target.ModelName, target.APIConfig)
-						common.Info("Fetched chat model (tenant default) for metadata filter",
-							zap.String("tenantID", tenantIDs[0]),
-							zap.String("modelName", modelName))
-					}
-
+				chatModelForFilter, getErr = modelFactory.NewDefaultChatModel(ctx, access)
+				if getErr != nil {
+					common.Warn("Failed to get tenant default chat model for meta_data_filter", zap.Error(getErr))
 				}
 			}
 		}
@@ -324,11 +310,10 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 		if err != nil || llmModelName == "" {
 			common.Warn("Failed to get default chat model name for LLM transformations", zap.Error(err))
 		} else {
-			target, getErr := modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeChat, llmModelName)
-			if getErr != nil {
-				common.Warn("Failed to get chat model for LLM transformations", zap.Error(getErr))
+			chatModel, err = modelFactory.NewChatModel(ctx, service.ModelAccess{TenantID: tenantIDs[0]}, llmModelName)
+			if err != nil {
+				common.Warn("Failed to get chat model for LLM transformations", zap.Error(err))
 			} else {
-				chatModel = models.NewChatModel(target.Driver, &target.ModelName, target.APIConfig)
 				common.Info("Fetched chat model (tenant default) for cross_languages/keyword_extraction",
 					zap.String("tenantID", tenantIDs[0]),
 					zap.String("modelName", llmModelName))
@@ -370,52 +355,50 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	labels := metadataSvc.LabelQuestion(ctx, modifiedQuestion, kbRecords)
 
 	// Determine embedding model.
+	access := service.ModelAccess{TenantID: tenantIDs[0]}
 	var embeddingModel *models.EmbeddingModel
 	var embdID string
-	var target *service.ModelTarget
-	var getErr error
 	if kbRecords[0].TenantEmbdID != nil && *kbRecords[0].TenantEmbdID != "" {
-		target, getErr = modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeEmbedding, *kbRecords[0].TenantEmbdID)
+		embeddingModel, getErr = modelFactory.NewEmbeddingModel(ctx, access, *kbRecords[0].TenantEmbdID)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get embedding model by tenant_embd_id: %w", getErr)
 		}
 	} else if kbRecords[0].EmbdID != "" {
 		embdID = kbRecords[0].EmbdID
-		target, getErr = modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeEmbedding, embdID)
+		embeddingModel, getErr = modelFactory.NewEmbeddingModel(ctx, access, embdID)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get embedding model by embd_id: %w", getErr)
 		}
 	} else {
-		target, getErr = modelSolver.ResolveDefaultModelConfig(ctx, tenantIDs[0], entity.ModelTypeEmbedding)
+		embeddingModel, getErr = modelFactory.NewDefaultEmbeddingModel(ctx, access)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get tenant default embedding model: %w", getErr)
 		}
 	}
-	embeddingModel = models.NewEmbeddingModel(target.Driver, &target.ModelName, target.APIConfig, target.MaxTokens)
 
 	if embeddingModel == nil {
 		return nil, fmt.Errorf("no embedding model found for tenant %s", tenantIDs[0])
 	}
-
+	modelName := ""
+	if info := embeddingModel.Info(); info != nil {
+		modelName = info.Name
+	}
 	common.Info("Fetched embedding model for retrieval",
 		zap.String("tenantID", tenantIDs[0]),
-		zap.String("modelName", target.ModelName))
+		zap.String("modelName", modelName))
 
 	// Get rerank model if RerankID is specified
 	var rerankModel *models.RerankModel
 	if tenantRerankID != nil && *tenantRerankID != "" {
-		target, getErr := modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeRerank, *tenantRerankID)
+		rerankModel, getErr = modelFactory.NewRerankModel(ctx, access, *tenantRerankID)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get rerank model by tenant_rerank_id: %w", getErr)
 		}
-		rerankModel = models.NewRerankModel(target.Driver, &target.ModelName, target.APIConfig, target.MaxTokens)
 	} else if rerankID != nil && *rerankID != "" {
-		rerankCompositeName := *rerankID
-		target, getErr := modelSolver.ResolveModelConfig(ctx, tenantIDs[0], entity.ModelTypeRerank, rerankCompositeName)
+		rerankModel, getErr = modelFactory.NewRerankModel(ctx, access, *rerankID)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get rerank model by rerank_id: %w", getErr)
 		}
-		rerankModel = models.NewRerankModel(target.Driver, &target.ModelName, target.APIConfig, target.MaxTokens)
 	}
 
 	retrievalReq := &nlp.RetrievalRequest{
@@ -433,6 +416,7 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 		RankFeature:            &labels,
 		EmbeddingModel:         embeddingModel,
 		Highlight:              req.Highlight,
+		Language:               entity.KnowledgebasesLanguage(kbRecords),
 	}
 
 	// Call RetrievalService to perform retrieval
@@ -853,7 +837,7 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 		if queryBuilder == nil {
 			queryBuilder = nlp.NewQueryBuilder()
 		}
-		if matchText, _ := queryBuilder.Question(keywords, "", 0.3); matchText != nil {
+		if matchText, _ := queryBuilder.Question(keywords, "", 0.3, datasetLanguageOf(kb)); matchText != nil {
 			matchExprs = append(matchExprs, matchText)
 		}
 	}
@@ -1113,11 +1097,12 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 	}
 
 	// Find the tenant that owns this dataset
-	var targetTenantID string
+	var targetTenantID, language string
 	for _, tenant := range tenants {
 		kb, err := s.kbDAO.GetByIDAndTenantID(ctx, dao.DB, req.DatasetID, tenant.TenantID)
 		if err == nil && kb != nil {
 			targetTenantID = tenant.TenantID
+			language = datasetLanguageOf(kb)
 			break
 		}
 	}
@@ -1169,8 +1154,8 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 
 	// Tokenize content
 	contentStr := d["content_with_weight"].(string)
-	d["content_ltks"], _ = tokenizer.Tokenize(contentStr)
-	d["content_sm_ltks"], _ = tokenizer.FineGrainedTokenize(d["content_ltks"].(string))
+	d["content_ltks"], _ = s.tokenize(contentStr, language)
+	d["content_sm_ltks"], _ = s.fineGrainedTokenize(d["content_ltks"].(string), language)
 
 	// Important keywords - convert []string to []interface{} for transformChunkFields
 	if req.ImportantKwd != nil {
@@ -1392,20 +1377,21 @@ func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkReques
 
 	chunkID := common.ChunkID(req.DocumentID, req.Content)
 	indexName := fmt.Sprintf("ragflow_%s", kb.TenantID)
-	contentLtks, err := s.tokenize(req.Content)
+	language := datasetLanguageOf(kb)
+	contentLtks, err := s.tokenize(req.Content, language)
 	if err != nil {
 		return nil, addChunkError{code: common.CodeServerError, message: fmt.Sprintf("tokenize content: %v", err)}
 	}
-	contentSmLtks, err := s.fineGrainedTokenize(contentLtks)
+	contentSmLtks, err := s.fineGrainedTokenize(contentLtks, language)
 	if err != nil {
 		return nil, addChunkError{code: common.CodeServerError, message: fmt.Sprintf("tokenize content fine-grained: %v", err)}
 	}
-	importantTks, err := s.tokenize(strings.Join(req.ImportantKeywords, " "))
+	importantTks, err := s.tokenize(strings.Join(req.ImportantKeywords, " "), language)
 	if err != nil {
 		return nil, addChunkError{code: common.CodeServerError, message: fmt.Sprintf("tokenize important keywords: %v", err)}
 	}
 	questionKwd := filterTrimmedStrings(req.Questions)
-	questionTks, err := s.tokenize(strings.Join(req.Questions, "\n"))
+	questionTks, err := s.tokenize(strings.Join(req.Questions, "\n"), language)
 	if err != nil {
 		return nil, addChunkError{code: common.CodeServerError, message: fmt.Sprintf("tokenize questions: %v", err)}
 	}
@@ -1481,7 +1467,7 @@ func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkReques
 
 	ctx, cancel := context.WithTimeout(ctx, 600*time.Second)
 	defer cancel()
-	if _, err = s.docEngine.InsertChunks(ctx, []map[string]interface{}{chunkData}, indexName, req.DatasetID); err != nil {
+	if _, err = s.docEngine.InsertChunks(ctx, []map[string]interface{}{chunkData}, indexName, req.DatasetID, datasetLanguageOf(kb)); err != nil {
 		return nil, addChunkError{code: common.CodeServerError, message: fmt.Sprintf("insert chunk: %v", err)}
 	}
 
@@ -1658,18 +1644,20 @@ func filterTrimmedStrings(values []string) []string {
 	return filtered
 }
 
-func (s *ChunkService) tokenize(text string) (string, error) {
+// tokenize tokenizes a manually written chunk field with the dataset language,
+// so it is indexed the way the dataset's parsed chunks are and its queries fold.
+func (s *ChunkService) tokenize(text, language string) (string, error) {
 	if s.tokenizeFunc != nil {
-		return s.tokenizeFunc(text)
+		return s.tokenizeFunc(text, language)
 	}
-	return tokenizer.Tokenize(text)
+	return tokenizer.New(language).Tokenize(text)
 }
 
-func (s *ChunkService) fineGrainedTokenize(text string) (string, error) {
+func (s *ChunkService) fineGrainedTokenize(text, language string) (string, error) {
 	if s.fineGrainedTokenizeFunc != nil {
-		return s.fineGrainedTokenizeFunc(text)
+		return s.fineGrainedTokenizeFunc(text, language)
 	}
-	return tokenizer.FineGrainedTokenize(text)
+	return tokenizer.New(language).FineGrainedTokenize(text)
 }
 
 func (s *ChunkService) numTokens(text string) int {
@@ -1683,11 +1671,11 @@ func (s *ChunkService) getEmbeddingModel(ctx context.Context, tenantID, embdID s
 	if s.getEmbeddingModelFunc != nil {
 		return s.getEmbeddingModelFunc(tenantID, embdID)
 	}
-	target, err := service.NewModelSolver().ResolveModelConfig(ctx, tenantID, entity.ModelTypeEmbedding, embdID)
+	embeddingModel, err := service.NewModelFactory().NewEmbeddingModel(ctx, service.ModelAccess{TenantID: tenantID}, embdID)
 	if err != nil {
 		return nil, err
 	}
-	return models.NewEmbeddingModel(target.Driver, &target.ModelName, target.APIConfig, target.MaxTokens), nil
+	return embeddingModel, nil
 }
 
 func (s *ChunkService) incrementChunkStats(docID, kbID string, tokenNum, chunkNum int64, duration float64) error {
@@ -1870,4 +1858,15 @@ func releaseChunkImageLock(key string) {
 	if lock.refs == 0 {
 		delete(chunkImageLocks.locks, key)
 	}
+}
+
+// datasetLanguageOf is the dataset's language, or "" when unset. A query is
+// folded the way its dataset was indexed, and on engines whose fulltext
+// analyzer is fixed when the chunk store is created a write that may create it
+// has to carry the language too.
+func datasetLanguageOf(kb *entity.Knowledgebase) string {
+	if kb == nil || kb.Language == nil {
+		return ""
+	}
+	return *kb.Language
 }
