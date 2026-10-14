@@ -674,7 +674,7 @@ func TestGenMetaFilter_RefusesAnOversizedValueSpace(t *testing.T) {
 	requireTokenCounts(t)
 	chatModel, driver := newCapturingFilterModelWithContext(t, 256)
 
-	result, err := GenMetaFilter(t.Context(), chatModel, bigMetaData(2000), "which project?", nil)
+	result, err := GenMetaFilter(t.Context(), chatModel, bigMetaData(2000).ValueSpace(), "which project?", nil)
 	if err != nil {
 		t.Fatalf("GenMetaFilter: %v", err)
 	}
@@ -692,7 +692,7 @@ func TestGenMetaFilter_SendsAValueSpaceThatFits(t *testing.T) {
 	chatModel, driver := newCapturingFilterModelWithContext(t, 128000)
 
 	metas := common.MetaData{"project": {"alpha": {"doc-1"}, "beta": {"doc-2"}}}
-	if _, err := GenMetaFilter(t.Context(), chatModel, metas, "which project?", nil); err != nil {
+	if _, err := GenMetaFilter(t.Context(), chatModel, metas.ValueSpace(), "which project?", nil); err != nil {
 		t.Fatalf("GenMetaFilter: %v", err)
 	}
 	if driver.calls != 1 {
@@ -711,7 +711,7 @@ func TestGenMetaFilter_UnresolvedContextLengthUsesTheDefaultBudget(t *testing.T)
 	t.Run("under the default budget the prompt is sent", func(t *testing.T) {
 		chatModel, driver := newCapturingFilterModelWithContext(t, 0)
 
-		if _, err := GenMetaFilter(t.Context(), chatModel, common.MetaData{"project": {"alpha": {"doc-1"}}}, "which project?", nil); err != nil {
+		if _, err := GenMetaFilter(t.Context(), chatModel, common.MetaValueSpace{"project": {"alpha"}}, "which project?", nil); err != nil {
 			t.Fatalf("GenMetaFilter: %v", err)
 		}
 		if driver.calls != 1 {
@@ -726,7 +726,7 @@ func TestGenMetaFilter_UnresolvedContextLengthUsesTheDefaultBudget(t *testing.T)
 			t.Fatalf("fixture is only %d tokens; it must exceed the 8192 default to test the budget", got)
 		}
 
-		result, err := GenMetaFilter(t.Context(), chatModel, metas, "which project?", nil)
+		result, err := GenMetaFilter(t.Context(), chatModel, metas.ValueSpace(), "which project?", nil)
 		if err != nil {
 			t.Fatalf("GenMetaFilter: %v", err)
 		}
