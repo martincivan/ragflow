@@ -17,9 +17,13 @@
 package tokenizer
 
 import (
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"ragflow/internal/common"
 )
 
 type languageDifferentiator struct {
@@ -362,7 +366,7 @@ func TestTokenize_DefaultLanguageResetsAnalyzerState(t *testing.T) {
 	}
 }
 
-func TestTokenize_SlovakCzechFoldDiacriticsAndSkipStemming(t *testing.T) {
+func TestTokenize_SlovakCzechStemThenFoldDiacritics(t *testing.T) {
 	restore := saveEngineType()
 	defer restore()
 	SetEngineType("")
@@ -383,11 +387,17 @@ func TestTokenize_SlovakCzechFoldDiacriticsAndSkipStemming(t *testing.T) {
 		input string
 		want  string
 	}{
-		// The analyzer folds diacritics before splitting, so the split regex
-		// keeps words whole, and stemming/lemmatization are off.
-		{"Slovak", "škola daňové priznanie", "skola danove priznanie"},
-		{"Czech", "příliš žluťoučký kůň", "prilis zlutoucky kun"},
-		// No stemming for folding languages: the token survives unchanged.
+		// The analyzer light-stems the accented word and folds the stem, so
+		// the case forms of "škola" collapse onto one term instead of staying
+		// four, which folding alone cannot do.
+		{"Slovak", "škola daň priznanie", "skol dan priznani"},
+		{"Slovak", "školy škôl školám školách", "skol skol skol skol"},
+		// The superlative prefix "naj-" is stripped too.
+		{"Slovak", "najväčší najlepšie", "vacs lepsi"},
+		{"Czech", "příliš žluťoučký kůň", "prilis zlutouck kun"},
+		{"Czech", "školy škol školám ve školách", "skol skol skol ve skol"},
+		// English lemmatization and Snowball stemming stay off: no Slovak or
+		// Czech rule matches an English word, so it survives unchanged.
 		{"Slovak", "running", "running"},
 	}
 	for _, tt := range tests {
@@ -410,13 +420,101 @@ func TestTokenize_SlovakCzechFoldDiacriticsAndSkipStemming(t *testing.T) {
 		t.Errorf("Tokenize(default, \"running\") = %q, want a stemmed form (English stemming must stay enabled)", engGot)
 	}
 
-	// FineGrainedTokenize on folded tokens must not stem either.
-	fg, err := New("Slovak").FineGrainedTokenize("danove priznanie")
+	// FineGrainedTokenize runs over tokens that Tokenize already stemmed and
+	// folded, so it must leave them alone rather than stem them a second time.
+	fg, err := New("Slovak").FineGrainedTokenize("skol dan priznani")
 	if err != nil {
 		t.Fatalf("FineGrainedTokenize(Slovak) unexpected error: %v", err)
 	}
-	if fg != "danove priznanie" {
-		t.Errorf("FineGrainedTokenize(Slovak, \"danove priznanie\") = %q, want unchanged tokens", fg)
+	if fg != "skol dan priznani" {
+		t.Errorf("FineGrainedTokenize(Slovak, \"skol dan priznani\") = %q, want unchanged tokens", fg)
+	}
+}
+
+func TestTokenize_SlovakLemmaTable(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	SetEngineType("")
+
+	dictPath := common.GetEnv(common.EnvRAGFlowDictPath)
+	if dictPath == "" {
+		dictPath = "/usr/share/infinity/resource"
+	}
+	if _, err := os.Stat(filepath.Join(dictPath, "slovak", "lemma.tsv")); err != nil {
+		t.Skipf("no Slovak lemma table under %s: %v", dictPath, err)
+	}
+
+	if err := Init(&PoolConfig{
+		DictPath:       dictPath,
+		MinSize:        1,
+		MaxSize:        1,
+		IdleTimeout:    5 * time.Second,
+		AcquireTimeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatalf("Failed to initialize pool: %v", err)
+	}
+	defer Close()
+
+	tests := []struct {
+		lang  string
+		input string
+		want  string
+	}{
+		// The table reaches the forms whose stem the suffix rules cannot
+		// recover: on its own the stemmer leaves "psovi" and "ľuďmi" apart
+		// from "pes" and "ľudia".
+		{"Slovak", "psovi pes", "pes pes"},
+		{"Slovak", "ľudí ľuďmi ľudia", "ludi ludi ludi"},
+		{"Slovak", "Ľudí PSOVI", "ludi pes"},
+		// Every form of an adjective meets at its lemma's stem.
+		{"Slovak", "daňové daňového daňový", "danov danov danov"},
+		// Negation stays a term of its own.
+		{"Slovak", "nebezpečný bezpečný", "nebezpecn bezpecn"},
+		// A form the table leaves out keeps its stem: forms shorter than
+		// four letters, and forms hunspell-sk only knows as an unrelated word.
+		{"Slovak", "psa nič tomu", "psa nic tomu"},
+		// Czech has no table.
+		{"Czech", "psovi pes", "psov pes"},
+	}
+	for _, tt := range tests {
+		got, err := New(tt.lang).Tokenize(tt.input)
+		if err != nil {
+			t.Fatalf("Tokenize(%s, %q) unexpected error: %v", tt.lang, tt.input, err)
+		}
+		if got != tt.want {
+			t.Errorf("Tokenize(%s, %q) = %q, want %q", tt.lang, tt.input, got, tt.want)
+		}
+	}
+}
+
+func TestTokenize_SwitchingAwayFromStemAndFoldLanguage(t *testing.T) {
+	restore := saveEngineType()
+	defer restore()
+	SetEngineType("")
+
+	if err := Init(&PoolConfig{
+		DictPath:       "",
+		MinSize:        1,
+		MaxSize:        1,
+		IdleTimeout:    5 * time.Second,
+		AcquireTimeout: 5 * time.Second,
+	}); err != nil {
+		t.Fatalf("Failed to initialize pool: %v", err)
+	}
+	defer Close()
+
+	// Chinese has no Snowball entry, so SetLanguage keeps the previous
+	// stemmer by design. That stemmer must still be the English one: Slovak
+	// and Czech never replace it, they stem from their own instance.
+	if got, err := New("Slovak").Tokenize("školy running"); err != nil || got != "skol running" {
+		t.Fatalf("Tokenize(Slovak) = %q, %v; want %q", got, err, "skol running")
+	}
+	got, err := New("Chinese").Tokenize("running skoly")
+	if err != nil {
+		t.Fatalf("Tokenize(Chinese) unexpected error: %v", err)
+	}
+	if got != "run skoli" {
+		t.Errorf("Tokenize(Chinese, \"running skoly\") = %q, want %q", got, "run skoli")
 	}
 }
 
