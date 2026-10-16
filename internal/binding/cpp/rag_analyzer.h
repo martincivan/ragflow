@@ -19,6 +19,7 @@
 #include "term.h"
 #include "re2/re2.h"
 #include "dart_trie.h"
+#include "slovak_lemmatizer.h"
 #include "wordnet_lemmatizer.h"
 #include "analyzer.h"
 #include <string>
@@ -118,7 +119,7 @@ private:
     // lowercases to a plain "i" so that the mapping stays one-to-one.
     static std::string LowerLatin(const std::string& input);
 
-    // Lemmatize (English only) and stem one already-lowercased term; a
+    // Lemmatize (English, Slovak) and stem one already-lowercased term; a
     // stem-and-fold language stems the accented term and folds the stem
     // afterwards. Mirrors _normalize_token() in Infinity's rag_tokenizer.py.
     std::string NormalizeTerm(const std::string& lowercase_term);
@@ -177,6 +178,8 @@ public:
     std::unique_ptr<Stemmer> stemmer_;
 
     std::unique_ptr<Stemmer> latin_stemmer_; // Slovak/Czech; see SetLanguage()
+
+    const SlovakLemmatizer* slovak_lemmatizer_{nullptr}; // shared, not owned; see SetLanguage()
 
     OpenCC* opencc_{nullptr};
 

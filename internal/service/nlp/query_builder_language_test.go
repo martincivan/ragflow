@@ -60,8 +60,10 @@ func TestQueryBuilder_Question_FoldingLanguage(t *testing.T) {
 		}
 	}
 	// "daňové" and "živnostníkov" are stemmed while they still carry their
-	// diacritics, then folded.
-	for _, want := range []string{"(dan^", "(zivnostnik^"} {
+	// diacritics, then folded. "daňové" stems to "dan", or to "danov" through
+	// its lemma "daňový" when the resource directory has the Slovak lemma
+	// table.
+	for _, want := range []string{"(dan", "(zivnostnik^"} {
 		if !strings.Contains(expr.MatchingText, want) {
 			t.Errorf("Question(Slovak) query missing stemmed, folded term %q: %q", want, expr.MatchingText)
 		}

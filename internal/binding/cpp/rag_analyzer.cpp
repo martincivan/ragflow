@@ -682,7 +682,7 @@ RAGAnalyzer::RAGAnalyzer(const std::string &path)
 }
 
 RAGAnalyzer::RAGAnalyzer(const RAGAnalyzer &other)
-    : own_dict_(false), trie_(other.trie_), pos_table_(other.pos_table_), wordnet_lemma_(other.wordnet_lemma_), stemmer_(std::make_unique<Stemmer>()),
+    : dict_path_(other.dict_path_), own_dict_(false), trie_(other.trie_), pos_table_(other.pos_table_), wordnet_lemma_(other.wordnet_lemma_), stemmer_(std::make_unique<Stemmer>()),
       opencc_(other.opencc_), lowercase_string_buffer_(term_string_buffer_limit_), fine_grained_(other.fine_grained_) {
     InitStemmer(STEM_LANG_ENGLISH);
 }
@@ -720,6 +720,9 @@ void RAGAnalyzer::SetLanguage(const std::string &language) {
     if (stem_and_fold_) {
         latin_stemmer_ = std::make_unique<Stemmer>();
         latin_stemmer_->Init(lang_key == "slovak" ? STEM_LANG_SLOVAK : STEM_LANG_CZECH);
+        // Slovak first looks the token up in a lemma table, which reaches
+        // the forms the suffix rules miss ("ľudí" -> "ľudia").
+        slovak_lemmatizer_ = lang_key == "slovak" ? SlovakLemmatizer::Shared(dict_path_) : nullptr;
         return;
     }
 
@@ -1572,7 +1575,8 @@ std::string RAGAnalyzer::NormalizeTerm(const std::string &lowercase_term) {
     if (stem_and_fold_) {
         std::string stem_term = lowercase_term;
         if (re2::RE2::FullMatch(lowercase_term, latin_word_pattern_)) {
-            latin_stemmer_->Stem(lowercase_term, stem_term);
+            std::string lemma = slovak_lemmatizer_ ? std::string(slovak_lemmatizer_->Lemmatize(lowercase_term)) : lowercase_term;
+            latin_stemmer_->Stem(lemma, stem_term);
         }
         return FoldDiacritics(stem_term);
     }
