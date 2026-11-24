@@ -4,6 +4,7 @@ import humanId from 'human-id';
 import { t } from 'i18next';
 import { lowerFirst } from 'lodash';
 import { useCallback, useMemo } from 'react';
+import { v4 as uuid } from 'uuid';
 import { useTranslation } from 'react-i18next';
 import {
   NodeHandleId,
@@ -13,7 +14,6 @@ import {
   initialArXivValues,
   initialBeginValues,
   initialBingValues,
-  initialBrowserValues,
   initialCategorizeValues,
   initialCodeValues,
   initialCompilationValues,
@@ -34,7 +34,10 @@ import {
   initialSofyaValues,
   initialSearch1APICrawlValues,
   initialSearch1APISearchValues,
+  initialAnySearchSearchValues,
+  initialAnySearchExtractValues,
   initialYouComValues,
+  initialPerplexityValues,
   initialListOperationsValues,
   initialLoopValues,
   initialMessageValues,
@@ -44,7 +47,7 @@ import {
   initialQueritContentsValues,
   initialQueritValues,
   initialRetrievalValues,
-  initialRewriteQuestionValues,
+  initialScoredSwitchValues,
   initialSearXNGValues,
   initialStringTransformValues,
   initialSwitchValues,
@@ -154,6 +157,7 @@ function useAddGroupNode() {
 export const useInitializeOperatorParams = () => {
   const defaultModelDictionary = useFetchDefaultModelDictionary();
   const llmId = defaultModelDictionary.llm_id;
+  const scoringId = defaultModelDictionary.scoring_id;
 
   const initialFormValuesMap = useMemo(() => {
     return {
@@ -163,9 +167,9 @@ export const useInitializeOperatorParams = () => {
         ...initialCategorizeValues,
         llm_id: llmId,
       },
-      [Operator.RewriteQuestion]: {
-        ...initialRewriteQuestionValues,
-        llm_id: llmId,
+      [Operator.ScoredSwitch]: {
+        ...initialScoredSwitchValues,
+        llm_id: scoringId,
       },
       [Operator.Message]: initialMessageValues,
       [Operator.DuckDuckGo]: initialDuckValues,
@@ -197,9 +201,13 @@ export const useInitializeOperatorParams = () => {
       [Operator.QueritSearch]: initialQueritValues,
       [Operator.KeenableSearch]: initialKeenableValues,
       [Operator.YouComSearch]: initialYouComValues,
+      [Operator.PerplexitySearch]: initialPerplexityValues,
       [Operator.SofyaSearch]: initialSofyaValues,
       [Operator.Search1APISearch]: initialSearch1APISearchValues,
       [Operator.Search1APICrawl]: initialSearch1APICrawlValues,
+      [Operator.AnySearchSearch]: initialAnySearchSearchValues,
+      [Operator.AnySearchExtract]: initialAnySearchExtractValues,
+      [Operator.AnySearchDiscover]: { api_key: '' },
       [Operator.UserFillUp]: initialUserFillUpValues,
       [Operator.StringTransform]: initialStringTransformValues,
       [Operator.TavilyExtract]: initialTavilyExtractValues,
@@ -213,6 +221,12 @@ export const useInitializeOperatorParams = () => {
       // The manual chunker shares the title chunker's form (TitleChunkerForm
       // with pinMethodGroup) and initial values, like normalizeOperatorForm.
       [Operator.ManualChunker]: initialTitleChunkerValues,
+      // Parser-internal chunkers are never added through the canvas; these
+      // entries only keep the map exhaustive over Operator.
+      [Operator.TableChunker]: {},
+      [Operator.QAChunker]: {},
+      [Operator.OneChunker]: {},
+      [Operator.PageChunker]: {},
       [Operator.Extractor]: {
         ...getInitialExtractorValues(),
         llm_id: llmId,
@@ -226,17 +240,22 @@ export const useInitializeOperatorParams = () => {
       [Operator.LoopStart]: {},
       [Operator.ExitLoop]: {},
       [Operator.DocGenerator]: initialDocGeneratorValues,
-      [Operator.Browser]: { ...initialBrowserValues, llm_id: llmId },
       [Operator.ExcelProcessor]: {},
-    };
-  }, [defaultModelDictionary, llmId]);
+    } satisfies Record<Operator, unknown>;
+  }, [defaultModelDictionary, llmId, scoringId]);
 
   const initializeOperatorParams = useCallback(
     (operatorName: Operator, position: Position) => {
-      // The map only covers canvas operators; parser-internal chunkers
-      // (Table/QA/One/Page) are never added through this path.
-      const initialValues =
-        initialFormValuesMap[operatorName as keyof typeof initialFormValuesMap];
+      const initialValues = initialFormValuesMap[operatorName];
+      if (operatorName === Operator.ScoredSwitch) {
+        return {
+          ...initialValues,
+          items: [
+            { name: 'option_a', description: '', uuid: uuid() },
+            { name: 'option_b', description: '', uuid: uuid() },
+          ],
+        };
+      }
       if (isBottomSubAgent(operatorName, position)) {
         return {
           ...initialValues,

@@ -27,7 +27,9 @@ import (
 
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
+	"ragflow/internal/permission"
 	"ragflow/internal/service"
+	"ragflow/internal/service/datasetversion"
 	"ragflow/internal/storage"
 	"ragflow/internal/utility"
 
@@ -35,6 +37,18 @@ import (
 )
 
 var syncFilenameUnsafeRE = regexp.MustCompile(`[\\/:*?"<>|]+`)
+
+func syncDocumentParseContext(ctx context.Context, taskContext service.SyncTaskContext) (context.Context, error) {
+	userID := strings.TrimSpace(taskContext.Connector.UserID)
+	if userID == "" {
+		return nil, fmt.Errorf("connector %s has no owner user_id", taskContext.Connector.ID)
+	}
+	tenantID := strings.TrimSpace(taskContext.Connector.TenantID)
+	if tenantID == "" {
+		return nil, fmt.Errorf("connector %s has no tenant_id", taskContext.Connector.ID)
+	}
+	return permission.WithIdentity(ctx, userID, tenantID), nil
+}
 
 // Upsert stores one normalized source document.
 func (s *DocumentService) Upsert(ctx context.Context, input service.DocumentUpsertInput) (service.DocumentUpsertResult, error) {
@@ -78,6 +92,14 @@ func (s *DocumentService) Upsert(ctx context.Context, input service.DocumentUpse
 		return service.DocumentUpsertResult{}, err
 	}
 	if existing != nil && existing.ContentHash != nil && *existing.ContentHash == contentHash {
+		// Content is unchanged but the source may have renamed the document
+		// (a moved node, or a name that only now resolves), so re-align the name.
+		if existing.Name == nil || *existing.Name != filename {
+			if err := s.documentDAO.UpdateByID(ctx, dao.DB, existing.ID, map[string]any{"name": filename}); err != nil {
+				return service.DocumentUpsertResult{}, err
+			}
+			existing.Name = &filename
+		}
 		if err := s.ensureSyncDocumentPostWrite(ctx, input, existing); err != nil {
 			return service.DocumentUpsertResult{}, err
 		}
@@ -126,6 +148,10 @@ func (s *DocumentService) Upsert(ctx context.Context, input service.DocumentUpse
 
 // insertSyncDocument inserts a new synced document and file-manager link.
 func (s *DocumentService) insertSyncDocument(ctx context.Context, input service.DocumentUpsertInput, filename, location, filetype, contentHash, tenantID string) (service.DocumentUpsertResult, error) {
+	// The settings and values the document is created with are recorded under the
+	// upload version this request allocates at the end (see InsertDocument and
+	// afterSyncDocumentUpsert): the sink holds them until the number exists.
+	ctx = datasetversion.WithStateSink(ctx)
 	// base info
 	kb := &input.TaskContext.Knowledgebase
 	kbFolder, err := s.ensureKBFolder(ctx, kb, tenantID)
@@ -136,12 +162,16 @@ func (s *DocumentService) insertSyncDocument(ctx context.Context, input service.
 	// create the 'doc'
 	selection, parserConfig := resolveDocumentParser(ctx, kb, filename, utility.FileType(filetype), kb.ParserConfig)
 	doc := s.newDatasetDocument(kb, tenantID, filename, "", filetype, selection, parserConfig, input.SourceType, int64(len(input.SourceDocument.Blob)), input.SourceDocument.Blob)
+	if ownerID := strings.TrimSpace(kb.CreatedBy); ownerID != "" {
+		doc.CreatedBy = ownerID
+		doc.UserID = ownerID
+	}
 	doc.ID = input.DocumentID
 	// A fingerprint is acknowledged only after all dependent work succeeds.
 	doc.ContentHash = nil
 
 	// put 'file' in mysql `document`
-	if err = s.InsertDocument(doc); err != nil {
+	if err = s.InsertDocument(ctx, doc); err != nil {
 		return service.DocumentUpsertResult{}, err
 	}
 	if err = s.publishSyncDocument(ctx, doc, location); err != nil {
@@ -154,6 +184,16 @@ func (s *DocumentService) insertSyncDocument(ctx context.Context, input service.
 	// write metadata and do `auto_parse` (or not)
 	if err = s.afterSyncDocumentUpsert(ctx, input, doc, false, contentHash); err != nil {
 		return service.DocumentUpsertResult{}, err
+	}
+	// A synced document is an added document: the dataset's history should show
+	// that its content grew even when nobody uploaded it by hand.
+	version, verr := datasetversion.RecordContentVersionChangesOwnTx(ctx, kb.ID, entity.DatasetVersionKindUpload,
+		[]entity.DatasetVersionChange{documentVersionChange(entity.DatasetVersionChangeActionAdd, doc)})
+	if verr != nil {
+		return service.DocumentUpsertResult{}, verr
+	}
+	if verr := datasetversion.FlushStates(ctx, dao.DB, kb.ID, version); verr != nil {
+		return service.DocumentUpsertResult{}, verr
 	}
 
 	return service.DocumentUpsertResult{DocID: doc.ID, Action: service.DocumentActionAdded}, nil
@@ -219,7 +259,11 @@ func (s *DocumentService) afterSyncDocumentUpsert(ctx context.Context, input ser
 	}
 	// do auto_parse if enabled
 	if input.AutoParse {
-		if err := s.StartParseDocuments(ctx, doc, &input.TaskContext.Knowledgebase, input.TaskContext.Connector.TenantID, StartParseOptions{RerunWithDelete: rerun}); err != nil {
+		parseCtx, err := syncDocumentParseContext(ctx, input.TaskContext)
+		if err != nil {
+			return err
+		}
+		if err := s.StartParseDocuments(parseCtx, doc, &input.TaskContext.Knowledgebase, StartParseOptions{RerunWithDelete: rerun}); err != nil {
 			return err
 		}
 	}
@@ -260,7 +304,11 @@ func (s *DocumentService) ensureSyncDocumentPostWrite(ctx context.Context, input
 	if task != nil {
 		return nil
 	}
-	return s.StartParseDocuments(ctx, doc, &input.TaskContext.Knowledgebase, input.TaskContext.Connector.TenantID, StartParseOptions{})
+	parseCtx, err := syncDocumentParseContext(ctx, input.TaskContext)
+	if err != nil {
+		return err
+	}
+	return s.StartParseDocuments(parseCtx, doc, &input.TaskContext.Knowledgebase, StartParseOptions{})
 }
 
 // updateSyncDocumentFile updates the file-manager row linked to a synced document.
@@ -319,17 +367,7 @@ func syncDocumentFilename(name, extension, fallback string) string {
 		name += extension
 	}
 
-	if len(name) <= 255 {
-		return name
-	}
-
-	ext := filepath.Ext(name)
-	baseLimit := 255 - len(ext)
-	if baseLimit < 1 {
-		return name[:255]
-	}
-
-	return name[:baseLimit] + ext
+	return utility.TruncateFilename(name, 255)
 }
 
 // syncDocumentStagedLocation returns a unique object-storage key for unpublished synced content.

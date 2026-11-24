@@ -19,6 +19,7 @@ package infinity
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash/fnv"
 	"maps"
@@ -46,6 +47,7 @@ var ChinesePunctRegex = regexp.MustCompile(`[,，;；、\r\n]+`)
 const (
 	pagerankAdjustRetryCount = 2
 	pagerankAdjustLockCount  = 256
+	infinityMaxInsertRows    = 8192
 )
 
 var pagerankAdjustLocks [pagerankAdjustLockCount]sync.Mutex
@@ -120,7 +122,7 @@ func (e *Engine) createChunkStoreWithDB(db *infinity.Database, baseName, dataset
 	}
 
 	// Determine vector column name
-	vectorColName := fmt.Sprintf("q_%d_vec", vecSize)
+	vectorColName := common.VectorColumnName(vecSize)
 
 	// Check if table already exists
 	exists, err := e.tableExistsWithDB(db, tableName)
@@ -470,17 +472,20 @@ func (e *Engine) InsertChunks(ctx context.Context, chunks []map[string]interface
 	}
 
 	// Insert chunks to dataset
-	_, err = table.Insert(insertChunks)
-	if err != nil {
-		common.Warn("Infinity insert failed",
-			zap.String("tableName", tableName),
-			zap.Int("rows", len(insertChunks)),
-			zap.Strings("rowFields", rowFieldNames(insertChunks)),
-			zap.Error(err))
-		if isConnectionLevelError(err) {
-			e.client.dropConnectionFor(db, "InsertChunks")
+	for start := 0; start < len(insertChunks); start += infinityMaxInsertRows {
+		end := min(start+infinityMaxInsertRows, len(insertChunks))
+		batch := insertChunks[start:end]
+		if _, err = table.Insert(batch); err != nil {
+			common.Warn("Infinity insert failed",
+				zap.String("tableName", tableName),
+				zap.Int("rows", len(batch)),
+				zap.Strings("rowFields", rowFieldNames(batch)),
+				zap.Error(err))
+			if isConnectionLevelError(err) {
+				e.client.dropConnectionFor(db, "InsertChunks")
+			}
+			return nil, fmt.Errorf("failed to insert chunks to dataset: %w", err)
 		}
-		return nil, fmt.Errorf("failed to insert chunks to dataset: %w", err)
 	}
 
 	common.Info("InfinityConnection.InsertChunks result", zap.String("tableName", tableName), zap.Int("count", len(insertChunks)))
@@ -1081,6 +1086,7 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 	}
 
 	orderBy := req.OrderBy
+	mergeMemoryOrder := isMemoryIndex && !hasTextMatch && !hasVectorMatch && orderBy != nil && len(orderBy.Fields) > 0
 	var rankFeature map[string]float64
 	if req.RankFeature != nil {
 		rankFeature = req.RankFeature
@@ -1194,8 +1200,11 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 				}
 			}
 			tableOutputColumns := outputColumns
+			if mergeMemoryOrder {
+				tableOutputColumns = unionSortColumns(tableOutputColumns, orderBy)
+			}
 			if wildcardSelect {
-				tableOutputColumns = expandSelectWildcards(outputColumns, tableColumns)
+				tableOutputColumns = expandSelectWildcards(tableOutputColumns, tableColumns)
 			}
 			tableFilterParts := append([]string(nil), filterParts...)
 			if len(filterCopy) > 0 {
@@ -1276,7 +1285,7 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 
 			// Add vector match if provided
 			if hasVectorMatch {
-				vecFieldName := fmt.Sprintf("q_%d_vec", len(vectorData))
+				vecFieldName := common.VectorColumnName(len(vectorData))
 				dataType := "float"
 				distanceType := "cosine"
 
@@ -1325,15 +1334,18 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 						threshold = s
 					}
 				}
+				denseEF := resolveDenseEF(matchDense, vectorTopN)
 				extraOptions := map[string]string{
 					"threshold": threshold,
 					"filter":    denseFilterStr,
+					"ef":        strconv.Itoa(denseEF),
 				}
 
 				common.Debug("MatchDense for hybrid search",
 					zap.String("fieldName", vecFieldName),
 					zap.String("distanceType", distanceType),
 					zap.Int("topN", vectorTopN),
+					zap.Int("ef", denseEF),
 					zap.Bool("hasFusion", fusionExpr != nil))
 
 				table = table.MatchDense(vecFieldName, vectorData, dataType, distanceType, vectorTopN, extraOptions)
@@ -1383,9 +1395,13 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 			}
 
 			// Set limit and offset
-			table = table.Limit(pageSize)
-			if offset > 0 {
-				table = table.Offset(offset)
+			if mergeMemoryOrder {
+				table = table.Limit(pageSize + offset)
+			} else {
+				table = table.Limit(pageSize)
+				if offset > 0 {
+					table = table.Offset(offset)
+				}
 			}
 
 			// Request total_hits_count from Infinity
@@ -1489,6 +1505,10 @@ func (e *Engine) Search(ctx context.Context, req *types.SearchRequest) (*types.S
 		allResults = sortByScore(allResults, len(allResults))
 	}
 
+	if mergeMemoryOrder {
+		sortChunksByFields(allResults, orderBy)
+		allResults = allResults[min(offset, len(allResults)):]
+	}
 	if len(allResults) > pageSize {
 		allResults = allResults[:pageSize]
 	}
@@ -1511,6 +1531,32 @@ func shouldDefaultAvailableFilter(req *types.SearchRequest, isSkillIndex bool) b
 	return !isSkillIndex && !req.IncludeUnavailable
 }
 
+// defaultDenseEF floors the HNSW candidate pool ("ef") for Infinity dense
+// search. Chunk tables are HNSW-indexed (see createChunkStoreWithDB), and
+// Infinity defaults ef to topN when the caller passes none, which degrades
+// to near-greedy descent on large graphs and silently loses recall: on a
+// 60k-row HNSW graph top-10 self-hit was 54% with the default and 94.5%
+// at ef=200 (#22161).
+const defaultDenseEF = 200
+
+// resolveDenseEF picks the ef for a MatchDense call. An explicit
+// ExtraOptions["ef"] wins when it parses to a positive integer; otherwise
+// the default floor applies, and ef never drops below the requested topN
+// (an ef smaller than topN cannot return topN rows).
+func resolveDenseEF(matchDense *types.MatchDenseExpr, topN int) int {
+	ef := defaultDenseEF
+	if matchDense != nil && matchDense.ExtraOptions != nil {
+		if n, ok := common.GetInt(matchDense.ExtraOptions["ef"]); ok && n > 0 {
+			ef = n
+		} else if s, ok := matchDense.ExtraOptions["ef"].(string); ok {
+			if n, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && n > 0 {
+				ef = n
+			}
+		}
+	}
+	return max(ef, topN)
+}
+
 const (
 	// regexpSearchDefaultLimit caps a regexp search, matching the Elasticsearch
 	// engine so grep_chunks returns the same page on either backend.
@@ -1531,13 +1577,8 @@ func (e *Engine) SearchByRegexp(ctx context.Context, req *types.RegexpSearchRequ
 	if strings.TrimSpace(req.Pattern) == "" {
 		return nil, fmt.Errorf("regexp pattern cannot be empty")
 	}
-	tenantID := strings.TrimSpace(req.TenantID)
-	if tenantID == "" {
-		return nil, fmt.Errorf("tenant id cannot be empty")
-	}
-	// One index per tenant; a list would fan out to unrelated tables.
-	if strings.Contains(tenantID, ",") {
-		return nil, fmt.Errorf("regexp search supports exactly one tenant")
+	if len(req.IndexNames) == 0 {
+		return nil, fmt.Errorf("index names cannot be empty")
 	}
 	// Chunk tables are per dataset: an unscoped request would read the bare
 	// ragflow_<tenant>, which holds no chunks, and report an empty result.
@@ -1563,14 +1604,21 @@ func (e *Engine) SearchByRegexp(ctx context.Context, req *types.RegexpSearchRequ
 	}
 	defer release()
 
-	// Chunk tables are per dataset: ragflow_<tenant>_<datasetID>.
-	baseName := fmt.Sprintf("ragflow_%s", tenantID)
-	tableNames := make([]string, 0, len(req.KbIDs))
-	for _, kbID := range req.KbIDs {
-		if kbID == "" {
-			tableNames = append(tableNames, baseName)
-		} else {
-			tableNames = append(tableNames, fmt.Sprintf("%s_%s", baseName, kbID))
+	// Chunk tables are per dataset: ragflow_<tenant>_<datasetID>. Every index
+	// name is one tenant, and req.KbIDs carries the datasets, so the table list
+	// is index × dataset; a table that does not exist is skipped below.
+	tableNames := make([]string, 0, len(req.IndexNames)*len(req.KbIDs))
+	for _, indexName := range req.IndexNames {
+		indexName = strings.TrimSpace(indexName)
+		if indexName == "" {
+			continue
+		}
+		for _, kbID := range req.KbIDs {
+			if kbID == "" {
+				tableNames = append(tableNames, indexName)
+			} else {
+				tableNames = append(tableNames, fmt.Sprintf("%s_%s", indexName, kbID))
+			}
 		}
 	}
 
@@ -1844,6 +1892,12 @@ func (e *Engine) GetChunk(ctx context.Context, tableName, chunkID string, datase
 	for _, tblName := range tableNames {
 		table, err := db.GetTable(tblName)
 		if err != nil {
+			if isMemoryIndexName(tableName) {
+				var infinityErr *infinity.InfinityException
+				if !errors.As(err, &infinityErr) || infinity.ErrorCode(infinityErr.ErrorCode) != infinity.ErrorCodeTableNotExist {
+					return nil, fmt.Errorf("failed to open message table: %w", err)
+				}
+			}
 			continue
 		}
 
@@ -1851,11 +1905,17 @@ func (e *Engine) GetChunk(ctx context.Context, tableName, chunkID string, datase
 		filter := fmt.Sprintf("id = '%s'", chunkID)
 		result, err := table.Output([]string{"*"}).Filter(filter).ToResult()
 		if err != nil {
+			if isMemoryIndexName(tableName) {
+				return nil, fmt.Errorf("failed to read message: %w", err)
+			}
 			continue
 		}
 
 		qr, ok := result.(*infinity.QueryResult)
 		if !ok {
+			if isMemoryIndexName(tableName) {
+				return nil, fmt.Errorf("unexpected message query result %T", result)
+			}
 			continue
 		}
 
@@ -1899,6 +1959,7 @@ func (e *Engine) GetChunk(ctx context.Context, tableName, chunkID string, datase
 
 	common.Debug("infinity get chunk", zap.String("chunkID", chunkID), zap.Any("tables", tableNames))
 	decodeJSONFields(chunk)
+	decodeVarcharJSONFields(chunk)
 
 	// Memory rows come back under the message mapping's storage columns, which
 	// the chunk field mappings below would mangle.
@@ -1960,6 +2021,12 @@ func (e *Engine) GetChunk(ctx context.Context, tableName, chunkID string, datase
 		chunk["tag_kwd"], _ = splitKeywordList("tag_kwd", val)
 	}
 
+	// Drop the storage-column aliases the mappings derived from, as GetFields
+	// does: an editor echoing "a,b" back as a keyword list gets a 400.
+	for _, col := range []string{"docnm", "important_keywords", "questions", "content", "authors"} {
+		delete(chunk, col)
+	}
+
 	return chunk, nil
 }
 
@@ -2007,6 +2074,11 @@ func chunksFromColumnData(columnData map[string][]interface{}) []map[string]inte
 func applyFieldMappings(chunks []map[string]interface{}) {
 	for _, chunk := range chunks {
 		decodeJSONFields(chunk)
+		// Search always projects tag_feas once a text or vector match exists,
+		// so a search hit carries the column's JSON text unless it is decoded
+		// here too. GetChunk decodes the same column, and the Elasticsearch
+		// backend returns it from _source as an object.
+		decodeVarcharJSONFields(chunk)
 		// docnm -> docnm_kwd, title_tks, title_sm_tks
 		if val, ok := chunk["docnm"].(string); ok {
 			chunk["docnm_kwd"] = val
@@ -2172,6 +2244,12 @@ func mapMemoryMessageStorageFields(row map[string]interface{}) {
 // to the logical fields the memory service reads.
 func normalizeMemoryMessageRows(rows []map[string]interface{}) {
 	for _, row := range rows {
+		for field, value := range row {
+			if vectorColumnPattern.MatchString(field) {
+				row["content_embed"] = value
+				delete(row, field)
+			}
+		}
 		if val, ok := row["message_type_kwd"]; ok {
 			row["message_type"] = val
 			delete(row, "message_type_kwd")
@@ -2389,15 +2467,27 @@ func (e *Engine) GetFields(chunks []map[string]interface{}, fields []string) map
 				continue
 			}
 
-			// _feas: JSON parse (Python lines 762-763)
+			// _feas: JSON parse (Python lines 762-763). Only text is parsed:
+			// Search decodes the column in place through applyFieldMappings and
+			// the retrieval path hands those same chunk maps to GetFields, so
+			// replacing every non-string with an empty map would wipe the map
+			// Search had just decoded and echo {} back to the caller.
 			if strings.HasSuffix(fieldLower, "_feas") {
-				if strVal, ok := val.(string); ok && strVal != "" {
-					var parsed interface{}
-					if err := json.Unmarshal([]byte(strVal), &parsed); err == nil {
-						chunk[field] = parsed
-					}
-				} else {
+				if val == nil {
 					chunk[field] = map[string]interface{}{}
+					continue
+				}
+				strVal, ok := val.(string)
+				if !ok {
+					continue
+				}
+				if strVal == "" {
+					chunk[field] = map[string]interface{}{}
+					continue
+				}
+				var parsed interface{}
+				if err := json.Unmarshal([]byte(strVal), &parsed); err == nil {
+					chunk[field] = parsed
 				}
 				continue
 			}
@@ -3109,7 +3199,8 @@ func equivalentConditionToStrRaw(condition map[string]interface{}, tableColumns 
 
 	var cond []string
 
-	for k, v := range condition {
+	for _, k := range sortedConditionKeys(condition) {
+		v := condition[k]
 		if k == "and" || k == "or" {
 			var children []string
 			for _, child := range types.FilterClauses(v) {
@@ -3130,6 +3221,13 @@ func equivalentConditionToStrRaw(condition map[string]interface{}, tableColumns 
 			continue
 		}
 
+		if memIndex && k == "session_id_contains" {
+			if text, ok := v.(string); ok {
+				pattern := strings.NewReplacer("'", `\x27`, `"`, `\x22`).Replace(regexp.QuoteMeta(text))
+				cond = append(cond, infinity.RegexFilter("session_id", pattern))
+			}
+			continue
+		}
 		// Handle must_not specially
 		if k == "must_not" {
 			if m, ok := v.(map[string]interface{}); ok {
@@ -3362,6 +3460,31 @@ func decodeJSONFields(chunk map[string]interface{}) {
 				}
 			}
 			chunk[fieldName] = decodedList
+		}
+	}
+}
+
+// decodeVarcharJSONFields parses the JSON text transformChunkFields writes into
+// fieldVarcharJSON columns back into a map; empty or nil becomes {}.
+func decodeVarcharJSONFields(chunk map[string]interface{}) {
+	for fieldName, value := range chunk {
+		if !fieldVarcharJSON(fieldName) {
+			continue
+		}
+		text, ok := value.(string)
+		if !ok {
+			if value == nil {
+				chunk[fieldName] = map[string]interface{}{}
+			}
+			continue
+		}
+		if text == "" {
+			chunk[fieldName] = map[string]interface{}{}
+			continue
+		}
+		var decoded interface{}
+		if err := json.Unmarshal([]byte(text), &decoded); err == nil {
+			chunk[fieldName] = decoded
 		}
 	}
 }
@@ -3795,7 +3918,7 @@ func transformChunkFields(chunk map[string]interface{}, embeddingCols [][2]inter
 		default:
 			if fieldJSON(k) {
 				d[k] = encodeJSONField(k, v)
-			} else if strings.HasSuffix(k, "_feas") {
+			} else if fieldVarcharJSON(k) {
 				jsonBytes, _ := json.Marshal(v)
 				d[k] = string(jsonBytes)
 			} else if fieldKeyword(k) {

@@ -20,7 +20,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
-	"sort"
+	"maps"
+	"slices"
 	"strings"
 	"time"
 
@@ -32,22 +33,18 @@ import (
 	"gorm.io/gorm"
 )
 
-var allDatasetTaskTypes = []string{
+var allDatasetTaskTypes = slices.Concat([]string{
 	kccommon.TaskTypeWiki,
 	kccommon.TaskTypeTree,
 	kccommon.TaskTypeGraph,
 	kccommon.TaskTypeMindmap,
-	kccommon.TaskTypeTimeline,
-	kccommon.TaskTypePageIndex,
-}
+}, additionalStructureTaskTypes, []string{kccommon.TaskTypePageIndex})
 
-var structureTaskTypes = []string{
+var structureTaskTypes = slices.Concat([]string{
 	kccommon.TaskTypeGraph,
-	kccommon.TaskTypeTimeline,
-	kccommon.TaskTypePageIndex,
-}
+}, additionalStructureTaskTypes, []string{kccommon.TaskTypePageIndex})
 
-// Dataset ingestion logs use the status values exposed by the Python API and
+// Dataset ingestion logs use the status values exposed by the API and
 // consumed by the shared frontend. The Go scheduler uses a different set of
 // internal terminal names, so translate them at the persistence boundary.
 func datasetLogOperationStatus(status string) string {
@@ -81,7 +78,7 @@ func taskTypesForVariants(variants []string) []string {
 			taskType = kccommon.TaskTypeMindmap
 		case "structure":
 			// Legacy structure events predate the task-type field and cannot
-			// distinguish graph, timeline, and page-index products.
+			// distinguish individual structure products.
 			for _, structureTaskType := range structureTaskTypes {
 				seen[structureTaskType] = struct{}{}
 			}
@@ -127,11 +124,14 @@ func normalizeTaskType(taskType string) string {
 		return kccommon.TaskTypeGraph
 	case "mindmap", "mind_map":
 		return kccommon.TaskTypeMindmap
-	case "timeline":
-		return kccommon.TaskTypeTimeline
 	case "pageindex", "page_index":
 		return kccommon.TaskTypePageIndex
 	default:
+		for _, additional := range additionalStructureTaskTypes {
+			if strings.EqualFold(strings.TrimSpace(taskType), additional) {
+				return additional
+			}
+		}
 		return ""
 	}
 }
@@ -157,16 +157,14 @@ func taskTypesForEntries(entries []BacklogEntry) []string {
 }
 
 func sortedTaskTypes(seen map[string]struct{}) []string {
-	taskTypes := make([]string, 0, len(seen))
-	for taskType := range seen {
-		taskTypes = append(taskTypes, taskType)
+	if len(seen) == 0 {
+		return []string{}
 	}
-	sort.Strings(taskTypes)
-	return taskTypes
+	return slices.Sorted(maps.Keys(seen))
 }
 
-func startDatasetCompileLog(ctx context.Context, tenantID, datasetID, claimToken string, entries []BacklogEntry) error {
-	if kcDB == nil || claimToken == "" {
+func (c *Consumer) startDatasetCompileLog(ctx context.Context, tenantID, datasetID, claimToken string, entries []BacklogEntry) error {
+	if c.db == nil || claimToken == "" {
 		return nil
 	}
 	now := time.Now()
@@ -187,7 +185,7 @@ func startDatasetCompileLog(ctx context.Context, tenantID, datasetID, claimToken
 			}
 		}
 	}
-	return kcDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	return c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, taskType := range sortedTaskTypesFromGroups(groups) {
 			entryData := make([]any, 0, len(groups[taskType]))
 			for _, entry := range groups[taskType] {
@@ -231,37 +229,37 @@ func startDatasetCompileLog(ctx context.Context, tenantID, datasetID, claimToken
 	})
 }
 
-func updateDatasetCompileLog(ctx context.Context, claimToken string, taskTypes []string, progress float64, message string) error {
-	if kcDB == nil || claimToken == "" {
+func (c *Consumer) updateDatasetCompileLog(ctx context.Context, claimToken string, taskTypes []string, progress float64, message string) error {
+	if c.db == nil || claimToken == "" {
 		return nil
 	}
 	for _, taskType := range taskTypes {
-		if err := updateDatasetCompileLogForType(ctx, datasetCompileLogID(claimToken, taskType), progress, message); err != nil {
+		if err := c.updateDatasetCompileLogForType(ctx, datasetCompileLogID(claimToken, taskType), progress, message); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func updateDatasetCompileLogForType(ctx context.Context, logID string, progress float64, message string) error {
-	return recordDatasetCompileLogEvent(ctx, logID, progress, common.RUNNING, dao.EventTypeMessage, message)
+func (c *Consumer) updateDatasetCompileLogForType(ctx context.Context, logID string, progress float64, message string) error {
+	return c.recordDatasetCompileLogEvent(ctx, logID, progress, common.RUNNING, dao.EventTypeMessage, message)
 }
 
-func finishDatasetCompileLog(ctx context.Context, claimToken string, taskTypes []string, operationStatus, message string, progress float64) error {
-	if kcDB == nil || claimToken == "" {
+func (c *Consumer) finishDatasetCompileLog(ctx context.Context, claimToken string, taskTypes []string, operationStatus, message string, progress float64) error {
+	if c.db == nil || claimToken == "" {
 		return nil
 	}
 	for _, taskType := range taskTypes {
 		logID := datasetCompileLogID(claimToken, taskType)
-		if err := recordDatasetCompileLogEvent(ctx, logID, progress, datasetLogOperationStatus(operationStatus), dao.EventTypeTerminal, message); err != nil {
+		if err := c.recordDatasetCompileLogEvent(ctx, logID, progress, datasetLogOperationStatus(operationStatus), dao.EventTypeTerminal, message); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func recordDatasetCompileLogEvent(ctx context.Context, logID string, progress float64, operationStatus string, eventType int, message string) error {
-	return kcDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+func (c *Consumer) recordDatasetCompileLogEvent(ctx context.Context, logID string, progress float64, operationStatus string, eventType int, message string) error {
+	return c.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var log entity.PipelineOperationLog
 		if err := tx.WithContext(ctx).Where("id = ?", logID).First(&log).Error; err != nil {
 			return err

@@ -71,6 +71,7 @@ func Init(configPath string) error {
 	globalViper = v
 
 	globalConfig = &config.Config{}
+	globalConfig.ParseServerNames(v)
 	err := globalConfig.ParseGeneralConfig(v)
 	if err != nil {
 		return fmt.Errorf("parse general config error: %w", err)
@@ -84,11 +85,6 @@ func Init(configPath string) error {
 	err = globalConfig.ParseDocEngineConfig(v)
 	if err != nil {
 		return fmt.Errorf("parse doc engine config error: %w", err)
-	}
-
-	err = globalConfig.ParseStorageEngineConfig(v)
-	if err != nil {
-		return fmt.Errorf("parse storage engine config error: %w", err)
 	}
 
 	err = globalConfig.ParseCacheEngineConfig(v)
@@ -131,6 +127,11 @@ func Init(configPath string) error {
 		return fmt.Errorf("parse syncer config error: %w", err)
 	}
 
+	err = globalConfig.ParseDeepDocConfig(v)
+	if err != nil {
+		return fmt.Errorf("parse deepdoc config error: %w", err)
+	}
+
 	err = globalConfig.ParseLogConfig(v)
 	if err != nil {
 		return fmt.Errorf("parse log config error: %w", err)
@@ -144,6 +145,11 @@ func Init(configPath string) error {
 	err = globalConfig.GetEnvironments()
 	if err != nil {
 		return fmt.Errorf("get environments error: %w", err)
+	}
+
+	err = globalConfig.ParseStorageEngineConfig(v)
+	if err != nil {
+		return fmt.Errorf("parse storage engine config error: %w", err)
 	}
 
 	err = globalConfig.ParseBillingConfig(v)
@@ -161,12 +167,33 @@ func Init(configPath string) error {
 		return fmt.Errorf("parse OAuth config error: %w", err)
 	}
 
+	err = globalConfig.ParseAuditConfig(v)
+	if err != nil {
+		return fmt.Errorf("parse audit log config error: %w", err)
+	}
+
+	err = globalConfig.ParseIngestLogConfig(v)
+	if err != nil {
+		return fmt.Errorf("parse ingestion log config error: %w", err)
+	}
+
 	return nil
 }
 
 // GetConfig gets the global configuration
 func GetConfig() *config.Config {
 	return globalConfig
+}
+
+// MCPAllowPrivateHosts reports whether self-hosted MCP servers on private
+// networks are permitted (ALLOW_ANY_HOST). It is nil-safe:
+// an uninitialized global config yields false so callers fail closed instead
+// of panicking on a nil *config.Config.
+func MCPAllowPrivateHosts() bool {
+	if globalConfig == nil {
+		return false
+	}
+	return globalConfig.GetMCPAllowPrivateHosts()
 }
 
 // GetAllConfigs collects backend connection settings for administrator inspection.
@@ -182,6 +209,9 @@ func GetAllConfigs() ([]map[string]interface{}, error) {
 		mysqlConfig := globalConfig.GetMySQLConfig()
 		exportedMySQLConfigs := mysqlConfig.ExportConfigs()
 		allConfigs = append(allConfigs, exportedMySQLConfigs)
+	case "vastbase":
+		vastbaseConfig := globalConfig.GetVastbaseMetaConfig()
+		allConfigs = append(allConfigs, vastbaseConfig.ExportConfigs())
 	default:
 		return nil, fmt.Errorf("not supported database: %s", databaseType)
 	}
@@ -197,6 +227,9 @@ func GetAllConfigs() ([]map[string]interface{}, error) {
 		infinityConfig := globalConfig.GetInfinityConfig()
 		exportedInfinityConfigs := infinityConfig.ExportConfigs()
 		allConfigs = append(allConfigs, exportedInfinityConfigs)
+	case "opensearch":
+		openSearchConfig := globalConfig.GetOpenSearchConfig()
+		allConfigs = append(allConfigs, openSearchConfig.ExportConfigs())
 	case "oceanbase":
 		oceanBaseConfig := globalConfig.GetOceanBaseConfig()
 		allConfigs = append(allConfigs, oceanBaseConfig.ExportConfigs())

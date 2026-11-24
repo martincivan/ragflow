@@ -1,9 +1,9 @@
+import type { ComponentType } from 'react';
 import { Operator } from '../constant';
 import AgentForm from '../form/agent-form';
 import ArXivForm from '../form/arxiv-form';
 import BeginForm from '../form/begin-form';
 import BingForm from '../form/bing-form';
-import BrowserForm from '../form/browser-use-form';
 import CompilationForm from '../form/compilation-form';
 import CategorizeForm from '../form/categorize-form';
 import CodeForm from '../form/code-form';
@@ -24,7 +24,10 @@ import KeenableForm from '../form/keenable-form';
 import SofyaForm from '../form/sofya-form';
 import Search1APICrawlForm from '../form/search1api-crawl-form';
 import Search1APIForm from '../form/search1api-form';
+import AnySearchExtractForm from '../form/anysearch-extract-form';
+import AnySearchSearchForm from '../form/anysearch-search-form';
 import YouComForm from '../form/youcom-form';
+import PerplexityForm from '../form/perplexity-form';
 import ListOperationsForm from '../form/list-operations-form';
 import LoopForm from '../form/loop-form';
 import MessageForm from '../form/message-form';
@@ -34,7 +37,7 @@ import QueritContentsForm from '../form/querit-contents-form';
 import QueritForm from '../form/querit-form';
 import BGPTForm from '../form/bgpt-form';
 import RetrievalForm from '../form/retrieval-form/next';
-import RewriteQuestionForm from '../form/rewrite-question-form';
+import ScoredSwitchForm from '../form/scored-switch-form';
 import SearXNGForm from '../form/searxng-form';
 import StringTransformForm from '../form/string-transform-form';
 import SwitchForm from '../form/switch-form';
@@ -52,7 +55,13 @@ import WikipediaForm from '../form/wikipedia-form';
 import YahooFinanceForm from '../form/yahoo-finance-form';
 import type { INextOperatorForm } from '../interface';
 
-export const FormConfigMap = {
+type OperatorFormConfig = {
+  component: ComponentType<INextOperatorForm>;
+};
+
+// Not every operator has a config form (e.g. TableChunker/QAChunker/
+// OneChunker/PageChunker); consumers fall back to empty content.
+export const FormConfigMap: Partial<Record<Operator, OperatorFormConfig>> = {
   [Operator.Begin]: {
     component: BeginForm,
   },
@@ -64,9 +73,6 @@ export const FormConfigMap = {
   },
   [Operator.Message]: {
     component: MessageForm,
-  },
-  [Operator.RewriteQuestion]: {
-    component: RewriteQuestionForm,
   },
   [Operator.Code]: {
     component: CodeForm,
@@ -86,6 +92,9 @@ export const FormConfigMap = {
   [Operator.YouComSearch]: {
     component: YouComForm,
   },
+  [Operator.PerplexitySearch]: {
+    component: PerplexityForm,
+  },
   [Operator.SofyaSearch]: {
     component: SofyaForm,
   },
@@ -94,6 +103,12 @@ export const FormConfigMap = {
   },
   [Operator.Search1APICrawl]: {
     component: Search1APICrawlForm,
+  },
+  [Operator.AnySearchSearch]: {
+    component: AnySearchSearchForm,
+  },
+  [Operator.AnySearchExtract]: {
+    component: AnySearchExtractForm,
   },
   [Operator.Wikipedia]: {
     component: WikipediaForm,
@@ -125,6 +140,9 @@ export const FormConfigMap = {
   [Operator.Switch]: {
     component: SwitchForm,
   },
+  [Operator.ScoredSwitch]: {
+    component: ScoredSwitchForm,
+  },
   [Operator.WenCai]: {
     component: WenCaiForm,
   },
@@ -142,9 +160,6 @@ export const FormConfigMap = {
   },
   [Operator.DocGenerator]: {
     component: DocGeneratorForm,
-  },
-  [Operator.Browser]: {
-    component: BrowserForm,
   },
   [Operator.Note]: {
     component: () => <></>,

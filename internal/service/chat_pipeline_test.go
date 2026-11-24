@@ -20,10 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"reflect"
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -33,6 +35,9 @@ import (
 	"ragflow/internal/engine"
 	"ragflow/internal/entity"
 	modelModule "ragflow/internal/entity/models"
+	"ragflow/internal/permission"
+	ragprompts "ragflow/internal/rag/prompts"
+	"ragflow/internal/service/graph"
 )
 
 // dialForTest builds a minimal *entity.Chat suitable for the
@@ -87,7 +92,7 @@ func TestAsyncChat_RejectsNonUserLastMessage(t *testing.T) {
 		{"role": "user", "content": "first"},
 		{"role": "assistant", "content": "last message must not be assistant"},
 	}
-	_, err := s.AsyncChat(t.Context(), "user-1", dialForTest(""), messages, false, nil)
+	_, err := s.AsyncChat(t.Context(), dialForTest(""), messages, false, nil)
 	if err == nil {
 		t.Fatal("expected error for non-user last message, got nil")
 	}
@@ -100,9 +105,60 @@ func TestAsyncChat_RejectsNonUserLastMessage(t *testing.T) {
 // service should return an error before spawning the goroutine.
 func TestAsyncChat_EmptyMessages(t *testing.T) {
 	s := &ChatPipelineService{}
-	_, err := s.AsyncChat(t.Context(), "user-1", dialForTest(""), nil, false, nil)
+	_, err := s.AsyncChat(t.Context(), dialForTest(""), nil, false, nil)
 	if err == nil {
 		t.Fatal("expected error for empty messages, got nil")
+	}
+}
+
+func TestAsyncChatRejectsNonStringUserContent(t *testing.T) {
+	s := &ChatPipelineService{}
+	messages := []map[string]interface{}{{"role": "user", "content": map[string]interface{}{"text": "question"}}}
+	_, err := s.AsyncChat(t.Context(), dialForTest(""), messages, false, nil)
+	if err == nil || !strings.Contains(err.Error(), "messages[0].content is invalid") {
+		t.Fatalf("AsyncChat error = %v, want indexed invalid user content error", err)
+	}
+}
+
+func TestValidateUserMessageContentPreservesTextParts(t *testing.T) {
+	messages := []map[string]interface{}{{
+		"role": "user",
+		"content": []interface{}{
+			map[string]interface{}{"type": "text", "text": "question"},
+		},
+	}}
+	if err := validateUserMessageContent(messages); err != nil {
+		t.Fatalf("valid text content parts rejected: %v", err)
+	}
+}
+
+func TestValidateUserMessageContentRejectsNil(t *testing.T) {
+	messages := []map[string]interface{}{{"role": "user", "content": nil}}
+	if err := validateUserMessageContent(messages); err == nil || !strings.Contains(err.Error(), "messages[0].content") {
+		t.Fatalf("validation error = %v, want indexed missing-content error", err)
+	}
+}
+
+func TestAsyncChatRejectsUnauthorizedDatasetsBeforeStartingPipeline(t *testing.T) {
+	db := setupChatRESTUpdateServiceTestDB(t)
+	insertForeignPrivateDatasetForChatTest(t, db)
+
+	chat := dialForTest("")
+	chat.KBIDs = []interface{}{"kb-private"}
+	results, err := (&ChatPipelineService{}).AsyncChat(
+		serviceTestContext(t, "user-1", "user-1"),
+		chat,
+		[]map[string]interface{}{{"role": "user", "content": "show me the private dataset"}},
+		false,
+		nil,
+	)
+	if err == nil {
+		for range results {
+		}
+		t.Fatal("AsyncChat accepted another user's private dataset")
+	}
+	if !isAccessDeniedOrHidden(err) {
+		t.Fatalf("AsyncChat error = %v, want access denied or hidden resource", err)
 	}
 }
 
@@ -1154,11 +1210,8 @@ func TestBuildChunkFetchSQL(t *testing.T) {
 			wantFound: true,
 		},
 		{
-			// Python's regex is non-greedy, so WHERE-clause extraction
-			// stops at the first occurrence of ORDER BY / LIMIT / GROUP BY.
-			// Python's subsequent SQL string is then
-			// "select doc_id, ... from t where {where}", which DROPS
-			// the order by / limit suffixes. Go matches this behavior.
+			// The secondary fetch drops the aggregate query's trailing clauses
+			// and applies its own limit.
 			name:      "WHERE + ORDER BY + LIMIT 5 (suffixes dropped, no extra limit)",
 			sql:       "select * from t where x = 1 order by y limit 5",
 			multiKB:   false,
@@ -1195,7 +1248,7 @@ func TestBuildChunkFetchSQL(t *testing.T) {
 			if tc.name == "Infinity expectedCol is docnm (not _kwd)" {
 				expectedCol = "docnm"
 			}
-			gotSQL, gotFound := buildChunkFetchSQL(tc.sql, "t", expectedCol, tc.multiKB)
+			gotSQL, gotFound := buildChunkFetchSQL(tc.sql, "t", expectedCol, tc.multiKB, "elasticsearch")
 			if gotFound != tc.wantFound {
 				t.Errorf("found = %v, want %v", gotFound, tc.wantFound)
 			}
@@ -1282,13 +1335,13 @@ type sqlFakeEngine struct {
 	sqlCalls   *[]string
 	rowsBySQL  map[string][]map[string]interface{}
 	errBySQL   map[string]error
-	runSQL     func(ctx context.Context, table, sqlText string, kbIDs []string) ([]map[string]interface{}, error)
+	runSQL     func(ctx context.Context, sqlText string) ([]map[string]interface{}, error)
 }
 
 func (f *sqlFakeEngine) GetType() string { return f.engineType }
-func (f *sqlFakeEngine) RunSQL(ctx context.Context, table, sqlText string, kbIDs []string, format string) ([]map[string]interface{}, error) {
+func (f *sqlFakeEngine) RunSQL(ctx context.Context, sqlText string, format string) ([]map[string]interface{}, error) {
 	if f.runSQL != nil {
-		return f.runSQL(ctx, table, sqlText, kbIDs)
+		return f.runSQL(ctx, sqlText)
 	}
 	if f.sqlCalls != nil {
 		*f.sqlCalls = append(*f.sqlCalls, sqlText)
@@ -1325,7 +1378,7 @@ func TestFetchAggregateChunks_SkipsInfinityMultiKB(t *testing.T) {
 // TestFetchAggregateChunks_SingleKBSuccess verifies the secondary fetch
 // path populates chunks and doc_aggs correctly.
 func TestFetchAggregateChunks_SingleKBSuccess(t *testing.T) {
-	chunksSQL := "select doc_id, docnm_kwd from t where x = 1 limit 20"
+	chunksSQL := "select doc_id, docnm_kwd from t WHERE (x = 1) AND (kb_id = '" + scopeAllowedKB + "') limit 20"
 	sqlEngine := &sqlFakeEngine{
 		engineType: "elasticsearch",
 		rowsBySQL: map[string][]map[string]interface{}{
@@ -1340,7 +1393,7 @@ func TestFetchAggregateChunks_SingleKBSuccess(t *testing.T) {
 	chunks, docAggs := s.fetchAggregateChunks(
 		t.Context(), sqlEngine, "t",
 		"select count(*) from t where x = 1",
-		"docnm_kwd", []string{"kb_a"},
+		"docnm_kwd", []string{scopeAllowedKB},
 	)
 	if len(chunks) != 3 {
 		t.Fatalf("chunks len = %d, want 3", len(chunks))
@@ -1358,8 +1411,8 @@ func TestFetchAggregateChunks_SingleKBSuccess(t *testing.T) {
 	}
 	// Single-kb: each chunk gets kb_id from the dialog's kb list.
 	for i, c := range chunks {
-		if c["kb_id"] != "kb_a" {
-			t.Errorf("chunks[%d].kb_id = %v, want kb_a", i, c["kb_id"])
+		if c["kb_id"] != scopeAllowedKB {
+			t.Errorf("chunks[%d].kb_id = %v, want %s", i, c["kb_id"], scopeAllowedKB)
 		}
 	}
 }
@@ -1381,9 +1434,11 @@ func TestFetchAggregateChunks_NoWhereClause(t *testing.T) {
 
 // TestFetchAggregateChunks_RunSQLError verifies graceful failure.
 func TestFetchAggregateChunks_RunSQLError(t *testing.T) {
+	called := false
 	sqlEngine := &sqlFakeEngine{
 		engineType: "elasticsearch",
-		runSQL: func(ctx context.Context, table, sqlText string, kbIDs []string) ([]map[string]interface{}, error) {
+		runSQL: func(ctx context.Context, sqlText string) ([]map[string]interface{}, error) {
+			called = true
 			return nil, fmt.Errorf("engine boom")
 		},
 	}
@@ -1391,8 +1446,11 @@ func TestFetchAggregateChunks_RunSQLError(t *testing.T) {
 	chunks, docAggs := s.fetchAggregateChunks(
 		t.Context(), sqlEngine, "t",
 		"select count(*) from t where x = 1",
-		"docnm_kwd", []string{"kb_a"},
+		"docnm_kwd", []string{scopeAllowedKB},
 	)
+	if !called {
+		t.Fatal("expected the secondary query to execute")
+	}
 	if chunks != nil || docAggs != nil {
 		t.Errorf("expected nil on RunSQL error, got %v / %v", chunks, docAggs)
 	}
@@ -1470,7 +1528,7 @@ func TestBuildSQLReference_AggregateMissingSourceColumnsSecondaryFetch(t *testin
 	rows := []map[string]interface{}{
 		{"count": 42.0, "label": "total"},
 	}
-	chunksSQL := "select doc_id, docnm_kwd from t where x = 1 limit 20"
+	chunksSQL := "select doc_id, docnm_kwd from t WHERE (x = 1) AND (kb_id = '" + scopeAllowedKB + "') limit 20"
 	sqlEngine := &sqlFakeEngine{
 		engineType: "elasticsearch",
 		rowsBySQL: map[string][]map[string]interface{}{
@@ -1479,7 +1537,7 @@ func TestBuildSQLReference_AggregateMissingSourceColumnsSecondaryFetch(t *testin
 			},
 		},
 	}
-	kbs := []*entity.Knowledgebase{{ID: "kb_a"}}
+	kbs := []*entity.Knowledgebase{{ID: scopeAllowedKB}}
 	s := &ChatPipelineService{}
 	ans, ref := s.buildSQLReference(
 		t.Context(), sqlEngine, "t",
@@ -1593,6 +1651,30 @@ func TestBuildChatConfig_RequestOverrides(t *testing.T) {
 	}
 }
 
+func TestBuildChatConfigThinkingDefaults(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		saved   any
+		request map[string]interface{}
+		want    bool
+	}{
+		{name: "unset"},
+		{name: "saved default", saved: "default"},
+		{name: "saved enabled", saved: "enabled", want: true},
+		{name: "saved bool enabled", saved: true, want: true},
+		{name: "request default overrides enabled", saved: true, request: map[string]interface{}{"thinking": "default"}},
+		{name: "request enabled", request: map[string]interface{}{"thinking": true}, want: true},
+		{name: "request disabled", saved: true, request: map[string]interface{}{"thinking": false}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := BuildChatConfig(&entity.Chat{LLMSetting: entity.JSONMap{"thinking": tc.saved}}, tc.request)
+			if cfg.Thinking == nil || *cfg.Thinking != tc.want {
+				t.Fatalf("Thinking = %v, want %v", cfg.Thinking, tc.want)
+			}
+		})
+	}
+}
+
 // TestBuildChatConfig_FromEmptyDialog verifies the merger works even when
 // dialog.LLMSetting is nil.
 func TestBuildChatConfig_FromEmptyDialog(t *testing.T) {
@@ -1626,6 +1708,199 @@ func TestClampChatConfigMaxTokensUsesRemainingBudget(t *testing.T) {
 	}
 	if dialog.LLMSetting["max_tokens"] != float64(1024) {
 		t.Fatalf("dialog max_tokens was mutated: %v", dialog.LLMSetting["max_tokens"])
+	}
+}
+
+func TestCompletionReserveTiers(t *testing.T) {
+	maxTokens := func(v int) *modelModule.ChatConfig { return &modelModule.ChatConfig{MaxTokens: &v} }
+	for _, tc := range []struct {
+		name      string
+		cfg       *modelModule.ChatConfig
+		maxOutput int
+		window    int
+		want      int
+	}{
+		{"chat max_tokens is honoured exactly", maxTokens(1000), 2048, 32768, 1000},
+		{"chat max_tokens is not capped at a quarter", maxTokens(20000), 2048, 32768, 20000},
+		{"model max output below a quarter", &modelModule.ChatConfig{}, 2048, 32768, 2048},
+		{"model max output capped at a quarter", &modelModule.ChatConfig{}, 131072, 32768, 8192},
+		{"default reserve", nil, 0, 32768, defaultCompletionReserve},
+		{"default reserve capped at a quarter", nil, 0, 8000, 2000},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := completionReserve(tc.cfg, tc.maxOutput, tc.window); got != tc.want {
+				t.Errorf("completionReserve = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestBuildLLMModelConfigCarriesMaxOutput(t *testing.T) {
+	cfg, _, _, _, err := NewChatPipelineService().buildLLMModelConfig(&modelModule.ModelInfo{Name: "m", ContextLength: 32768, MaxOutput: 8192})
+	if err != nil {
+		t.Fatalf("buildLLMModelConfig: %v", err)
+	}
+	if got, _ := cfg["max_output"].(int); got != 8192 {
+		t.Errorf("max_output = %v, want 8192", cfg["max_output"])
+	}
+}
+
+func TestKnowledgeTokenBudgetSubtractsTemplateCitationAndReserve(t *testing.T) {
+	s := NewChatPipelineService()
+	template := "You are a helpful assistant. Answer from the knowledge base.\n{knowledge}"
+	kwargs := map[string]interface{}{"knowledge": strings.Repeat("caller knowledge ", 500)}
+	templateTokens := graph.NumTokensFromString("You are a helpful assistant. Answer from the knowledge base.\n ")
+	citationTokens := graph.NumTokensFromString(ragprompts.CitationPrompt(""))
+	if got, want := s.knowledgeTokenBudget(32768, template, kwargs, true, 4096), 32768-templateTokens-citationTokens-4096; got != want {
+		t.Errorf("quoted budget = %d, want %d", got, want)
+	}
+	if got, want := s.knowledgeTokenBudget(32768, template, kwargs, false, 4096), 32768-templateTokens-4096; got != want {
+		t.Errorf("unquoted budget = %d, want %d", got, want)
+	}
+	if _, ok := kwargs["knowledge"]; !ok {
+		t.Error("knowledgeTokenBudget must not change the caller's kwargs")
+	}
+	if got := s.knowledgeTokenBudget(100, strings.Repeat("word ", 200), nil, false, 25); got != 0 {
+		t.Errorf("a template larger than the window must leave no budget, got %d", got)
+	}
+}
+
+func TestKnowledgeTokenBudgetSplitsAcrossKnowledgeInsertions(t *testing.T) {
+	s := NewChatPipelineService()
+	for _, tc := range []struct {
+		name, template, rendered string
+		insertions               int
+	}{
+		{"no placeholder, appended once", "Answer from the knowledge base.", "Answer from the knowledge base.", 1},
+		{"one placeholder", "Answer from the knowledge base.\n{knowledge}", "Answer from the knowledge base.\n ", 1},
+		{"two placeholders", "Answer from the knowledge base.\n{knowledge}\nAgain:\n{knowledge}", "Answer from the knowledge base.\n \nAgain:\n ", 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			want := (32768 - graph.NumTokensFromString(tc.rendered) - 4096) / tc.insertions
+			if got := s.knowledgeTokenBudget(32768, tc.template, nil, false, 4096); got != want {
+				t.Errorf("budget = %d, want %d", got, want)
+			}
+		})
+	}
+}
+
+func TestKBPromptKeepsNoPassageWithoutBudget(t *testing.T) {
+	s := NewChatPipelineService()
+	kbinfos := map[string]interface{}{"chunks": []map[string]interface{}{
+		{"content_with_weight": "The regional council approved the budget amendment.", "docnm_kwd": "a.pdf"},
+		{"content_with_weight": "The amendment takes effect next year.", "docnm_kwd": "b.pdf"},
+	}}
+	for _, budget := range []int{0, -1} {
+		if got := s.kbPrompt(kbinfos, budget); len(got) != 0 {
+			t.Errorf("kbPrompt(budget %d) kept %d passages, want none", budget, len(got))
+		}
+	}
+}
+
+// A zero knowledge budget keeps every retrieved chunk out of the prompt, so the
+// empty-response fallback must not send them as references; an empty retrieval
+// keeps closing with the retrieval result.
+func TestEmptyResponseReferenceOmitsChunksOutsideThePrompt(t *testing.T) {
+	s := NewChatPipelineService()
+	retrieved := map[string]interface{}{
+		"total": 1,
+		"chunks": []map[string]interface{}{
+			{"content_with_weight": "The regional council approved the budget amendment.", "doc_id": "d1", "docnm_kwd": "a.pdf"},
+		},
+		"doc_aggs": []interface{}{map[string]interface{}{"doc_id": "d1", "doc_name": "a.pdf", "count": 1}},
+	}
+	budget := s.knowledgeTokenBudget(100, strings.Repeat("word ", 200), nil, true, 25)
+	knowledges := s.kbPrompt(retrieved, budget)
+	if !emptyResponseApplies(len(knowledges), "", false) {
+		t.Fatalf("budget %d kept %d passages, want the fallback to apply", budget, len(knowledges))
+	}
+	if ref := emptyResponseReference(retrieved, knowledges, true); len(ref) != 0 {
+		t.Errorf("zero budget, quote on: reference = %#v, want empty", ref)
+	}
+
+	empty := map[string]interface{}{"total": 0, "chunks": []map[string]interface{}{}, "doc_aggs": []interface{}{}}
+	if ref := emptyResponseReference(empty, nil, true); !reflect.DeepEqual(ref, empty) {
+		t.Errorf("empty retrieval, quote on: reference = %#v, want the retrieval result", ref)
+	}
+	if ref := emptyResponseReference(empty, nil, false); ref == nil || len(ref) != 0 {
+		t.Errorf("quote off: reference = %#v, want an explicit empty object", ref)
+	}
+}
+
+const fullWindowTemplate = "You are a helpful assistant. Answer from the knowledge base.\n{knowledge}"
+
+// fillWindowAndClamp runs the request-building steps of AsyncChat's phase 10 on a
+// retrieval far larger than the window: passages sized by knowledgeTokenBudget,
+// system prompt formatted with the prompt parameters in params, citation rules
+// appended, messages fitted at 95% of the window, completion clamped. The
+// passages are about 550 tokens each, near the default chunk size. It returns
+// the room left for the completion.
+func fillWindowAndClamp(t *testing.T, window int, cfg *modelModule.ChatConfig, maxOutput int, template string, params map[string]interface{}) int {
+	t.Helper()
+	s := NewChatPipelineService()
+	chunks := make([]map[string]interface{}, 0, 200)
+	for i := 0; i < 200; i++ {
+		chunks = append(chunks, map[string]interface{}{
+			"content_with_weight": strings.Repeat(fmt.Sprintf("Passage %d: the regional council approved the budget amendment for the year. ", i), 35),
+			"docnm_kwd":           fmt.Sprintf("document-%d.pdf", i),
+		})
+	}
+	kbinfos := map[string]interface{}{"chunks": chunks}
+
+	reserve := completionReserve(cfg, maxOutput, window)
+	kwargs := maps.Clone(params)
+	if kwargs == nil {
+		kwargs = map[string]interface{}{}
+	}
+	knowledges := s.kbPrompt(kbinfos, s.knowledgeTokenBudget(window, template, kwargs, true, reserve))
+	if len(knowledges) == 0 || len(knowledges) == len(chunks) {
+		t.Fatalf("kept %d of %d passages; the retrieval must be cut by the budget", len(knowledges), len(chunks))
+	}
+	kwargs["knowledge"] = "\n------\n" + strings.Join(knowledges, "\n\n------\n\n")
+	messages := []map[string]interface{}{
+		{"role": "system", "content": s.formatPrompt(template, kwargs)},
+		{"role": "user", "content": "Which budget amendments did the regional council approve this year?"},
+	}
+	used, _ := s.messageFitIn(messages, int(float64(window)*0.95))
+	citation := graph.NumTokensFromString(ragprompts.CitationPrompt(""))
+	if _, _, err := clampChatConfigMaxTokens(cfg, window, used+citation); err != nil {
+		t.Fatalf("full-window retrieval left no completion room: %v", err)
+	}
+	return window - used - citation
+}
+
+func TestFullWindowRetrievalKeepsDefaultCompletionReserve(t *testing.T) {
+	if room := fillWindowAndClamp(t, 32768, &modelModule.ChatConfig{}, 0, fullWindowTemplate, nil); room < defaultCompletionReserve {
+		t.Errorf("completion room = %d tokens, want at least the %d-token reserve", room, defaultCompletionReserve)
+	}
+}
+
+func TestFullWindowRetrievalKeepsModelMaxOutputReserve(t *testing.T) {
+	if room := fillWindowAndClamp(t, 32768, &modelModule.ChatConfig{}, 131072, fullWindowTemplate, nil); room < 32768/4 {
+		t.Errorf("completion room = %d tokens, want at least a quarter of the window (%d)", room, 32768/4)
+	}
+}
+
+func TestFullWindowRetrievalKeepsReserveWithLargePromptParameter(t *testing.T) {
+	const template = "You are a helpful assistant. Answer from the knowledge base.\nCase file:\n{case_file}\n{knowledge}"
+	params := map[string]interface{}{"case_file": strings.Repeat("The applicant filed an appeal against the permit decision. ", 600)}
+	if tokens := graph.NumTokensFromString(params["case_file"].(string)); tokens < 4000 {
+		t.Fatalf("case_file is %d tokens, want a parameter of several thousand", tokens)
+	}
+	if room := fillWindowAndClamp(t, 32768, &modelModule.ChatConfig{}, 0, template, params); room < defaultCompletionReserve {
+		t.Errorf("completion room = %d tokens, want at least the %d-token reserve", room, defaultCompletionReserve)
+	}
+}
+
+func TestFullWindowRetrievalHonoursChatMaxTokens(t *testing.T) {
+	maxTokens := 6000
+	cfg := BuildChatConfig(&entity.Chat{LLMSetting: entity.JSONMap{"max_tokens": float64(maxTokens)}}, nil)
+	fillWindowAndClamp(t, 32768, cfg, 2048, fullWindowTemplate, nil)
+	if cfg.MaxTokens == nil {
+		t.Fatalf("max_tokens sent to the model is unset, want exactly %d", maxTokens)
+	}
+	if *cfg.MaxTokens != maxTokens {
+		t.Errorf("max_tokens sent to the model = %d, want exactly %d", *cfg.MaxTokens, maxTokens)
 	}
 }
 
@@ -1686,7 +1961,7 @@ func TestAsyncChatEmptyResponseQuoteDisabled(t *testing.T) {
 	if err := db.AutoMigrate(&entity.Knowledgebase{}); err != nil {
 		t.Fatal(err)
 	}
-	if err := db.Create(&entity.Knowledgebase{ID: "kb-1", TenantID: "tenant-1", Name: "Knowledge"}).Error; err != nil {
+	if err := db.Create(&entity.Knowledgebase{ID: "kb-1", TenantID: "tenant-1", CreatedBy: "user-1", Name: "Knowledge"}).Error; err != nil {
 		t.Fatal(err)
 	}
 
@@ -1694,7 +1969,8 @@ func TestAsyncChatEmptyResponseQuoteDisabled(t *testing.T) {
 	chat.KBIDs = entity.JSONSlice{"kb-1"}
 	chat.PromptConfig["system"] = "Answer using {knowledge}"
 	chat.PromptConfig["empty_response"] = "Nothing found."
-	results, err := NewChatPipelineService().AsyncChat(t.Context(), "user-1", chat,
+	ctx := serviceTestContext(t, "user-1", "tenant-1")
+	results, err := NewChatPipelineService().AsyncChat(ctx, chat,
 		[]map[string]interface{}{{"role": "user", "content": "Question"}}, true,
 		map[string]interface{}{"quote": false})
 	if err != nil {
@@ -1808,7 +2084,7 @@ func setupChatPipelineToolSupportTestDB(t *testing.T) *gorm.DB {
 	activeStatus := "1"
 	rows := []interface{}{
 		&entity.UserTenant{ID: "user-tenant-1", UserID: "user-1", TenantID: "tenant-1", Role: "owner", InvitedBy: "user-1", Status: &activeStatus},
-		&entity.TenantModelProvider{ID: "provider-zhipu", TenantID: "tenant-1", ProviderName: "ZHIPU-AI"},
+		&entity.TenantModelProvider{ID: "provider-zhipu", UserID: "user-1", TenantID: "tenant-1", ProviderName: "ZHIPU-AI"},
 		&entity.TenantModelInstance{ID: "instance-zhipu", ProviderID: "provider-zhipu", InstanceName: "default", APIKey: "sk-test", Status: "active", Extra: "{}"},
 		&entity.TenantModel{ID: "model-tools-on", ProviderID: "provider-zhipu", InstanceID: "instance-zhipu", ModelName: "glm-4-plus", ModelType: int(entity.ModelTypeChat), Status: "active", Extra: `{"is_tools":true}`},
 		&entity.TenantModel{ID: "model-tools-off", ProviderID: "provider-zhipu", InstanceID: "instance-zhipu", ModelName: "glm-4-flash", ModelType: int(entity.ModelTypeChat), Status: "active", Extra: `{"is_tools":false}`},
@@ -1826,17 +2102,19 @@ func setupChatPipelineToolSupportTestDB(t *testing.T) *gorm.DB {
 	return db
 }
 
-// seedChatPipelineToolSupportTenant sets the tenant's default chat model, which
+// seedChatPipelineToolSupportTenant sets the owner membership's default chat model, which
 // the no-explicit-LLM branch of the probe resolves.
 func seedChatPipelineToolSupportTenant(t *testing.T, db *gorm.DB, defaultLLMID string) {
 	t.Helper()
 	status := string(entity.StatusValid)
 	if err := db.Create(&entity.Tenant{
 		ID:     "tenant-1",
-		LLMID:  defaultLLMID,
 		Status: &status,
 	}).Error; err != nil {
 		t.Fatalf("failed to create tenant: %v", err)
+	}
+	if err := db.Model(&entity.UserTenant{}).Where("id = ?", "user-tenant-1").Update("llm_id", defaultLLMID).Error; err != nil {
+		t.Fatalf("failed to configure owner default model: %v", err)
 	}
 }
 
@@ -1885,7 +2163,7 @@ func TestResolveModelConfigRejectsImage2TextOnlyModel(t *testing.T) {
 	svc := NewChatPipelineService()
 
 	_, err := svc.ModelFactory.resolveConfig(
-		t.Context(), ModelAccess{TenantID: "tenant-1"}, entity.ModelTypeChat, "model-image2text-tools",
+		permission.WithTenantID(t.Context(), "tenant-1"), entity.ModelTypeChat, "model-image2text-tools",
 	)
 	if err == nil {
 		t.Fatal("ResolveModelConfig accepted an image2text-only model as chat")
@@ -2000,6 +2278,20 @@ func TestResolveReasoningLevelReadsAgenticLevel(t *testing.T) {
 	}
 }
 
+// TestEngineLevelsPinTheFrontendContract pins the engine level numbers: a
+// mismatch means the UI and this package disagree on which number means which
+// engine (mode 5 smart-reasoning, 6 planer-explorer-auditor, 7 IterSynth,
+// 8 Codex; the values message-input/next.tsx sends).
+func TestEngineLevelsPinTheFrontendContract(t *testing.T) {
+	if reasoningLevelAgentic != 5 {
+		t.Fatalf("reasoningLevelAgentic = %d, want 5 (the level message-input/next.tsx sends)", reasoningLevelAgentic)
+	}
+	if reasoningLevelPlanExplorer != 6 || reasoningLevelIterative != 7 || reasoningLevelCodex != 8 {
+		t.Fatalf("engine levels = plan:%d iter:%d codex:%d, want 6/7/8 (message-input/next.tsx)",
+			reasoningLevelPlanExplorer, reasoningLevelIterative, reasoningLevelCodex)
+	}
+}
+
 // TestQuoteEnabledNeedsBothSourcesToAgree pins the effective citation setting:
 // the request and the dialog each get a veto, and an absent setting on either
 // side leaves citations on.
@@ -2034,36 +2326,90 @@ func TestQuoteEnabledNeedsBothSourcesToAgree(t *testing.T) {
 	}
 }
 
-// TestAgenticDispatchRequiresKnowledgeBaseScope pins that the agentic branch is
-// unreachable without a knowledge base.
+// TestSelectAgenticEngine pins the engine dispatch: which agentic engine a turn
+// runs on, from the reasoning level alone. Modes 5/6 are unreachable without a
+// knowledge base; mode 8 is reachable with or without one.
 //
-// The agent resolves a citation against an explicit kb_id scope, and
-// buildBoolQueryFromCondition drops that term when the scope is empty — so an
-// agentic turn on a KB-less dialog would resolve a cited chunk out of ANY KB in
-// the tenant. The dispatch therefore falls through instead of running the agent
-// with an unbounded scope, which keeps the empty-scope query unconstructible
-// rather than trusting each retrieval path to defend itself.
-func TestAgenticDispatchRequiresKnowledgeBaseScope(t *testing.T) {
+// Modes 5/6 resolve citations against an explicit kb_id scope, and
+// buildBoolQueryFromCondition drops that term when the scope is empty — so a turn
+// on a KB-less dialog would resolve a cited chunk out of ANY KB in the tenant. The
+// dispatch therefore falls through for them instead of running an engine with an
+// unbounded scope, keeping the empty-scope query unconstructible rather than trusting
+// each retrieval path to defend itself. mode 8 instead lets Codex converse without a
+// KB and makes the MCP retrieval tools error on a no-scope call (see the mode 8 plan).
+//
+// It calls the production selector rather than re-deriving it: an earlier version of
+// this test mirrored the condition, which would have kept passing while the real
+// branch said something else.
+func TestSelectAgenticEngine(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
+		level  int
 		hasKBs bool
-		kwargs map[string]interface{}
-		want   bool
+		want   agenticEngine
 	}{
-		{"agentic level with KBs", true, map[string]interface{}{"reasoning": reasoningLevelAgentic}, true},
-		{"agentic level without KBs", false, map[string]interface{}{"reasoning": reasoningLevelAgentic}, false},
-		{"explicit agent_mode without KBs", false, map[string]interface{}{"agent_mode": "smart-reasoning"}, false},
-		{"explicit agent_mode with KBs", true, map[string]interface{}{"agent_mode": "smart-reasoning"}, true},
-		{"no selection without KBs", false, map[string]interface{}{"reasoning": 0}, false},
+		{"agentic level with KBs", reasoningLevelAgentic, true, engineAgenticRAG},
+		{"agentic level without KBs", reasoningLevelAgentic, false, ""},
+		{"iterative level with KBs", reasoningLevelIterative, true, engineIterative},
+		{"iterative level without KBs", reasoningLevelIterative, false, ""},
+		// mode 8 (Codex) is exempt from the KB gate: Codex can converse without a
+		// KB, and its MCP retrieval tools error on a no-scope call rather than
+		// querying an unbounded scope.
+		{"codex level with KBs", reasoningLevelCodex, true, engineCodex},
+		{"codex level without KBs", reasoningLevelCodex, false, engineCodex},
+		// The depth levels stay on the regular pipeline: they select a harness
+		// mode, not an engine.
+		{"harness depth with KBs", 3, true, ""},
+		{"harness depth without KBs", 4, false, ""},
+		{"off with KBs", 0, true, ""},
+		{"off without KBs", 0, false, ""},
+		// A level above the ladder (a future level, or a stale client) must not be
+		// read as "deeper"; nothing above 7 exists and nothing below 0 does.
+		{"above the ladder", 9, true, ""},
+		{"below the ladder", -1, true, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			// Mirrors the guard in AsyncChat's agentic branch.
-			_, byMode := tc.kwargs["agent_mode"].(string)
-			byLevel := resolveReasoningLevel(tc.kwargs, nil) == reasoningLevelAgentic
-			dispatches := (byMode || byLevel) && tc.hasKBs
-			if dispatches != tc.want {
-				t.Errorf("dispatches to agentic = %v, want %v (byMode=%v byLevel=%v hasKBs=%v)",
-					dispatches, tc.want, byMode, byLevel, tc.hasKBs)
+			if got := selectAgenticEngine(tc.level, tc.hasKBs); got != tc.want {
+				t.Errorf("selectAgenticEngine(%d, %v) = %q, want %q",
+					tc.level, tc.hasKBs, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAgentModeIsNotASelector pins the removal: an `agent_mode` kwarg — the
+// parameter the API used to carry — must no longer choose an engine. Only the
+// reasoning level does, so a client that still sends one gets the level's engine,
+// and a client that sends ONLY agent_mode gets the plain pipeline.
+func TestAgentModeIsNotASelector(t *testing.T) {
+	chat := &entity.Chat{TenantID: "t1", KBIDs: []any{"kb1"}}
+	for _, tc := range []struct {
+		name   string
+		kwargs map[string]interface{}
+		want   agenticEngine
+	}{
+		{
+			"a mode-5 agent_mode alone selects nothing",
+			map[string]interface{}{"agent_mode": "smart-reasoning"},
+			"",
+		},
+		{
+			"an iterative agent_mode alone selects nothing",
+			map[string]interface{}{"agent_mode": "iterative-synthesis"},
+			"",
+		},
+		{
+			"the level wins and the stale kwarg is ignored",
+			map[string]interface{}{"agent_mode": "smart-reasoning", "reasoning": 7},
+			engineIterative,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := selectAgenticEngine(
+				resolveReasoningLevel(tc.kwargs, map[string]interface{}(chat.PromptConfig)),
+				true)
+			if got != tc.want {
+				t.Errorf("dispatch = %q, want %q", got, tc.want)
 			}
 		})
 	}
@@ -2194,5 +2540,35 @@ func TestSynthesizeTTS_CleansTextBeforeCallingDriver(t *testing.T) {
 				t.Errorf("audio = %v, want audio present = %v", audio, wantCall)
 			}
 		})
+	}
+}
+
+func TestAsyncChat_ContextCancellationTerminatesGoroutine(t *testing.T) {
+	db := setupChatPipelineVisionTestDB(t)
+	seedChatPipelineVisionTenant(t, db, "glm-4-flash@ZHIPU-AI")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // pre-cancel context to simulate client disconnect
+
+	chat := dialForTest("glm-4-flash@ZHIPU-AI")
+	results, err := NewChatPipelineService().AsyncChat(ctx, chat,
+		[]map[string]interface{}{{"role": "user", "content": "Question"}}, true, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Do NOT drain results with a background goroutine.
+	// AsyncChat must detect pre-cancelled context, exit, and close results.
+	timeout := time.After(2 * time.Second)
+	for {
+		select {
+		case _, ok := <-results:
+			if !ok {
+				// success: AsyncChat goroutine exited cleanly without leaking
+				return
+			}
+		case <-timeout:
+			t.Fatal("AsyncChat goroutine leaked: did not terminate when context was cancelled")
+		}
 	}
 }

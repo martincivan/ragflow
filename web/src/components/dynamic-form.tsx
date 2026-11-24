@@ -442,13 +442,19 @@ export const RenderField = ({
                 }
               : fieldProps;
             return (
-              <Segmented
-                {...finalFieldProps}
-                options={field.options || []}
-                className="w-full"
-                itemClassName="flex-1 justify-center"
-                disabled={field.disabled}
-              />
+              <div
+                className={cn(
+                  'w-full',
+                  field.disabled && 'pointer-events-none opacity-50',
+                )}
+              >
+                <Segmented
+                  {...finalFieldProps}
+                  options={field.options || []}
+                  className="w-full"
+                  itemClassName="flex-1 justify-center"
+                />
+              </div>
             );
           }}
         </RAGFlowFormItem>
@@ -946,10 +952,14 @@ const DynamicForm = {
                 const shouldShow = field.shouldRender
                   ? field.shouldRender(formValues)
                   : true;
+                // `shouldRender === false` unmounts the field entirely (no DOM),
+                // instead of leaving it hidden. `field.hidden` keeps the previous
+                // hidden-class behavior since it's a separate static concern.
+                if (!shouldShow) return null;
                 return (
                   <div
                     key={field.name}
-                    className={cn({ hidden: field.hidden || !shouldShow })}
+                    className={cn({ hidden: field.hidden })}
                   >
                     <RenderField
                       field={field}

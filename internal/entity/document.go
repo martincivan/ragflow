@@ -16,68 +16,129 @@
 
 package entity
 
-import "time"
+import (
+	"time"
+
+	"ragflow/internal/common"
+)
 
 // Document document model
 type Document struct {
-	ID              string     `gorm:"column:id;primaryKey;size:32" json:"id"`
-	Thumbnail       *string    `gorm:"column:thumbnail;type:longtext" json:"thumbnail,omitempty"`
-	KbID            string     `gorm:"column:kb_id;size:256;not null;index" json:"kb_id"`
-	ParserID        string     `gorm:"column:parser_id;size:32;not null;index" json:"parser_id"`
-	PipelineID      *string    `gorm:"column:pipeline_id;size:32;index" json:"pipeline_id,omitempty"`
-	ParserConfig    JSONMap    `gorm:"column:parser_config;type:longtext;not null" json:"parser_config"`
-	SourceType      string     `gorm:"column:source_type;size:128;not null;default:local;index" json:"source_type"`
-	Type            string     `gorm:"column:type;size:32;not null;index" json:"type"`
-	CreatedBy       string     `gorm:"column:created_by;size:32;not null;index" json:"created_by"`
-	Name            *string    `gorm:"column:name;size:255;index" json:"name,omitempty"`
-	Location        *string    `gorm:"column:location;size:255;index" json:"location,omitempty"`
-	Size            int64      `gorm:"column:size;default:0;index" json:"size"`
-	TokenNum        int64      `gorm:"column:token_num;default:0;index" json:"token_num"`
-	ChunkNum        int64      `gorm:"column:chunk_num;default:0;index" json:"chunk_num"`
-	Progress        float64    `gorm:"column:progress;default:0;index" json:"progress"`
-	ProgressMsg     *string    `gorm:"column:progress_msg;type:longtext" json:"progress_msg,omitempty"`
-	ProcessBeginAt  *time.Time `gorm:"column:process_begin_at;index" json:"process_begin_at,omitempty"`
-	ProcessDuration float64    `gorm:"column:process_duration;default:0" json:"process_duration"`
-	ContentHash     *string    `gorm:"column:content_hash;size:32;index;default:''" json:"content_hash,omitempty"`
-	Suffix          string     `gorm:"column:suffix;size:32;not null;index" json:"suffix"`
-	Status          *string    `gorm:"column:status;size:1;index;default:'1'" json:"status,omitempty"`
+	ID                string     `gorm:"column:id;primaryKey;size:32" json:"id"`
+	Thumbnail         *string    `gorm:"column:thumbnail;type:longtext" json:"thumbnail,omitempty"`
+	KbID              string     `gorm:"column:kb_id;size:256;not null;index" json:"kb_id"`
+	UserID            string     `gorm:"column:user_id;size:32;not null;default:'';index" json:"user_id"`
+	ParserID          string     `gorm:"column:parser_id;size:32;not null;index" json:"parser_id"`
+	PipelineID        *string    `gorm:"column:pipeline_id;size:32;index" json:"pipeline_id,omitempty"`
+	PipelineVersionID *string    `gorm:"column:pipeline_version_id;size:32;index" json:"pipeline_version_id,omitempty"`
+	ParserConfig      JSONMap    `gorm:"column:parser_config;type:longtext;not null" json:"parser_config"`
+	SourceType        string     `gorm:"column:source_type;size:128;not null;default:local;index" json:"source_type"`
+	Type              string     `gorm:"column:type;size:32;not null;index" json:"type"`
+	CreatedBy         string     `gorm:"column:created_by;size:32;not null;index" json:"created_by"`
+	Name              *string    `gorm:"column:name;size:255;index" json:"name,omitempty"`
+	Location          *string    `gorm:"column:location;size:255;index" json:"location,omitempty"`
+	Size              int64      `gorm:"column:size;default:0;index" json:"size"`
+	TokenNum          int64      `gorm:"column:token_num;default:0;index" json:"token_num"`
+	ChunkNum          int64      `gorm:"column:chunk_num;default:0;index" json:"chunk_num"`
+	Progress          float64    `gorm:"column:progress;default:0;index" json:"progress"`
+	ProgressMsg       *string    `gorm:"column:progress_msg;type:longtext" json:"progress_msg,omitempty"`
+	ProcessBeginAt    *time.Time `gorm:"column:process_begin_at;index" json:"process_begin_at,omitempty"`
+	ProcessDuration   float64    `gorm:"column:process_duration;default:0" json:"process_duration"`
+	ContentHash       *string    `gorm:"column:content_hash;size:32;index;default:''" json:"content_hash,omitempty"`
+	Suffix            string     `gorm:"column:suffix;size:32;not null;index" json:"suffix"`
+	Status            *string    `gorm:"column:status;size:1;index;default:'1'" json:"status,omitempty"`
+	// RestoredVersion is the dataset version the current content was replayed
+	// from, when it came from a restore rather than a parse: the chunk history
+	// at or before that number was written back to the document engine. It is
+	// null for content no restore touched - the hash a parse produced - and is
+	// cleared when a new parse is queued, because that content is about to be
+	// replaced by fresh output.
+	//
+	// It is a marker on its own, not a status: with ChunkNum it answers what a
+	// restore produced - a value with ChunkNum > 0 means the version's chunks came
+	// back, a value with ChunkNum == 0 means the version held none (or the replay
+	// left the document without any). The run outcome stays on the ingestion task,
+	// which a restore deliberately does not touch.
+	RestoredVersion *int64 `gorm:"column:restored_version" json:"restored_version,omitempty"`
+	// RestoredFromParse marks a restored document whose history recorded a parse
+	// with no chunks. Not a column: readers fill it beside RestoredVersion.
+	RestoredFromParse bool `gorm:"-" json:"-"`
 	BaseModel
 }
 
 // DocumentListItem represents a document list row with joined fields.
 type DocumentListItem struct {
-	ID              string     `gorm:"column:id" json:"id"`
-	Thumbnail       *string    `gorm:"column:thumbnail" json:"thumbnail,omitempty"`
-	KbID            string     `gorm:"column:kb_id" json:"kb_id"`
-	ParserID        string     `gorm:"column:parser_id" json:"parser_id"`
-	PipelineID      *string    `gorm:"column:pipeline_id" json:"pipeline_id,omitempty"`
-	PipelineName    *string    `gorm:"column:pipeline_name" json:"pipeline_name,omitempty"`
-	ParserConfig    string     `gorm:"column:parser_config" json:"parser_config"`
-	SourceType      string     `gorm:"column:source_type" json:"source_type"`
-	Type            string     `gorm:"column:type" json:"type"`
-	CreatedBy       string     `gorm:"column:created_by" json:"created_by"`
-	Nickname        *string    `gorm:"column:nickname" json:"nickname,omitempty"`
-	Name            *string    `gorm:"column:name" json:"name,omitempty"`
-	Location        *string    `gorm:"column:location" json:"location,omitempty"`
-	Size            int64      `gorm:"column:size" json:"size"`
-	TokenNum        int64      `gorm:"column:token_num" json:"token_num"`
-	ChunkNum        int64      `gorm:"column:chunk_num" json:"chunk_num"`
-	Progress        float64    `gorm:"column:progress" json:"progress"`
-	ProgressMsg     *string    `gorm:"column:progress_msg" json:"progress_msg,omitempty"`
-	ProcessBeginAt  *time.Time `gorm:"column:process_begin_at" json:"process_begin_at,omitempty"`
-	ProcessDuration float64    `gorm:"column:process_duration" json:"process_duration"`
-	ContentHash     *string    `gorm:"column:content_hash" json:"content_hash,omitempty"`
-	Suffix          string     `gorm:"column:suffix" json:"suffix"`
-	IngestionStatus *string    `gorm:"column:ingestion_status" json:"ingestion_status,omitempty"`
-	PipelineLogID   *string    `gorm:"column:pipeline_log_id" json:"-"`
-	Status          *string    `gorm:"column:status" json:"status,omitempty"`
-	CreateTime      *int64     `gorm:"column:create_time" json:"create_time,omitempty"`
-	CreateDate      *time.Time `gorm:"column:create_date" json:"create_date,omitempty"`
-	UpdateTime      *int64     `gorm:"column:update_time" json:"update_time,omitempty"`
-	UpdateDate      *time.Time `gorm:"column:update_date" json:"update_date,omitempty"`
+	ID         string  `gorm:"column:id" json:"id"`
+	Thumbnail  *string `gorm:"column:thumbnail" json:"thumbnail,omitempty"`
+	KbID       string  `gorm:"column:kb_id" json:"kb_id"`
+	ParserID   string  `gorm:"column:parser_id" json:"parser_id"`
+	PipelineID *string `gorm:"column:pipeline_id" json:"pipeline_id,omitempty"`
+	// PipelineVersionID pins the document to a specific dataflow canvas version
+	// (design section 5 sticky snapshot). Returned by the list so the reopened
+	// change-parser dialog can show the saved pin instead of re-adopting the
+	// latest version. Omitted when the document tracks the canvas latest.
+	PipelineVersionID *string    `gorm:"column:pipeline_version_id;size:32" json:"pipeline_version_id,omitempty"`
+	PipelineName      *string    `gorm:"column:pipeline_name" json:"pipeline_name,omitempty"`
+	ParserConfig      string     `gorm:"column:parser_config" json:"parser_config"`
+	SourceType        string     `gorm:"column:source_type" json:"source_type"`
+	Type              string     `gorm:"column:type" json:"type"`
+	CreatedBy         string     `gorm:"column:created_by" json:"created_by"`
+	Nickname          *string    `gorm:"column:nickname" json:"nickname,omitempty"`
+	Name              *string    `gorm:"column:name" json:"name,omitempty"`
+	Location          *string    `gorm:"column:location" json:"location,omitempty"`
+	Size              int64      `gorm:"column:size" json:"size"`
+	TokenNum          int64      `gorm:"column:token_num" json:"token_num"`
+	ChunkNum          int64      `gorm:"column:chunk_num" json:"chunk_num"`
+	Progress          float64    `gorm:"column:progress" json:"progress"`
+	ProgressMsg       *string    `gorm:"column:progress_msg" json:"progress_msg,omitempty"`
+	ProcessBeginAt    *time.Time `gorm:"column:process_begin_at" json:"process_begin_at,omitempty"`
+	ProcessDuration   float64    `gorm:"column:process_duration" json:"process_duration"`
+	ContentHash       *string    `gorm:"column:content_hash" json:"content_hash,omitempty"`
+	Suffix            string     `gorm:"column:suffix" json:"suffix"`
+	RestoredVersion   *int64     `gorm:"column:restored_version" json:"restored_version,omitempty"`
+	IngestionStatus   *string    `gorm:"column:ingestion_status" json:"ingestion_status,omitempty"`
+	PipelineLogID     *string    `gorm:"column:pipeline_log_id" json:"-"`
+	Status            *string    `gorm:"column:status" json:"status,omitempty"`
+	CreateTime        *int64     `gorm:"column:create_time" json:"create_time,omitempty"`
+	CreateDate        *time.Time `gorm:"column:create_date" json:"create_date,omitempty"`
+	UpdateTime        *int64     `gorm:"column:update_time" json:"update_time,omitempty"`
+	UpdateDate        *time.Time `gorm:"column:update_date" json:"update_date,omitempty"`
 }
 
 // TableName specify table name
 func (Document) TableName() string {
 	return "document"
+}
+
+// IngestionStatusWith is the status the document shows, given the status of its
+// latest ingestion task ("" when it has none).
+//
+// It is the run's status, except for content a restore put back: a restore does
+// not run the pipeline, so the task still describes whatever ran last, while the
+// restored content is the version's. For those documents - the ones carrying
+// RestoredVersion - the content decides the terminal state: chunks came back means
+// completed, none came back means unstarted. A run in flight still wins, and a
+// document no restore touched returns exactly the value it always did, so no
+// ingestion outcome is re-read from the content counters.
+//
+// buildDocumentListIngestionStatusExpression (dao/document.go) is the same rule in
+// SQL, for the list that filters and sorts on it in the database.
+func (d *Document) IngestionStatusWith(taskStatus string) string {
+	if d == nil {
+		return common.UNSTART
+	}
+	switch taskStatus {
+	case common.CREATED, common.SCHEDULED, common.RUNNING, common.STOPPING:
+		return taskStatus
+	}
+	if d.RestoredVersion != nil {
+		if d.ChunkNum > 0 || d.RestoredFromParse {
+			return common.COMPLETED
+		}
+		return common.UNSTART
+	}
+	if taskStatus == "" {
+		return common.UNSTART
+	}
+	return taskStatus
 }

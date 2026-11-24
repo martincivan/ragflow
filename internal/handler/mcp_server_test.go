@@ -11,6 +11,7 @@ import (
 	"ragflow/internal/common"
 	"ragflow/internal/entity"
 	"ragflow/internal/server/config"
+	"ragflow/internal/service"
 )
 
 func TestStandaloneMCPIdentityAndRevocation(t *testing.T) {
@@ -19,7 +20,7 @@ func TestStandaloneMCPIdentityAndRevocation(t *testing.T) {
 			calls := 0
 			revoked := false
 			lastKey := ""
-			auth := &AuthHandler{userService: &stubUserTokenResolver{getUserByTokenFn: func(ctx context.Context, key string) (*entity.User, common.ErrorCode, error) {
+			auth := &AuthHandler{userService: &stubUserTokenResolver{resolveAccessTokenFn: func(ctx context.Context, key string) (*service.AuthIdentity, common.ErrorCode, error) {
 				calls++
 				lastKey = key
 				if mode == "self-host" && calls == 1 {
@@ -30,7 +31,7 @@ func TestStandaloneMCPIdentityAndRevocation(t *testing.T) {
 				if revoked {
 					return nil, common.CodeUnauthorized, errors.New("revoked")
 				}
-				return &entity.User{ID: key}, common.CodeSuccess, nil
+				return &service.AuthIdentity{User: &entity.User{ID: key}}, common.CodeSuccess, nil
 			}}}
 			h, err := (&MCPServerHandler{}).NewStandalone(t.Context(), auth, config.MCPConfig{LaunchMode: mode, HostAPIKey: "configured-key", SSE: true, StreamableHTTP: true, JSONResponse: true})
 			if err != nil {
@@ -77,5 +78,20 @@ func TestStandaloneMCPRejectsInvalidConfiguredKey(t *testing.T) {
 	h, err := (&MCPServerHandler{}).NewStandalone(t.Context(), auth, config.MCPConfig{LaunchMode: "self-host", HostAPIKey: "do-not-print-me"})
 	if h != nil || err == nil || err.Error() != "invalid configured MCP API key" {
 		t.Fatalf("invalid preflight result: handler=%v error=%v", h, err)
+	}
+}
+
+func TestResolveMCPUserRejectsBetaToken(t *testing.T) {
+	betaCalled := false
+	auth := &AuthHandler{userService: &stubUserTokenResolver{resolveBetaAPITokenFn: func(context.Context, string) (*service.AuthIdentity, common.ErrorCode, error) {
+		betaCalled = true
+		return &service.AuthIdentity{User: &entity.User{ID: "owner"}, TenantID: "tenant"}, common.CodeSuccess, nil
+	}}}
+	user, err := auth.ResolveMCPUser(t.Context(), "Bearer share-link-beta")
+	if user != nil || err == nil {
+		t.Fatalf("beta token resolved to user=%v err=%v; want rejection", user, err)
+	}
+	if betaCalled {
+		t.Fatal("ResolveMCPUser consulted the beta token resolver")
 	}
 }

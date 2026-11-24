@@ -30,6 +30,14 @@ var ErrDocumentNotFound = errors.New("document not found")
 // tolerable no-op, mirroring Python's docStoreConn behavior.
 var ErrIndexNotFound = errors.New("index does not exist")
 
+// ErrMetaValueSpaceIncomplete marks a metadata value space that could not be
+// read in full -- the doc store answered with partial results. Distinct from a
+// failure to read it at all: callers must not generate a metadata filter from a
+// partial value space, because a value missing because its shard failed is
+// indistinguishable from a value that does not exist, and the filter is applied
+// as a hard document scope.
+var ErrMetaValueSpaceIncomplete = errors.New("metadata value space is incomplete")
+
 // SearchRequest unified search request for all engines
 type SearchRequest struct {
 	// Search target
@@ -66,9 +74,10 @@ type SearchResult struct {
 // match expressions) because regex matching is a distinct retrieval mode with
 // no vector or text relevance scoring.
 type RegexpSearchRequest struct {
-	// TenantID is the single tenant whose chunks are searched. Multi-tenant
-	// regexp requests are unsupported.
-	TenantID string
+	// IndexNames are the physical chunk indexes searched, one per dataset
+	// tenant (e.g. ragflow_<tenant>). Mapping a dataset to its tenant index is
+	// the caller's job, exactly as it is for SearchRequest.IndexNames.
+	IndexNames []string
 	// KbIDs are the knowledge base IDs to filter the search to.
 	KbIDs []string // Knowledge base IDs filter
 

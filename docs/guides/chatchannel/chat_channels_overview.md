@@ -4,7 +4,7 @@ title: Chat Channels Overview
 sidebar_label: Chat Channels Overview
 slug: /chat_channels_overview
 sidebar_custom_props: {
-  categoryIcon: LucideMessagesSquare
+  categoryIcon: LucideHouse
 }
 ---
 
@@ -14,7 +14,7 @@ This chapter describes how to configure chat channels in RAGFlow, including supp
 
 With chat channels, users can chat with a Chat directly in chat applications such as Discord, Telegram, WeCom, and Feishu / Lark. User messages from third-party platforms enter RAGFlow, where the bound Chat generates replies and sends them back to the original chat window.
 
-Chat channels are responsible only for platform access and message forwarding. Reply content, knowledge base scope, model capabilities, and answer quality are determined by the bound chat model.
+Chat channels are responsible only for platform access and message forwarding. Reply content, Dataset scope, model capabilities, and answer quality are determined by the bound chat model.
 
 **Supported channels**
 
@@ -57,6 +57,10 @@ For some platforms, after saving, it may take a few seconds before the page disp
 After adding a channel, you need to connect it to a Chat. If the channel is enabled but not connected to a Chat, RAGFlow can receive external messages but will not generate replies.
 
 After you modify bot credentials or the channel type, RAGFlow automatically restarts the corresponding channel connection. If the credentials are incorrect, the channel may fail to start. Return to the third-party platform to confirm whether the bot status, permissions, and keys are valid.
+
+Connection and startup retries wait 5 seconds, 10 seconds, 20 seconds, 1 minute, 3 minutes, 10 minutes, 30 minutes, 1 hour, 6 hours, and then 24 hours between attempts. Further failures keep the 24-hour interval. A successful connection or a saved credential change resets the retry schedule. Channels that stop on an explicit authentication rejection, logout, or forced disconnect still require you to correct the credentials or reconnect the account.
+
+Readiness checks within a startup attempt keep short polling intervals until the attempt succeeds or times out.
 
 Configuration result:
 

@@ -11,6 +11,7 @@ package pdfium
 
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 typedef struct FPDF_DOCUMENT__  { int unused; } *FPDF_DOCUMENT;
 typedef struct FPDF_PAGE__     { int unused; } *FPDF_PAGE;
@@ -42,9 +43,71 @@ extern FPDF_BOOKMARK FPDFBookmark_GetNextSibling(FPDF_DOCUMENT document, FPDF_BO
 extern unsigned long  FPDFBookmark_GetTitle(FPDF_BOOKMARK bookmark, void* buffer, unsigned long buflen);
 extern FPDF_DEST      FPDFBookmark_GetDest(FPDF_DOCUMENT document, FPDF_BOOKMARK bookmark);
 extern int            FPDFDest_GetDestPageIndex(FPDF_DOCUMENT document, FPDF_DEST dest);
+
+// Page import / document creation / save API
+extern FPDF_DOCUMENT FPDF_CreateNewDocument(void);
+extern int           FPDF_ImportPagesByIndex(FPDF_DOCUMENT dest_doc,
+                                             FPDF_DOCUMENT src_doc,
+                                             const int* page_indices,
+                                             unsigned long length,
+                                             int index);
+
+typedef struct FPDF_FILEWRITE_ {
+  int version;
+  int (*WriteBlock)(struct FPDF_FILEWRITE_* self,
+                    const void* data,
+                    unsigned long size);
+} FPDF_FILEWRITE;
+
+extern int FPDF_SaveAsCopy(FPDF_DOCUMENT document,
+                           FPDF_FILEWRITE* file_write,
+                           unsigned long flags);
+
+typedef struct {
+    FPDF_FILEWRITE file_write;
+    void* buffer;
+    size_t size;
+    size_t capacity;
+} MemBufferWriter;
+
+static int mem_write_block(struct FPDF_FILEWRITE_* self, const void* data, unsigned long size) {
+    MemBufferWriter* writer = (MemBufferWriter*)self;
+    if (writer->size + size > writer->capacity) {
+        size_t new_cap = (writer->capacity == 0) ? 65536 : writer->capacity * 2;
+        while (new_cap < writer->size + size) {
+            new_cap *= 2;
+        }
+        void* new_buf = realloc(writer->buffer, new_cap);
+        if (!new_buf) {
+            return 0;
+        }
+        writer->buffer = new_buf;
+        writer->capacity = new_cap;
+    }
+    memcpy((char*)writer->buffer + writer->size, data, size);
+    writer->size += size;
+    return 1;
+}
+
+static MemBufferWriter* create_mem_writer(void) {
+    MemBufferWriter* writer = (MemBufferWriter*)calloc(1, sizeof(MemBufferWriter));
+    if (!writer) return NULL;
+    writer->file_write.version = 1;
+    writer->file_write.WriteBlock = mem_write_block;
+    return writer;
+}
+
+static void free_mem_writer(MemBufferWriter* writer) {
+    if (writer) {
+        if (writer->buffer) free(writer->buffer);
+        free(writer);
+    }
+}
 */
 import "C"
 import (
+	"context"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
@@ -54,34 +117,64 @@ import (
 	"unsafe"
 
 	pdfsync "ragflow/internal/deepdoc/parser/pdf/pdfsync"
+	doctype "ragflow/internal/deepdoc/parser/type"
 )
-
-// Outline represents one entry in a PDF document outline (table of contents).
-type Outline struct {
-	Title      string
-	Level      int
-	PageNumber int // 1-indexed, matching Python
-}
 
 var initOnce sync.Once
 
 // Init initializes the PDFium library. Safe to call multiple times.
 func Init() { initOnce.Do(func() { C.FPDF_InitLibrary() }) }
 
-// PageSize returns the page dimensions in PDF points (1/72 inch) as seen
-// after rotation.  For a page with /Rotate 90 on A4, this returns ~842×595
-// (swapped from the MediaBox 595×842).  The call is cheap — it opens the
-// document and page, reads dimensions, then closes.
-func PageSize(pdfData []byte, pageIdx int) (width, height float64, err error) {
+// PageSize returns the post-rotation page dimensions in PDF points.
+func PageSize(pdfData []byte, pageIdx int) (float64, float64, error) {
+	sizes, _, err := PageSizes(context.Background(), pdfData, []int{pageIdx})
+	size := sizes[pageIdx]
+	return size[0], size[1], err
+}
+
+// PageSizes reads requested zero-based pages from one open document. Failed
+// pages are omitted; valid sizes and the document page count remain available.
+func PageSizes(ctx context.Context, pdfData []byte, pageIndexes []int) (sizes map[int][2]float64, count int, err error) {
 	pdfsync.With(func() {
-		Init()
-		_, _, pw, ph, closeAll, e := openPage(pdfData, pageIdx)
-		if e != nil {
-			err = e
+		if err = ctx.Err(); err != nil {
 			return
 		}
-		closeAll()
-		width, height = pw, ph
+		Init()
+		data := C.CBytes(pdfData)
+		defer C.free(data)
+		doc := C.FPDF_LoadMemDocument(data, C.int(len(pdfData)), nil)
+		if doc == nil {
+			err = fmt.Errorf("pdfium: FPDF_LoadMemDocument returned nil")
+			return
+		}
+		defer C.FPDF_CloseDocument(doc)
+		count = int(C.FPDF_GetPageCount(doc))
+		sizes = make(map[int][2]float64, len(pageIndexes))
+		for _, index := range pageIndexes {
+			if cancelErr := ctx.Err(); cancelErr != nil {
+				err = errors.Join(err, cancelErr)
+				return
+			}
+			if index < 0 || index >= count {
+				err = errors.Join(err, fmt.Errorf("pdfium: page index %d out of range [0,%d)", index, count))
+				continue
+			}
+			if _, ok := sizes[index]; ok {
+				continue
+			}
+			page := C.FPDF_LoadPage(doc, C.int(index))
+			if page == nil {
+				err = errors.Join(err, fmt.Errorf("pdfium: FPDF_LoadPage(%d) returned nil", index))
+				continue
+			}
+			width, height := float64(C.FPDF_GetPageWidth(page)), float64(C.FPDF_GetPageHeight(page))
+			C.FPDF_ClosePage(page)
+			if width <= 0 || height <= 0 {
+				err = errors.Join(err, fmt.Errorf("pdfium: page %d has invalid dimensions %.1fx%.1f", index, width, height))
+				continue
+			}
+			sizes[index] = [2]float64{width, height}
+		}
 	})
 	return
 }
@@ -102,6 +195,15 @@ func RenderPage(pdfData []byte, pageIdx int, dpi float64) (out *image.RGBA, err 
 		pxW := int(math.Round(pw * scale))
 		pxH := int(math.Round(ph * scale))
 
+		// Reject absurd pages before pdfium allocates the bitmap. RenderPage
+		// holds two buffers at peak: pdfium's pxH*stride bitmap and the
+		// image.NewRGBA copy (4 bytes/pixel each), so budget 8 bytes/pixel.
+		const maxRenderBytes = 1 << 30
+		if int64(pxW)*int64(pxH)*8 > maxRenderBytes {
+			err = fmt.Errorf("pdfium: page %d render buffers %dx%d exceed %d bytes", pageIdx, pxW, pxH, maxRenderBytes)
+			return
+		}
+
 		bitmap := C.FPDFBitmap_Create(C.int(pxW), C.int(pxH), 1) // 1 = RGBA
 		if bitmap == nil {
 			err = fmt.Errorf("pdfium: FPDFBitmap_Create(%d,%d) returned nil", pxW, pxH)
@@ -113,7 +215,13 @@ func RenderPage(pdfData []byte, pageIdx int, dpi float64) (out *image.RGBA, err 
 		// (e.g. outside crop box) are white rather than undefined.
 		stride := int(C.FPDFBitmap_GetStride(bitmap))
 		buf := C.FPDFBitmap_GetBuffer(bitmap)
-		pixels := (*[1 << 30]byte)(unsafe.Pointer(buf))[: pxH*stride : pxH*stride]
+		if stride <= 0 || buf == nil {
+			err = fmt.Errorf("pdfium: bitmap %dx%d has invalid buffer (stride %d)", pxW, pxH, stride)
+			return
+		}
+		// pdfium owns a pxH*stride byte buffer. Describe it directly instead of
+		// slicing a fixed [1<<30]byte array, which panicked on large pages.
+		pixels := unsafe.Slice((*byte)(buf), pxH*stride)
 		for i := range pixels {
 			pixels[i] = 255
 		}
@@ -195,11 +303,11 @@ func openPage(pdfData []byte, pageIdx int) (
 // Traversal is iterative with an explicit stack to avoid stack overflow on deep
 // outline trees. pdfium is not thread-safe; all FPDF_* calls are serialized by
 // the shared pdfsync.Mu.
-func ExtractOutlines(pdfData []byte) []Outline {
+func ExtractOutlines(pdfData []byte) []doctype.Outline {
 	if len(pdfData) == 0 {
 		return nil
 	}
-	var out []Outline
+	var out []doctype.Outline
 	pdfsync.With(func() {
 		Init()
 
@@ -217,7 +325,7 @@ func ExtractOutlines(pdfData []byte) []Outline {
 			level int
 		}
 
-		var result []Outline
+		var result []doctype.Outline
 		stack := []frame{{bm: C.FPDFBookmark_GetFirstChild(doc, nil), level: 0}}
 
 		for len(stack) > 0 {
@@ -239,7 +347,7 @@ func ExtractOutlines(pdfData []byte) []Outline {
 				}
 			}
 
-			result = append(result, Outline{Title: title, Level: top.level, PageNumber: pageNum})
+			result = append(result, doctype.Outline{Title: title, Level: top.level, PageNumber: pageNum})
 
 			// Push siblings after children so children are processed first (pre-order).
 			if sibling := C.FPDFBookmark_GetNextSibling(doc, top.bm); sibling != nil {
@@ -273,4 +381,94 @@ func bookmarkTitle(bm C.FPDF_BOOKMARK) string {
 		u16 = u16[:n-1]
 	}
 	return string(utf16.Decode(u16))
+}
+
+// ExtractPages creates a new PDF document containing only the specified zero-based
+// page indices from the source PDF data. The pages are inserted in the order of pageIndices.
+func ExtractPages(pdfData []byte, pageIndices []int) ([]byte, error) {
+	if len(pdfData) == 0 {
+		return nil, errors.New("pdfium: empty pdf data")
+	}
+	if len(pageIndices) == 0 {
+		return nil, errors.New("pdfium: no pages specified")
+	}
+
+	var output []byte
+	var extractErr error
+
+	pdfsync.With(func() {
+		Init()
+
+		cData := C.CBytes(pdfData)
+		defer C.free(cData)
+
+		srcDoc := C.FPDF_LoadMemDocument(unsafe.Pointer(cData), C.int(len(pdfData)), nil)
+		if srcDoc == nil {
+			extractErr = errors.New("pdfium: failed to load source document")
+			return
+		}
+		defer C.FPDF_CloseDocument(srcDoc)
+
+		srcPageCount := int(C.FPDF_GetPageCount(srcDoc))
+		cIndices := make([]C.int, len(pageIndices))
+		for i, idx := range pageIndices {
+			if idx < 0 || idx >= srcPageCount {
+				extractErr = fmt.Errorf("pdfium: page index %d out of bounds [0, %d)", idx, srcPageCount)
+				return
+			}
+			cIndices[i] = C.int(idx)
+		}
+
+		destDoc := C.FPDF_CreateNewDocument()
+		if destDoc == nil {
+			extractErr = errors.New("pdfium: failed to create new document")
+			return
+		}
+		defer C.FPDF_CloseDocument(destDoc)
+
+		ok := C.FPDF_ImportPagesByIndex(
+			destDoc,
+			srcDoc,
+			&cIndices[0],
+			C.ulong(len(cIndices)),
+			0,
+		)
+		if ok == 0 {
+			extractErr = errors.New("pdfium: failed to import pages")
+			return
+		}
+
+		writer := C.create_mem_writer()
+		if writer == nil {
+			extractErr = errors.New("pdfium: failed to allocate memory writer")
+			return
+		}
+		defer C.free_mem_writer(writer)
+
+		saved := C.FPDF_SaveAsCopy(destDoc, &writer.file_write, 0)
+		if saved == 0 {
+			extractErr = errors.New("pdfium: failed to save document copy")
+			return
+		}
+
+		if writer.size > 0 && writer.buffer != nil {
+			output = C.GoBytes(writer.buffer, C.int(writer.size))
+		} else {
+			extractErr = errors.New("pdfium: exported document is empty")
+		}
+	})
+
+	return output, extractErr
+}
+
+// ExtractPageRange extracts a contiguous range of pages [startPage, endPage] (inclusive, 0-indexed).
+func ExtractPageRange(pdfData []byte, startPage, endPage int) ([]byte, error) {
+	if startPage < 0 || endPage < startPage {
+		return nil, fmt.Errorf("pdfium: invalid page range [%d, %d]", startPage, endPage)
+	}
+	indices := make([]int, endPage-startPage+1)
+	for i := range indices {
+		indices[i] = startPage + i
+	}
+	return ExtractPages(pdfData, indices)
 }

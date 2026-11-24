@@ -1,26 +1,28 @@
-/*
- *  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
- *
- *  Licensed under the Apache License, Version 2.0 (the "License");
- *  you may not use this file except in compliance with the License.
- *  You may obtain a copy of the License at
- *
- *      http://www.apache.org/licenses/LICENSE-2.0
- *
- *  Unless required by applicable law or agreed to in writing, software
- *  distributed under the License is distributed on an "AS IS" BASIS,
- *  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- *  See the License for the specific language governing permissions and
- *  limitations under the License.
- */
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
 
 package agentic_rag
 
 import (
 	"context"
+	"ragflow/internal/retrievalaccount"
 	"strings"
 	"unicode/utf8"
 
+	"ragflow/internal/agent/runtime"
 	"ragflow/internal/common"
 
 	"go.uber.org/zap"
@@ -67,6 +69,7 @@ func servedChunkFields(ctx context.Context, tool, query string, hit snippetHit) 
 		zap.Int("snippet_runes", utf8.RuneCountInString(hit.snippet)),
 		zap.Int("query_terms", matched),
 		zap.String("snippet", snippet),
+		zap.String("content", hit.chunk.Content),
 	}
 	if hit.truncated {
 		fields = append(fields, zap.Bool("truncated", true))
@@ -80,10 +83,56 @@ func servedChunkFields(ctx context.Context, tool, query string, hit snippetHit) 
 // logServedChunks writes one debug line per served chunk (a no-op unless the
 // logger runs at debug level).
 func logServedChunks(ctx context.Context, tool, query string, hits []snippetHit) {
-	if len(hits) == 0 || common.Logger == nil || common.Logger.Check(zap.DebugLevel, "agentic_rag: retrieval served chunk") == nil {
+	// The served ledger rides the context: record every served chunk with its
+	// document so the delivery gate can name the documents a failing chain
+	// never deep-read.
+	if l := servedLedgerFrom(ctx); l != nil {
+		for _, hit := range hits {
+			l.Add(query, retrievalaccount.DocNameStem(hit.chunk.DocumentName))
+		}
+	}
+	if len(hits) == 0 {
 		return
 	}
 	for _, hit := range hits {
 		common.DebugCtx(ctx, "agentic_rag: retrieval served chunk", servedChunkFields(ctx, tool, query, hit)...)
 	}
+}
+
+// serveLogContentRunes bounds the deep-read body copied into the log. Deep-read
+// text is the payload itself, not a triage view, so the bound is the segment
+// budget rather than the snippet budget.
+const serveLogContentRunes = 6000
+
+// servedDeepReadFields builds the debug fields for one deep-read passage that
+// actually reached the model (i.e. AFTER the sufficiency filter). It is the
+// deep-read twin of servedChunkFields, and it exists for the same reason: the
+// generic tool-result line truncates the payload, so without it "the sentence
+// carrying the answer was never served" cannot be told apart from "it was
+// served and the model still missed it". ref_attr records the [ID:n] the
+// passage was stamped with, so a citation can be mapped back to the text.
+func servedDeepReadFields(docID string, c runtime.RetrievalChunk, refAttr string) []zap.Field {
+	content := c.Content
+	if r := []rune(content); len(r) > serveLogContentRunes {
+		content = string(r[:serveLogContentRunes]) + "…"
+	}
+	return []zap.Field{
+		zap.String("side", "deep_read"),
+		zap.String("doc_id", docID),
+		zap.String("chunk_id", c.ID),
+		zap.String("doc_name", c.DocumentName),
+		zap.Int("chunk_index", c.ChunkIndex),
+		zap.String("ref_attr", strings.TrimSpace(refAttr)),
+		zap.Int("content_runes", utf8.RuneCountInString(c.Content)),
+		zap.String("content", content),
+	}
+}
+
+// logServedDeepRead writes one debug line per deep-read passage (a no-op unless
+// the logger runs at debug level).
+func logServedDeepRead(ctx context.Context, docID string, c runtime.RetrievalChunk, refAttr string) {
+	if common.Logger == nil || common.Logger.Check(zap.DebugLevel, "agentic_rag: retrieval served deep read") == nil {
+		return
+	}
+	common.DebugCtx(ctx, "agentic_rag: retrieval served deep read", servedDeepReadFields(docID, c, refAttr)...)
 }

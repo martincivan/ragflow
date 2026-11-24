@@ -54,6 +54,7 @@ export type SelectWithSearchFlagProps = {
   value?: string;
   onChange?(value: string): void;
   triggerClassName?: string;
+  triggerId?: string;
   allowClear?: boolean;
   disabled?: boolean;
   placeholder?: string;
@@ -139,6 +140,7 @@ export const SelectWithSearch = forwardRef<
       onChange,
       options = [],
       triggerClassName,
+      triggerId,
       allowClear = false,
       disabled = false,
       placeholder,
@@ -268,7 +270,7 @@ export const SelectWithSearch = forwardRef<
       <Popover open={open} onOpenChange={setOpen}>
         <PopoverTrigger asChild>
           <Button
-            id={id}
+            id={triggerId ?? id}
             variant="outline"
             role="combobox"
             aria-expanded={open}
@@ -276,7 +278,7 @@ export const SelectWithSearch = forwardRef<
             disabled={disabled}
             data-testid={testId}
             className={cn(
-              '!bg-bg-input hover:bg-background border-border-button w-full  justify-between px-3 font-normal outline-offset-0 outline-none focus-visible:outline-[3px] [&_svg]:pointer-events-auto group',
+              'rounded-2xl !bg-bg-input hover:bg-background border-border-button w-full  justify-between px-3 font-normal outline-offset-0 outline-none focus-visible:outline-[3px] [&_svg]:pointer-events-auto group',
               triggerClassName,
             )}
           >
@@ -315,7 +317,7 @@ export const SelectWithSearch = forwardRef<
           </Button>
         </PopoverTrigger>
         <PopoverContent
-          className="border-border-button w-full min-w-[var(--radix-popper-anchor-width)] p-0"
+          className="rounded-2xl border-border-button w-full min-w-[var(--radix-popper-anchor-width)] p-0"
           align="start"
         >
           <Command className="p-5" filter={filterFn}>
@@ -368,7 +370,11 @@ export const SelectWithSearch = forwardRef<
                               ? [option.label]
                               : []
                           }
-                          onSelect={handleSelect}
+                          // cmdk trims the item value and hands the trimmed
+                          // string to onSelect, which turns whitespace-only
+                          // values (Tab, Space, line break) into ''. Select the
+                          // option's own value instead.
+                          onSelect={() => handleSelect(option.value)}
                           data-testid={
                             optionTestIdPrefix && option.value
                               ? `${optionTestIdPrefix}${option.value}`
@@ -411,7 +417,9 @@ export const SelectWithSearch = forwardRef<
                         group.keywords ??
                         (typeof group.label === 'string' ? [group.label] : [])
                       }
-                      onSelect={handleSelect}
+                      onSelect={(selected) =>
+                        handleSelect(group.value ?? selected)
+                      }
                       data-testid={
                         optionTestIdPrefix && group.value
                           ? `${optionTestIdPrefix}${group.value}`

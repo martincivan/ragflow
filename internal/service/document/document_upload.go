@@ -10,10 +10,15 @@ import (
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
+	"ragflow/internal/permission"
 	"ragflow/internal/service"
+	"ragflow/internal/service/datasetversion"
 	"ragflow/internal/storage"
 	"ragflow/internal/utility"
 	"strings"
+
+	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // UploadLocalDocuments stores each uploaded file in object storage and inserts a
@@ -27,16 +32,25 @@ import (
 //
 // Gaps vs Python (documented, not yet ported): thumbnail generation and
 // read_potential_broken_pdf repair.
-func (s *DocumentService) UploadLocalDocuments(ctx context.Context, kb *entity.Knowledgebase, tenantID string, files []*multipart.FileHeader, parentPath string, parserConfigOverride map[string]interface{}) ([]map[string]interface{}, []string) {
+func (s *DocumentService) UploadLocalDocuments(ctx context.Context, kb *entity.Knowledgebase, files []*multipart.FileHeader, parentPath string, parserConfigOverride map[string]interface{}) ([]map[string]interface{}, []string) {
+	userID := permission.UserIDFromContext(ctx)
+	if userID == "" {
+		return nil, []string{permission.ErrUnauthenticated.Error()}
+	}
 	storageImpl := storage.GetStorageFactory().GetStorage()
 	if storageImpl == nil {
 		return nil, []string{"storage not initialized"}
 	}
 
+	// The parse settings each document is created under are recorded under the
+	// upload's version, which this request allocates at the end (see
+	// InsertDocument): the sink holds them until the number exists.
+	ctx = datasetversion.WithStateSink(ctx)
+
 	// Resolve (and create if needed) the dataset's file-manager folder up front.
 	// Without the File / file2document linkage the document list (which inner-joins
 	// file2document + file) would never surface the uploaded files.
-	kbFolder, err := s.ensureKBFolder(ctx, kb, tenantID)
+	kbFolder, err := s.ensureKBFolder(ctx, kb, userID)
 	if err != nil {
 		return nil, []string{err.Error()}
 	}
@@ -54,6 +68,7 @@ func (s *DocumentService) UploadLocalDocuments(ctx context.Context, kb *entity.K
 
 	var results []map[string]interface{}
 	var errMsgs []string
+	var changes []entity.DatasetVersionChange
 
 	for _, fh := range files {
 		var blob []byte
@@ -63,7 +78,7 @@ func (s *DocumentService) UploadLocalDocuments(ctx context.Context, kb *entity.K
 			continue
 		}
 
-		filename, err := common.UniqueFileName(fh.Filename, 255, func(candidate string) (bool, error) {
+		filename, err := common.UniqueFileName(fh.Filename, common.NameLimit255, func(candidate string) (bool, error) {
 			return s.documentDAO.NameExistsInKB(ctx, dao.DB, kb.ID, candidate)
 		})
 		if err != nil {
@@ -77,12 +92,12 @@ func (s *DocumentService) UploadLocalDocuments(ctx context.Context, kb *entity.K
 			continue
 		}
 
-		location := filename
-		if safeParent != "" {
-			location = safeParent + "/" + filename
-		}
-		for storageImpl.ObjExist(ctx, kb.ID, location) {
-			location += "_"
+		var location string
+		for attempt := 0; ; attempt++ {
+			location = storageObjectPath(safeParent, filename, attempt)
+			if !storageImpl.ObjExist(ctx, kb.ID, location) {
+				break
+			}
 		}
 		if err = storageImpl.Put(ctx, kb.ID, location, blob); err != nil {
 			errMsgs = append(errMsgs, fh.Filename+": "+err.Error())
@@ -90,10 +105,10 @@ func (s *DocumentService) UploadLocalDocuments(ctx context.Context, kb *entity.K
 		}
 
 		selection, parserConfig := resolveDocumentParser(ctx, kb, filename, filetype, merged)
-		doc := s.newDatasetDocument(kb, tenantID, filename, location, string(filetype), selection, parserConfig, "local", int64(len(blob)), blob)
-		if err = s.InsertDocument(doc); err != nil {
+		doc := s.newDatasetDocument(kb, userID, filename, location, string(filetype), selection, parserConfig, "local", int64(len(blob)), blob)
+		if err = s.InsertDocument(ctx, doc); err != nil {
 			// Roll back the orphaned blob so a failed insert doesn't leak storage.
-			rmErr := removeObjectBestEffort(ctx, storageImpl, kb.ID, location)
+			rmErr := storage.RemoveBlob(ctx, storageImpl, kb.ID, location)
 			if rmErr != nil {
 				common.Warn(fmt.Sprintf("upload rollback: failed to remove orphaned blob %s/%s: %v", kb.ID, location, rmErr))
 			}
@@ -104,7 +119,7 @@ func (s *DocumentService) UploadLocalDocuments(ctx context.Context, kb *entity.K
 			// Linkage failed: roll back the document row and blob so the partial
 			// state doesn't leave an invisible (unlisted) document behind.
 			err = s.rollbackAddFileFromKBError(ctx, doc, kb.ID, err)
-			rmErr := removeObjectBestEffort(ctx, storageImpl, kb.ID, location)
+			rmErr := storage.RemoveBlob(ctx, storageImpl, kb.ID, location)
 			if rmErr != nil {
 				common.Warn(fmt.Sprintf("UploadLocalDocuments: failed to remove blob %s/%s: %v", kb.ID, location, rmErr))
 			}
@@ -112,34 +127,71 @@ func (s *DocumentService) UploadLocalDocuments(ctx context.Context, kb *entity.K
 			continue
 		}
 		results = append(results, docToRawMap(doc))
+		changes = append(changes, documentVersionChange(entity.DatasetVersionChangeActionAdd, doc))
+	}
+
+	// One version per request, not per file: a batch upload is one change to the
+	// dataset's content, and one row per file would bury the configuration
+	// history it sits next to. The change set keeps the per-file detail the
+	// version's counters cannot show.
+	if len(results) > 0 {
+		version, verr := datasetversion.RecordContentVersionChangesOwnTx(ctx, kb.ID, entity.DatasetVersionKindUpload, changes)
+		if verr != nil {
+			return results, append(errMsgs, verr.Error())
+		}
+		if verr := datasetversion.FlushStates(ctx, dao.DB, kb.ID, version); verr != nil {
+			return results, append(errMsgs, verr.Error())
+		}
 	}
 
 	return results, errMsgs
 }
 
+// storageObjectPath builds the persisted object key for an upload. Display
+// names are limited by Unicode code points, while filesystem-backed storage
+// limits each path segment by bytes.
+func storageObjectPath(parent, filename string, attempt int) string {
+	key := utility.StorageObjectName(filename, attempt, utility.StorageKeyMaxBytes)
+	if parent == "" {
+		return key
+	}
+	return parent + "/" + key
+}
+
 // UploadEmptyDocument inserts a zero-byte "virtual" document into the dataset.
-func (s *DocumentService) UploadEmptyDocument(ctx context.Context, kb *entity.Knowledgebase, tenantID, name string) (map[string]interface{}, common.ErrorCode, error) {
+func (s *DocumentService) UploadEmptyDocument(ctx context.Context, kb *entity.Knowledgebase, name string) (map[string]interface{}, common.ErrorCode, error) {
+	userID := permission.UserIDFromContext(ctx)
+	if userID == "" {
+		return nil, common.CodeUnauthorized, permission.ErrUnauthenticated
+	}
+	// The settings the document is created under are recorded under the upload's
+	// version, allocated at the end of the request (see InsertDocument).
+	ctx = datasetversion.WithStateSink(ctx)
 	// Fall back to a numbered name when the requested one is already taken.
-	name, err := common.UniqueFileName(name, 255, func(candidate string) (bool, error) {
+	name, err := common.UniqueFileName(name, common.NameLimit255, func(candidate string) (bool, error) {
 		return s.documentDAO.NameExistsInKB(ctx, dao.DB, kb.ID, candidate)
 	})
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
 
-	kbFolder, err := s.ensureKBFolder(ctx, kb, tenantID)
+	kbFolder, err := s.ensureKBFolder(ctx, kb, userID)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
 
 	// Virtual documents have no file type to route on, so they keep the
 	// dataset parser (mirrors Python's _upload_empty_document).
-	doc := s.newDatasetDocument(kb, tenantID, name, "", "virtual", service.CurrentSelection(kb.ParserID, kb.PipelineID), kb.ParserConfig, "local", 0, nil)
-	if err = s.InsertDocument(doc); err != nil {
+	doc := s.newDatasetDocument(kb, userID, name, "", "virtual", service.CurrentSelection(kb.ParserID, kb.PipelineID), kb.ParserConfig, "local", 0, nil)
+	if err = s.InsertDocument(ctx, doc); err != nil {
 		return nil, common.CodeServerError, err
 	}
 	if err = s.addFileFromKB(ctx, doc, kbFolder.ID, kb.TenantID); err != nil {
 		return nil, common.CodeServerError, s.rollbackAddFileFromKBError(ctx, doc, kb.ID, err)
+	}
+	if _, verr := datasetversion.RecordContentVersionChangesOwnTx(ctx, kb.ID, entity.DatasetVersionKindUpload,
+		[]entity.DatasetVersionChange{documentVersionChange(entity.DatasetVersionChangeActionAdd, doc)}); verr != nil {
+		return nil, common.CodeServerError, verr
 	}
 	return docToRawMap(doc), common.CodeSuccess, nil
 }
@@ -148,21 +200,32 @@ func (s *DocumentService) UploadEmptyDocument(ctx context.Context, kb *entity.Kn
 // folder: root -> .knowledgebase -> <dataset name>. Mirrors Python
 // get_root_folder + get_kb_folder + new_a_file_from_kb.
 func (s *DocumentService) ensureKBFolder(ctx context.Context, kb *entity.Knowledgebase, tenantID string) (*entity.File, error) {
-	root, err := s.fileDAO.GetRootFolder(ctx, dao.DB, tenantID)
-	if err != nil {
-		return nil, err
-	}
-	kbRoot, err := s.newAFileFromKB(ctx, tenantID, knowledgebaseFolderName, root.ID)
-	if err != nil {
-		return nil, err
-	}
-	return s.newAFileFromKB(ctx, kb.TenantID, kb.Name, kbRoot.ID)
+	var kbFolder *entity.File
+	err := dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Use the same lock order as dataset rename and refresh the caller's stale name.
+		var current entity.Knowledgebase
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+			Where("id = ? AND tenant_id = ?", kb.ID, kb.TenantID).Take(&current).Error; err != nil {
+			return err
+		}
+		root, err := s.fileDAO.GetRootFolder(ctx, tx, tenantID)
+		if err != nil {
+			return err
+		}
+		kbRoot, err := s.newAFileFromKB(ctx, tx, tenantID, knowledgebaseFolderName, root.ID)
+		if err != nil {
+			return err
+		}
+		kbFolder, err = s.newAFileFromKB(ctx, tx, current.TenantID, current.Name, kbRoot.ID)
+		return err
+	})
+	return kbFolder, err
 }
 
 // newAFileFromKB returns the existing folder named name under parentID, or
 // creates it. Mirrors Python FileService.new_a_file_from_kb.
-func (s *DocumentService) newAFileFromKB(ctx context.Context, tenantID, name, parentID string) (*entity.File, error) {
-	existingFolders, err := s.fileDAO.Query(ctx, dao.DB, name, parentID, tenantID)
+func (s *DocumentService) newAFileFromKB(ctx context.Context, db *gorm.DB, tenantID, name, parentID string) (*entity.File, error) {
+	existingFolders, err := s.fileDAO.Query(ctx, db, name, parentID, tenantID)
 	if err != nil {
 		return nil, err
 	}
@@ -175,6 +238,7 @@ func (s *DocumentService) newAFileFromKB(ctx context.Context, tenantID, name, pa
 	folder := &entity.File{
 		ID:         common.GenerateToken(),
 		ParentID:   parentID,
+		UserID:     tenantID,
 		TenantID:   tenantID,
 		CreatedBy:  tenantID,
 		Name:       name,
@@ -183,7 +247,7 @@ func (s *DocumentService) newAFileFromKB(ctx context.Context, tenantID, name, pa
 		Location:   &loc,
 		SourceType: string(entity.FileSourceKnowledgebase),
 	}
-	if err := s.fileDAO.Create(ctx, dao.DB, folder); err != nil {
+	if err := s.fileDAO.Create(ctx, db, folder); err != nil {
 		return nil, err
 	}
 	return folder, nil
@@ -208,6 +272,7 @@ func (s *DocumentService) addFileFromKB(ctx context.Context, doc *entity.Documen
 	file := &entity.File{
 		ID:         fileID,
 		ParentID:   kbFolderID,
+		UserID:     tenantID,
 		TenantID:   tenantID,
 		CreatedBy:  tenantID,
 		Name:       name,
@@ -231,18 +296,25 @@ func (s *DocumentService) addFileFromKB(ctx context.Context, doc *entity.Documen
 	return nil
 }
 
-func (s *DocumentService) UploadWebDocument(ctx context.Context, kb *entity.Knowledgebase, tenantID, name, url string) (map[string]interface{}, common.ErrorCode, error) {
+func (s *DocumentService) UploadWebDocument(ctx context.Context, kb *entity.Knowledgebase, name, url string) (map[string]interface{}, common.ErrorCode, error) {
+	userID := permission.UserIDFromContext(ctx)
+	if userID == "" {
+		return nil, common.CodeUnauthorized, permission.ErrUnauthenticated
+	}
 	storageImpl := storage.GetStorageFactory().GetStorage()
 	if storageImpl == nil {
 		return nil, common.CodeServerError, fmt.Errorf("storage not initialized")
 	}
+	// The settings the document is created under are recorded under the upload's
+	// version, allocated at the end of the request (see InsertDocument).
+	ctx = datasetversion.WithStateSink(ctx)
 
-	kbFolder, err := s.ensureKBFolder(ctx, kb, tenantID)
+	kbFolder, err := s.ensureKBFolder(ctx, kb, userID)
 	if err != nil {
 		return nil, common.CodeServerError, err
 	}
 
-	blob, headers, _, err := utility.FetchRemoteFileSafely(ctx, url, maxUploadDocSize)
+	blob, headers, _, err := utility.FetchRemoteFileSafely(ctx, url, common.GetMaxDocumentUploadBytes())
 	if err != nil {
 		return nil, common.CodeDataError, err
 	}
@@ -250,9 +322,12 @@ func (s *DocumentService) UploadWebDocument(ctx context.Context, kb *entity.Know
 	if headers != nil {
 		contentType = headers.Get("Content-Type")
 	}
-	filename := normalizeWebDocumentName(name, contentType, blob)
+	filename, ok := normalizeWebDocumentName(name, contentType, blob)
+	if !ok {
+		return nil, common.CodeArgumentError, fmt.Errorf("file name cannot be empty")
+	}
 	filename, _, blob = utility.NormalizeUploadInfoContent(filename, contentType, blob)
-	filename, err = common.UniqueFileName(filename, 255, func(candidate string) (bool, error) {
+	filename, err = common.UniqueFileName(filename, common.NameLimit255, func(candidate string) (bool, error) {
 		return s.documentDAO.NameExistsInKB(ctx, dao.DB, kb.ID, candidate)
 	})
 	if err != nil {
@@ -264,18 +339,21 @@ func (s *DocumentService) UploadWebDocument(ctx context.Context, kb *entity.Know
 		return nil, common.CodeDataError, fmt.Errorf("this type of file has not been supported yet")
 	}
 
-	location := filename
-	for storageImpl.ObjExist(ctx, kb.ID, location) {
-		location += "_"
+	location := ""
+	for attempt := 0; ; attempt++ {
+		location = storageObjectPath("", filename, attempt)
+		if !storageImpl.ObjExist(ctx, kb.ID, location) {
+			break
+		}
 	}
 	if err = storageImpl.Put(ctx, kb.ID, location, blob); err != nil {
 		return nil, common.CodeServerError, err
 	}
 
 	selection, parserConfig := resolveDocumentParser(ctx, kb, filename, filetype, kb.ParserConfig)
-	doc := s.newDatasetDocument(kb, tenantID, filename, location, string(filetype), selection, parserConfig, "web", int64(len(blob)), blob)
-	if err = s.InsertDocument(doc); err != nil {
-		rmErr := removeObjectBestEffort(ctx, storageImpl, kb.ID, location)
+	doc := s.newDatasetDocument(kb, userID, filename, location, string(filetype), selection, parserConfig, "web", int64(len(blob)), blob)
+	if err = s.InsertDocument(ctx, doc); err != nil {
+		rmErr := storage.RemoveBlob(ctx, storageImpl, kb.ID, location)
 		if rmErr != nil {
 			common.Warn(fmt.Sprintf("UploadWebDocument: failed to insert document, remove blob %s/%s: %v", kb.ID, location, rmErr))
 		}
@@ -283,28 +361,39 @@ func (s *DocumentService) UploadWebDocument(ctx context.Context, kb *entity.Know
 	}
 	if err = s.addFileFromKB(ctx, doc, kbFolder.ID, kb.TenantID); err != nil {
 		err = s.rollbackAddFileFromKBError(ctx, doc, kb.ID, err)
-		rmErr := removeObjectBestEffort(ctx, storageImpl, kb.ID, location)
+		rmErr := storage.RemoveBlob(ctx, storageImpl, kb.ID, location)
 		if rmErr != nil {
 			common.Warn(fmt.Sprintf("UploadWebDocument: failed to add file from knowledge base, remove blob %s/%s: %v", kb.ID, location, rmErr))
 		}
 		return nil, common.CodeServerError, err
 	}
+	version, verr := datasetversion.RecordContentVersionChangesOwnTx(ctx, kb.ID, entity.DatasetVersionKindUpload,
+		[]entity.DatasetVersionChange{documentVersionChange(entity.DatasetVersionChangeActionAdd, doc)})
+	if verr != nil {
+		return nil, common.CodeServerError, verr
+	}
+	if verr := datasetversion.FlushStates(ctx, dao.DB, kb.ID, version); verr != nil {
+		return nil, common.CodeServerError, verr
+	}
 	return docToRawMap(doc), common.CodeSuccess, nil
 }
 
-func normalizeWebDocumentName(name, contentType string, blob []byte) string {
+func normalizeWebDocumentName(name, contentType string, blob []byte) (string, bool) {
 	filename := utility.SanitizeFilename(name)
+	if filename == "" {
+		return "", false
+	}
 	if filepath.Ext(filename) != "" {
-		return filename
+		return filename, true
 	}
 	lowerCT := strings.ToLower(strings.TrimSpace(strings.Split(contentType, ";")[0]))
 	switch {
 	case lowerCT == "application/pdf" || http.DetectContentType(blob) == "application/pdf" || utility.BytesLooksLikePDF(blob):
-		return filename + ".pdf"
+		return filename + ".pdf", true
 	case lowerCT == "text/html" || lowerCT == "application/xhtml+xml" || utility.LooksLikeHTML(blob):
-		return filename + ".html"
+		return filename + ".html", true
 	default:
-		return filename
+		return filename, true
 	}
 }
 
@@ -322,19 +411,21 @@ func (s *DocumentService) newDatasetDocument(kb *entity.Knowledgebase, tenantID,
 	parserID, pipelineID := parserSelectionColumns(selection)
 	loc := location
 	doc := &entity.Document{
-		ID:           docID,
-		KbID:         kb.ID,
-		ParserID:     parserID,
-		PipelineID:   pipelineID,
-		ParserConfig: parserConfig,
-		CreatedBy:    tenantID,
-		Type:         filetype,
-		SourceType:   src,
-		Name:         &filename,
-		Location:     &loc,
-		Size:         size,
-		Suffix:       suffix,
-		Status:       &status,
+		ID:                docID,
+		KbID:              kb.ID,
+		UserID:            tenantID,
+		ParserID:          parserID,
+		PipelineID:        pipelineID,
+		PipelineVersionID: kb.PipelineVersionID,
+		ParserConfig:      parserConfig,
+		CreatedBy:         tenantID,
+		Type:              filetype,
+		SourceType:        src,
+		Name:              &filename,
+		Location:          &loc,
+		Size:              size,
+		Suffix:            suffix,
+		Status:            &status,
 	}
 	if blob != nil {
 		hash := contentHashHex(blob)
@@ -384,20 +475,21 @@ func docToRawMap(doc *entity.Document) map[string]interface{} {
 }
 
 func readFileHeaderBytes(fh *multipart.FileHeader) ([]byte, error) {
-	if fh.Size > maxUploadDocSize {
-		return nil, fmt.Errorf("file exceeds the maximum allowed size of %d bytes", maxUploadDocSize)
+	maxBytes := common.GetMaxDocumentUploadBytes()
+	if fh.Size > maxBytes {
+		return nil, fmt.Errorf("file exceeds the maximum allowed size of %d bytes", maxBytes)
 	}
 	src, err := fh.Open()
 	if err != nil {
 		return nil, err
 	}
 	defer src.Close()
-	blob, err := io.ReadAll(io.LimitReader(src, maxUploadDocSize+1))
+	blob, err := io.ReadAll(io.LimitReader(src, maxBytes+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(blob) > maxUploadDocSize {
-		return nil, fmt.Errorf("file exceeds the maximum allowed size of %d bytes", maxUploadDocSize)
+	if int64(len(blob)) > maxBytes {
+		return nil, fmt.Errorf("file exceeds the maximum allowed size of %d bytes", maxBytes)
 	}
 	return blob, nil
 }

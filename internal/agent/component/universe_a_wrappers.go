@@ -25,9 +25,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 
 	"ragflow/internal/agent/runtime"
@@ -80,7 +80,7 @@ type retrievalParams struct {
 	RerankID                 string
 	EmptyResponse            string
 	CrossLanguages           []string
-	TOCEnhance               bool
+	Highlight                bool
 	UseKG                    bool
 	MetaDataFilter           map[string]any
 	RetrievalFrom            string
@@ -137,14 +137,14 @@ func parseRetrievalParams(params map[string]any) retrievalParams {
 		out.EmptyResponse = v
 	}
 	out.CrossLanguages = toStringSlice(params["cross_languages"])
-	if v, ok := params["toc_enhance"].(bool); ok {
-		out.TOCEnhance = v
+	if v, ok := params["highlight"].(bool); ok {
+		out.Highlight = v
 	}
 	if v, ok := params["use_kg"].(bool); ok {
 		out.UseKG = v
 	}
 	if v, ok := params["meta_data_filter"].(map[string]any); ok {
-		out.MetaDataFilter = cloneAnyMap(v)
+		out.MetaDataFilter = maps.Clone(v)
 	}
 	if v, ok := params["retrieval_from"].(string); ok {
 		out.RetrievalFrom = v
@@ -247,8 +247,8 @@ func (c *retrievalComponent) Invoke(ctx context.Context, db *gorm.DB, inputs map
 
 func checkCanvasRetrievalDependencies(ctx context.Context, db *gorm.DB, inputs map[string]any) error {
 	if state, err := runtime.GetStateFromContext(ctx); err == nil && state != nil {
-		canvasID, _ := state.Sys["canvas_id"].(string)
-		userID, _ := state.Sys["user_id"].(string)
+		canvasID, _ := state.GetSysString("canvas_id")
+		userID, _ := state.GetSysString("user_id")
 		if strings.TrimSpace(canvasID) == "" && strings.TrimSpace(userID) != "" {
 			return fmt.Errorf("%w: canvas id missing from runtime state", permission.ErrInvalidPermission)
 		}
@@ -366,14 +366,14 @@ func (c *retrievalComponent) applyDefaults(inputs map[string]any) map[string]any
 	if _, ok := out["cross_languages"]; !ok && len(c.params.CrossLanguages) > 0 {
 		out["cross_languages"] = append([]string(nil), c.params.CrossLanguages...)
 	}
-	if _, ok := out["toc_enhance"]; !ok && c.params.TOCEnhance {
-		out["toc_enhance"] = true
+	if _, ok := out["highlight"]; !ok && c.params.Highlight {
+		out["highlight"] = true
 	}
 	if _, ok := out["use_kg"]; !ok && c.params.UseKG {
 		out["use_kg"] = true
 	}
 	if _, ok := out["meta_data_filter"]; !ok && c.params.MetaDataFilter != nil {
-		out["meta_data_filter"] = cloneAnyMap(c.params.MetaDataFilter)
+		out["meta_data_filter"] = maps.Clone(c.params.MetaDataFilter)
 	}
 	if _, ok := out["retrieval_from"]; !ok && c.params.RetrievalFrom != "" {
 		out["retrieval_from"] = c.params.RetrievalFrom
@@ -475,7 +475,7 @@ func resolveRetrievalDatasetID(ctx context.Context, db *gorm.DB, kbName string) 
 	}
 	if state, err := runtime.GetStateFromContext(ctx); err == nil && state != nil {
 		common.Debug("agent retrieval component: resolve dataset id context")
-		if tenantID, _ := state.Sys["tenant_id"].(string); tenantID != "" {
+		if tenantID, _ := state.GetSysString("tenant_id"); tenantID != "" {
 			if kb, lookupErr := dao.NewKnowledgebaseDAO().GetByName(ctx, db, kbName, tenantID); lookupErr == nil && kb != nil {
 				common.Debug("agent retrieval component: resolved dataset id by tenant")
 				return kb.ID
@@ -486,7 +486,7 @@ func resolveRetrievalDatasetID(ctx context.Context, db *gorm.DB, kbName string) 
 				common.Debug("agent retrieval component: tenant lookup missed")
 			}
 		}
-		if userID, _ := state.Sys["user_id"].(string); userID != "" {
+		if userID, _ := state.GetSysString("user_id"); userID != "" {
 			kbs, lookupErr := dao.NewKnowledgebaseDAO().GetByNameInUserTenants(ctx, db, kbName, userID)
 			if lookupErr != nil {
 				common.Warn("agent retrieval component: resolve dataset id by tenant membership failed",
@@ -500,7 +500,7 @@ func resolveRetrievalDatasetID(ctx context.Context, db *gorm.DB, kbName string) 
 				}
 				accessible, accessErr := permission.NewDatabaseChecker(db).FilterResources(
 					ctx,
-					permission.Subject{UserID: userID},
+
 					refs,
 					permission.OperationUse,
 				)
@@ -542,7 +542,7 @@ func newCodeExecComponent(params map[string]any) (Component, error) {
 	return &codeExecComponent{
 		inner:   agenttool.NewCodeExecTool(),
 		params:  cloned,
-		outputs: cloneAnyMap(asAnyMap(params["outputs"])),
+		outputs: maps.Clone(asAnyMap(params["outputs"])),
 	}, nil
 }
 
@@ -736,17 +736,6 @@ func asAnyMap(v any) map[string]any {
 	return nil
 }
 
-func cloneAnyMap(in map[string]any) map[string]any {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]any, len(in))
-	for k, v := range in {
-		out[k] = v
-	}
-	return out
-}
-
 func resolveCodeExecArguments(args map[string]any, merged map[string]any, state *runtime.CanvasState) map[string]any {
 	if args == nil {
 		return nil
@@ -807,18 +796,8 @@ func lookupCodeExecArgumentRef(ref string, merged map[string]any, state *runtime
 // toFloatParam coerces a node-param float value to float64. Same
 // JSON-float64 / numeric-string tolerance as toIntParam.
 func toFloatParam(v any) float64 {
-	switch x := v.(type) {
-	case float64:
-		return x
-	case int:
-		return float64(x)
-	case int64:
-		return float64(x)
-	case string:
-		f, _ := strconv.ParseFloat(x, 64)
-		return f
-	}
-	return 0
+	f, _ := common.ToFloat(v)
+	return f
 }
 
 // Compile-time interface checks.

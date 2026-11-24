@@ -1,13 +1,10 @@
-import { ParserSelect } from '@/components/parser-select';
+import { PageFrame } from '@/components/page-frame';
+import { ParserTreeSelect } from '@/components/parser-tree-select';
+import { SettingsFormContainer } from '@/components/settings-form-container';
+import { useParserTreeData } from '@/components/parser-tree-select/use-parser-tree-data';
+import { usePrefillLatestPipelineVersion } from '@/components/parser-tree-select/use-prefill-latest-pipeline-version';
 import PipelineOperatorTabs from '@/components/pipeline-operator-tabs';
 import { Button, ButtonLoading } from '@/components/ui/button';
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from '@/components/ui/card';
 import Divider from '@/components/ui/divider';
 import {
   Form,
@@ -17,6 +14,7 @@ import {
   FormMessage,
 } from '@/components/ui/form';
 import { ParseType } from '@/constants/knowledge';
+import { DatasetParserOptions } from '@/ee/components/parser-extension-fields';
 import { buildParserSelectValue } from '@/hooks/use-parser-options';
 import { useParserSelectHandler } from '@/hooks/use-parser-select-handler';
 import {
@@ -24,17 +22,17 @@ import {
   usePipelineOperatorNodes,
   useResetParserConfigOnPipelineChange,
 } from '@/hooks/use-pipeline-operator';
+import { buildParserConfigFromNodes } from '@/utils/pipeline-operator';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { isEqual } from 'lodash';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { FieldErrors, useForm, useFormState, useWatch } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
-import { z } from 'zod';
 import ChunkMethodLearnMore from './chunk-method-learn-more';
 import LinkDataSource, {
   IDataSourceNodeProps,
 } from './components/link-data-source';
-import { formSchema } from './form-schema';
+import { buildFormSchema, DatasetSettingFormValues } from './form-schema';
 import { GeneralForm } from './general-form';
 import {
   useConnectorHandlers,
@@ -42,12 +40,24 @@ import {
   usePipelineDataList,
   useSaveDatasetSetting,
 } from './hooks';
+import { normalizeParserConfigForComparison } from './parser-config';
+import { useFetchPipelineVersionList } from '@/hooks/use-pipeline-version-request';
 import { useRevealSubmitErrors } from './use-reveal-submit-errors';
+import { ApplyParserConfigDialog } from './apply-parser-config-dialog';
 
 export default function DatasetSetting() {
   const { t } = useTranslation();
 
-  const form = useForm<z.infer<typeof formSchema>>({
+  // The missing verdict lives behind a ref because the schema must exist
+  // before useForm runs, while the verdict derives from the form's watched
+  // values — see buildFormSchema.
+  const parserOptionMissingRef = useRef(false);
+  const formSchema = useMemo(
+    () => buildFormSchema(() => parserOptionMissingRef.current),
+    [],
+  );
+
+  const form = useForm<DatasetSettingFormValues>({
     resolver: zodResolver(formSchema),
     defaultValues: {
       parse_type: ParseType.BuiltIn,
@@ -73,6 +83,7 @@ export default function DatasetSetting() {
     sourceData,
   } = useFetchDatasetSettingOnMount(form);
   const { handleSave, loading: saveLoading } = useSaveDatasetSetting();
+  const [applyParserConfigOpen, setApplyParserConfigOpen] = useState(false);
 
   const [sourceDataState, setSourceDataState] =
     useState<IDataSourceNodeProps[]>();
@@ -91,12 +102,60 @@ export default function DatasetSetting() {
     name: 'pipeline_id',
     defaultValue: '',
   });
+  const pipelineVersionId = useWatch({
+    control: form.control,
+    name: 'pipeline_version_id',
+    defaultValue: '',
+  });
 
   const builtinPipelineId = useWatch({
     control: form.control,
     name: 'parser_id',
     defaultValue: '',
   });
+
+  const parserSelectValue = buildParserSelectValue({
+    parseType,
+    parserId: builtinPipelineId,
+    pipelineId,
+    pipelineVersionId,
+  });
+
+  // The merged parser tree owns the option data; reusing its existence
+  // verdict (same React Query cache, no extra fetches) flags a saved parser
+  // or pinned pipeline version that has since been deleted.
+  const { selectedLeafExists, loading: parserOptionsLoading } =
+    useParserTreeData({ value: parserSelectValue });
+  const parserOptionMissing =
+    !!parserSelectValue && !parserOptionsLoading && !selectedLeafExists;
+
+  // Keep the schema's missing verdict current; declared before the
+  // revalidation effect below so trigger() reads the fresh value.
+  useEffect(() => {
+    parserOptionMissingRef.current = parserOptionMissing;
+  }, [parserOptionMissing]);
+
+  // A persisted value never fires onChange validation, so once the parser
+  // options have loaded, revalidate explicitly — the saved parser or pinned
+  // version may have been deleted, and the error should be visible before
+  // submit. Re-running on selection changes clears the error as soon as a
+  // valid option is picked. parserOptionMissing is a dep too: the verdict can
+  // flip without a loading/selection transition (e.g. version data arriving
+  // for an already-idle tree), and the RHF error is sticky until revalidated.
+  // (Same pattern as ModelTreeSelectFormField.)
+  const trigger = form.trigger;
+  const parserFieldName =
+    parseType === ParseType.Pipeline ? 'pipeline_id' : 'parser_id';
+  useEffect(() => {
+    if (parserOptionsLoading || !parserSelectValue) return;
+    trigger(parserFieldName);
+  }, [
+    trigger,
+    parserOptionsLoading,
+    parserSelectValue,
+    parserFieldName,
+    parserOptionMissing,
+  ]);
 
   const pipelineParserConfig = knowledgeDetails?.parser_config as
     | Record<string, any>
@@ -116,39 +175,91 @@ export default function DatasetSetting() {
         ? knowledgeDetails?.pipeline_id
         : knowledgeDetails?.parser_id
       : undefined;
+  const savedVersionId = isPipelineMode
+    ? (knowledgeDetails?.pipeline_version_id ?? '')
+    : '';
+
+  // Reuse the select's catalog cache to prefill the latest saved version for
+  // unpinned datasets.
+  const { data: canvasVersions } = useFetchPipelineVersionList(
+    parseType === ParseType.Pipeline && pipelineId ? pipelineId : undefined,
+    knowledgeDetails?.user_id,
+  );
+  // Show the outdated bang only while the form still holds the SAVED pin:
+  // once the user picks a different (unsaved) version the bang would be
+  // misleading (design D3: hint only, never auto-upgrade).
+  const savedVersionOutdated =
+    !!knowledgeDetails?.pipeline_version_outdated &&
+    (pipelineVersionId ?? '') === (knowledgeDetails?.pipeline_version_id ?? '');
+
+  // Design section 8 (T37): an unpinned dataset still pre-selects the latest
+  // concrete canvas version once the version list resolves.
+  usePrefillLatestPipelineVersion(
+    form,
+    knowledgeDetails?.pipeline_version_id,
+    canvasVersions?.[0]?.id,
+  );
+
+  // The saved parser_config overrides the DSL defaults only while the
+  // selection matches the saved pipeline+version binding; a different version
+  // renders that version's own DSL defaults. (The form's parser_config stays
+  // the display source of truth via operatorValues either way.)
+  const isSavedBindingSelected =
+    !!selectedPipelineId &&
+    selectedPipelineId === savedPipelineId &&
+    (pipelineVersionId ?? '') === savedVersionId;
 
   const { operatorNodes, loading: operatorNodesLoading } =
-    usePipelineOperatorNodes(
-      selectedPipelineId,
-      selectedPipelineId && selectedPipelineId === savedPipelineId
+    usePipelineOperatorNodes({
+      pipelineId: selectedPipelineId,
+      versionId: isPipelineMode ? pipelineVersionId : undefined,
+      savedParserConfig: isSavedBindingSelected
         ? pipelineParserConfig
         : undefined,
-      !isPipelineMode,
-    );
+      isBuiltin: !isPipelineMode,
+    });
 
-  useResetParserConfigOnPipelineChange(
+  useResetParserConfigOnPipelineChange({
     form,
-    selectedPipelineId,
+    pipelineId: selectedPipelineId,
+    versionId: isPipelineMode ? pipelineVersionId : undefined,
     savedPipelineId,
+    savedVersionId: isPipelineMode ? savedVersionId : undefined,
     operatorNodes,
-  );
+  });
 
   const { activeTab, setActiveTab } = useActiveTab(operatorNodes);
 
   const { scrollContainerRef, handleInvalidSubmit } =
     useRevealSubmitErrors(setActiveTab);
 
-  useEffect(() => {
-    if (parseType === ParseType.BuiltIn) {
-      form.setValue('pipeline_id', '');
-    }
-  }, [parseType, form]);
-
   const handleSubmit = useCallback(
-    async (data: z.infer<typeof formSchema>) => {
-      await handleSave(data);
+    async (data: DatasetSettingFormValues) => {
+      const savedValues = form.formState.defaultValues;
+      const operatorDefaults = buildParserConfigFromNodes(operatorNodes);
+      const [savedParserConfig, parserConfig] = [
+        savedValues?.parser_config,
+        data.parser_config,
+      ].map((config) =>
+        normalizeParserConfigForComparison(config, operatorDefaults, t),
+      );
+      const parserSettingsChanged =
+        data.parse_type !== savedValues?.parse_type ||
+        (data.parser_id || '') !== (savedValues?.parser_id || '') ||
+        (data.pipeline_id || '') !== (savedValues?.pipeline_id || '') ||
+        (data.pipeline_version_id || '') !==
+          (savedValues?.pipeline_version_id || '') ||
+        !isEqual(parserConfig, savedParserConfig);
+
+      const result = await handleSave(data);
+      if (result.code === 0) {
+        form.reset(data);
+        if (knowledgeDetails.document_count > 0 && parserSettingsChanged) {
+          setApplyParserConfigOpen(true);
+        }
+      }
     },
-    [handleSave],
+    [form, handleSave, knowledgeDetails.document_count, operatorNodes, t],
   );
 
   const { errors } = useFormState({
@@ -189,28 +300,22 @@ export default function DatasetSetting() {
       (parseType === ParseType.BuiltIn && !!builtinPipelineId));
 
   return (
-    <div className="pr-5 pb-5">
-      <Card className="p-0 h-full flex flex-col bg-transparent shadow-none">
-        <CardHeader className="p-5 border-b-0.5 border-border-button">
-          <header>
-            <CardTitle as="h1">
-              {t('knowledgeDetails.nextConfiguration')}
-            </CardTitle>
-            <CardDescription>
-              {t('knowledgeConfiguration.titleDescription')}
-            </CardDescription>
-          </header>
-        </CardHeader>
-
-        <CardContent className="p-0 flex-1 h-0 flex divide-x-0.5">
-          <Form {...form}>
-            <form
-              onSubmit={form.handleSubmit(handleSubmit, handleInvalidSubmit)}
-              className="flex flex-col"
-            >
+    <>
+      <ApplyParserConfigDialog
+        datasetId={knowledgeDetails.id}
+        open={applyParserConfigOpen}
+        onOpenChange={setApplyParserConfigOpen}
+      />
+      <PageFrame>
+        <Form {...form}>
+          <form
+            onSubmit={form.handleSubmit(handleSubmit, handleInvalidSubmit)}
+            className="flex min-h-0 flex-1 flex-col"
+          >
+            <SettingsFormContainer className="flex min-h-0 flex-1 flex-col">
               <div
                 ref={scrollContainerRef}
-                className="flex-1 h-0 w-[768px] px-5 pt-5 overflow-y-auto scrollbar-auto"
+                className="flex-1 min-h-0 w-full px-5 pt-5 overflow-y-auto scrollbar-auto"
               >
                 <section className="space-y-5 text-text-secondary">
                   <div className="text-base font-medium text-text-primary">
@@ -219,13 +324,26 @@ export default function DatasetSetting() {
                   <GeneralForm></GeneralForm>
 
                   <Divider />
-                  <div className="text-base font-medium text-text-primary">
-                    {t('knowledgeConfiguration.dataPipeline')}
+                  <LinkDataSource
+                    data={pipelineDataList}
+                    handleLinkOrEditSubmit={handleLinkOrEditSubmit}
+                    unbindFunc={unbindFunc}
+                    handleAutoParse={handleAutoParse}
+                  />
+
+                  <Divider />
+                  <div className="flex items-center justify-between gap-4">
+                    <div className="text-base font-medium text-text-primary">
+                      {t('knowledgeConfiguration.parsingMode')}
+                    </div>
+                    {parseType === ParseType.BuiltIn && builtinPipelineId && (
+                      <ChunkMethodLearnMore parserId={builtinPipelineId} />
+                    )}
                   </div>
                   <FormItem className="items-center space-y-0">
                     <div className="flex items-center gap-1">
                       <FormLabel className="text-sm text-text-secondary whitespace-wrap w-1/4">
-                        {t('knowledgeConfiguration.parseType')}
+                        {t('knowledgeConfiguration.parsingMode')}
                       </FormLabel>
                       <div className="text-muted-foreground w-3/4">
                         <FormField
@@ -235,15 +353,14 @@ export default function DatasetSetting() {
                               ? 'parser_id'
                               : 'pipeline_id'
                           }
-                          render={() => (
+                          render={({ fieldState }) => (
                             <FormItem className="space-y-1">
-                              <ParserSelect
-                                value={buildParserSelectValue({
-                                  parseType,
-                                  parserId: builtinPipelineId,
-                                  pipelineId,
-                                })}
+                              <ParserTreeSelect
+                                value={parserSelectValue}
                                 onChange={handleParserSelect}
+                                outdated={savedVersionOutdated}
+                                invalid={fieldState.invalid}
+                                accessUserId={knowledgeDetails?.user_id}
                               />
                               <FormMessage />
                             </FormItem>
@@ -253,32 +370,26 @@ export default function DatasetSetting() {
                     </div>
                   </FormItem>
                   {showOperatorTabs && (
-                    <PipelineOperatorTabs
-                      nodes={operatorNodes}
-                      activeTab={activeTab}
-                      onTabChange={setActiveTab}
-                      onOperatorValuesChange={handleOperatorValuesChange}
-                      operatorValues={parserConfigValues}
-                      operatorFormErrors={
-                        errors.parser_config as
-                          | Record<string, FieldErrors | undefined>
-                          | undefined
-                      }
-                      fixedFileFormats
-                    />
+                    <DatasetParserOptions>
+                      <PipelineOperatorTabs
+                        nodes={operatorNodes}
+                        activeTab={activeTab}
+                        onTabChange={setActiveTab}
+                        onOperatorValuesChange={handleOperatorValuesChange}
+                        operatorValues={parserConfigValues}
+                        operatorFormErrors={
+                          errors.parser_config as
+                            | Record<string, FieldErrors | undefined>
+                            | undefined
+                        }
+                        fixedFileFormats
+                      />
+                    </DatasetParserOptions>
                   )}
-
-                  <Divider />
-                  <LinkDataSource
-                    data={pipelineDataList}
-                    handleLinkOrEditSubmit={handleLinkOrEditSubmit}
-                    unbindFunc={unbindFunc}
-                    handleAutoParse={handleAutoParse}
-                  />
                 </section>
               </div>
 
-              <div className="p-5 text-right items-center flex justify-end gap-3 w-[768px]">
+              <div className="p-5 text-right items-center flex justify-end gap-3 w-full">
                 <Button
                   type="reset"
                   variant="transparent"
@@ -294,22 +405,17 @@ export default function DatasetSetting() {
                   loading={
                     datasetSettingLoading ||
                     saveLoading ||
+                    form.formState.isSubmitting ||
                     (operatorNodesLoading && operatorNodes.length === 0)
                   }
                 >
                   {t('knowledgeConfiguration.save')}
                 </ButtonLoading>
               </div>
-            </form>
-          </Form>
-
-          <div className="flex-1 p-5 overflow-auto">
-            {parseType === ParseType.BuiltIn && builtinPipelineId && (
-              <ChunkMethodLearnMore parserId={builtinPipelineId} />
-            )}
-          </div>
-        </CardContent>
-      </Card>
-    </div>
+            </SettingsFormContainer>
+          </form>
+        </Form>
+      </PageFrame>
+    </>
   );
 }

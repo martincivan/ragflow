@@ -65,18 +65,17 @@ const (
 )
 
 // NavigateTreeTool routes a question to documents via the compiled navigation
-// tree. It is stateless: the tenant and dataset scope are injected at
-// construction from the session, and the routing backend is the production
-// nav-tree service (nav.NavServiceRouter).
+// tree. It is stateless: the dataset scope is injected at construction from the
+// session, each dataset is routed in its own tenant index, and the routing
+// backend is the production nav-tree service (nav.NavServiceRouter).
 type NavigateTreeTool struct {
-	tenantID   string
 	datasetIDs []string
 }
 
-// NewNavigateTreeTool returns a NavigateTreeTool scoped to the given tenant and
-// datasets, implementing eino's runtime.InvokableTool.
-func NewNavigateTreeTool(tenantID string, datasetIDs []string) *NavigateTreeTool {
-	return &NavigateTreeTool{tenantID: tenantID, datasetIDs: datasetIDs}
+// NewNavigateTreeTool returns a NavigateTreeTool scoped to the given datasets,
+// implementing eino's runtime.InvokableTool.
+func NewNavigateTreeTool(datasetIDs []string) *NavigateTreeTool {
+	return &NavigateTreeTool{datasetIDs: datasetIDs}
 }
 
 // Info returns the tool's metadata for the chat model.
@@ -148,6 +147,13 @@ func (g *NavigateTreeTool) invokableRun(ctx context.Context, argumentsInJSON str
 		common.DebugCtx(ctx, "navigate_tree: marked unavailable; skipping backend (no compiled navigation tree)")
 		return navTreeEmpty(navTreeReasonNoStructure, "no compiled navigation tree"), nil
 	}
+	docScope, err := resolveDocumentScope(ctx, args.DocScope)
+	if err != nil {
+		return "", fmt.Errorf("navigate_tree: %w", err)
+	}
+	if docScope != nil && len(docScope) == 0 {
+		return navTreeEmpty(navTreeReasonNoDoc, ""), nil
+	}
 	if len(datasetIDs) == 0 {
 		// Bound scope is empty: report no structure rather than reading outside
 		// the conversation's allowed datasets.
@@ -166,8 +172,11 @@ func (g *NavigateTreeTool) invokableRun(ctx context.Context, argumentsInJSON str
 		anyTree  bool
 		anyError error
 	)
+	// Each dataset is routed in ITS OWN tenant: a team-shared dataset lives in
+	// the sharing tenant's index, which is not the conversation's tenant.
+	tenants := DatasetTenants(ctx, datasetIDs)
 	for _, kbID := range datasetIDs {
-		routed, rerr := router.Route(ctx, g.tenantID, kbID, full, args.DocScope, navSearchMaxDocs)
+		routed, rerr := router.Route(ctx, tenants[kbID], kbID, full, docScope, navSearchMaxDocs)
 		if rerr != nil {
 			anyError = rerr
 			common.DebugCtx(ctx, "navigate_tree: nav-tree descent failed",
@@ -222,6 +231,7 @@ func (g *NavigateTreeTool) invokableRun(ctx context.Context, argumentsInJSON str
 	common.InfoCtx(ctx, "agentic_rag: navigate_tree",
 		zap.String("query", query),
 		zap.Int("datasets", len(datasetIDs)),
+		zap.Int("doc_scope", len(docScope)),
 		zap.Int("docs", len(ordered)),
 		zap.Strings("names", names))
 	parts := []string{fmt.Sprintf(`<tree_navigation count="%d" query="%s">`, len(ordered), xmlEscape(query))}

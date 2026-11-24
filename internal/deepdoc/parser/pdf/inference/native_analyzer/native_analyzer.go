@@ -78,6 +78,12 @@ func Register(modelDir string, dropScore float64) error {
 	if err := native.InitORT(); err != nil {
 		return fmt.Errorf("deepdoc native: init onnxruntime: %w", err)
 	}
+	// Load the CUDA EP plugin (no-op on CPU). Must happen after InitORT and
+	// before any model session is created; fail fast if a GPU was requested but
+	// the plugin .so is missing.
+	if err := native.RegisterExecutionProvider(); err != nil {
+		return fmt.Errorf("deepdoc native: register execution provider: %w", err)
+	}
 	deepdoctype.SetNativeDocAnalyzerFactory(func() (deepdoctype.DocAnalyzer, bool) {
 		a, err := NewAnalyzer(modelDir, dropScore)
 		if err != nil {
@@ -100,10 +106,13 @@ func canServe(modelDir string) bool {
 }
 
 // Serving reports whether the backend can currently serve from the
-// process-registered model directory. Used for startup logging only; the
-// parser's factory already gates on the same check via canServe.
+// process-registered model directory. It is the startup hard-abort gate, so it
+// also requires the DocAnalyzer factory to have been registered: an execution-
+// provider/plugin registration failure can return from Register before the
+// factory is installed, and that must not be mistaken for a healthy backend.
+// Health keeps the ORT+models-only semantics via canServe.
 func Serving() bool {
-	return canServe(registeredModelDir)
+	return canServe(registeredModelDir) && deepdoctype.NativeDocAnalyzerFactory != nil
 }
 
 // DLA runs layout detection on a page image.
@@ -136,16 +145,11 @@ func (a *NativeAnalyzer) DLA(ctx context.Context, img image.Image) ([]deepdoctyp
 	return out, nil
 }
 
-// TSR recognises table structure from a cropped image.
-func (a *NativeAnalyzer) TSR(ctx context.Context, img image.Image) ([]deepdoctype.TSRCell, error) {
-	ni, err := native.FromImage(img)
-	if err != nil {
-		return nil, err
-	}
-	res, err := native.RunTSR(ctx, a.modelDir, ni)
-	if err != nil {
-		return nil, err
-	}
+// tsrCellsFn maps a native TSR result to the DeepDoc TSR cells. Override seam:
+// a downstream build variant assigns this at init/startup, before any inference
+// runs. Defaults to the inlined clamp-and-convert mapping; set once, never
+// mutated during serving.
+var tsrCellsFn = func(res native.TSRResult) []deepdoctype.TSRCell {
 	out := make([]deepdoctype.TSRCell, 0, len(res.Boxes))
 	// Clamp into the source image bounds (mirrors tsr_adapter.py): this
 	// backend replaced the HTTP service whose adapter clamped every
@@ -157,7 +161,20 @@ func (a *NativeAnalyzer) TSR(ctx context.Context, img image.Image) ([]deepdoctyp
 			Label: b.Label,
 		})
 	}
-	return out, nil
+	return out
+}
+
+// TSR recognises table structure from a cropped image.
+func (a *NativeAnalyzer) TSR(ctx context.Context, img image.Image) ([]deepdoctype.TSRCell, error) {
+	ni, err := native.FromImage(img)
+	if err != nil {
+		return nil, err
+	}
+	res, err := native.RunTSR(ctx, a.modelDir, ni)
+	if err != nil {
+		return nil, err
+	}
+	return tsrCellsFn(res), nil
 }
 
 // OCRDetect detects text regions (quad boxes) in a cropped image.

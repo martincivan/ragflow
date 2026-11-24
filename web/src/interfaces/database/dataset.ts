@@ -38,6 +38,11 @@ export interface IDataset {
   parser_id?: string;
   permission: string;
   pipeline_id: string;
+  // Pinned dataflow canvas version (design section 5/C2). Absent or empty
+  // means the dataset tracks the canvas latest version.
+  pipeline_version_id?: string;
+  // True when the pinned version is not the canvas latest (design D1/D2/D3).
+  pipeline_version_outdated?: boolean;
   raptor_task_finish_at: string;
   raptor_task_id: string;
   similarity_threshold: number;
@@ -45,9 +50,15 @@ export interface IDataset {
   tenant_avatar: string;
   tenant_embd_id: number;
   tenant_id: string;
+  user_id?: string;
+  operator_permission: number;
   token_num: number;
   update_date: string;
   update_time: number;
+  // version is the dataset's own change sequence. Every recorded version — a
+  // settings change, an upload, a parse, a chunk edit — advances it, and the
+  // sidebar shows it beside "Updated".
+  version?: number;
   keywords_similarity_weight: number;
   connectors: IConnector[];
 }
@@ -68,8 +79,6 @@ interface Parserconfig {
   delimiter: string;
   from_page?: number;
   to_page?: number;
-  graphrag: Graphrag;
-  html4excel: boolean;
   image_context_size: number;
   layout_recognize: string;
   llm_id: string;
@@ -77,33 +86,14 @@ interface Parserconfig {
   built_in_metadata?: Array<{ key: string; type: string }>;
   enable_metadata?: boolean;
   parent_child: Parentchild;
-  raptor: Raptor;
   table_context_size: number;
   tag_kb_ids?: string[];
   topn_tags: number;
 }
 
-interface Raptor {
-  clustering_method?: 'gmm' | 'ahc';
-  max_cluster: number;
-  max_token: number;
-  prompt: string;
-  random_seed: number;
-  threshold: number;
-  tree_builder?: 'raptor' | 'psi';
-  use_raptor: boolean;
-}
-
 interface Parentchild {
   children_delimiter: string;
   use_parent_child: boolean;
-}
-
-interface Graphrag {
-  batch_chunk_token_size?: number;
-  entity_types: string[];
-  method: string;
-  use_graphrag: boolean;
 }
 
 export interface IDatasetListResult {
@@ -117,7 +107,6 @@ export interface IKnowledgeFileParserConfig {
   chunk_token_num: number;
   layout_recognize: boolean;
   pages: number[][];
-  task_page_size: number;
 }
 
 export interface IKnowledgeFile {
@@ -162,6 +151,9 @@ export type ChunkDocType = 'image' | 'table' | 'text';
 export interface IChunk {
   available_int: number; // Whether to enable, 0: not enabled, 1: enabled
   chunk_id: string;
+  // Version of the text shown: 0 for the parser's output, higher after edits.
+  // Absent on editions that keep no chunk history.
+  content_version?: number;
   content_with_weight: string;
   doc_id: string;
   doc_name: string;

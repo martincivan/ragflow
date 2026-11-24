@@ -17,6 +17,7 @@
 import ArtifactForceGraph from '@/components/artifact-force-graph';
 import { TreeView, type TreeDataItem } from '@/components/ui/tree-view';
 import { CompilationTemplateKind } from '@/constants/compilation';
+import { renderRepresentation } from '@/ee/components/structure-graph/representation-renderer';
 import {
   type IArtifactGraph,
   type IArtifactGraphEntity,
@@ -31,11 +32,13 @@ import { useTranslation } from 'react-i18next';
 import {
   adaptKnowledgeGraphToForceGraph,
   adaptPageIndexToTreeData,
-  adaptTimelineToX6Data,
   adaptTreeToTreeData,
 } from './adapters';
 import MindMapG6Graph from './mindmap-g6-graph';
-import TimelineX6Graph from './timeline-x6-graph';
+import {
+  getKnowledgeGraphNodeLabel,
+  useKnowledgeGraphNodeColor,
+} from './use-knowledge-graph-node-style';
 
 export interface ClickableNode {
   id: string;
@@ -52,7 +55,7 @@ export interface ClickableNode {
 
 const EmptyForceGraphData: IArtifactGraph = { entities: [], relations: [] };
 
-interface RepresentationRendererProps {
+export interface RepresentationRendererProps {
   template?: IStructureGraphTemplate;
   onNodeClick?: (node: ClickableNode) => void;
   highlightNodeId?: string | null;
@@ -73,6 +76,11 @@ function UnsupportedPlaceholder({ kind }: { kind: StructureTemplateKind }) {
   );
 }
 
+/**
+ * Renders a structure template and forwards supported node selections.
+ * Knowledge graphs receive entity-type colors and labels; other graph views
+ * retain the shared defaults.
+ */
 export function RepresentationRenderer({
   template,
   onNodeClick,
@@ -80,6 +88,7 @@ export function RepresentationRenderer({
   totalEntities,
   returnedEntities,
 }: RepresentationRendererProps) {
+  const getKnowledgeGraphNodeColor = useKnowledgeGraphNodeColor();
   const handleTreeItemClick = useCallback(
     (item: TreeDataItem | undefined) => {
       if (item?.source_chunk_ids?.length) {
@@ -107,15 +116,6 @@ export function RepresentationRenderer({
           name: node.name,
           source_chunk_ids: node.source_chunk_ids,
         });
-      }
-    },
-    [onNodeClick],
-  );
-
-  const handleTimelineNodeClick = useCallback(
-    (node: { id: string; name: string; source_chunk_ids?: string[] }) => {
-      if (node.source_chunk_ids?.length) {
-        onNodeClick?.(node);
       }
     },
     [onNodeClick],
@@ -188,20 +188,12 @@ export function RepresentationRenderer({
             data={forceGraphData}
             show
             getNodeId={getArtifactNodeName}
+            getNodeColor={getKnowledgeGraphNodeColor}
+            getNodeLabel={getKnowledgeGraphNodeLabel}
             onNodeClick={handleArtifactNodeClick}
             highlightNodeId={highlightNodeId}
             totalEntities={totalEntities}
             returnedEntities={returnedEntities}
-          />
-        </div>
-      );
-    case CompilationTemplateKind.Timeline:
-      return (
-        <div className="mt-6 flex-1 min-h-0">
-          <TimelineX6Graph
-            data={adaptTimelineToX6Data(template)}
-            show
-            onNodeClick={handleTimelineNodeClick}
           />
         </div>
       );
@@ -252,6 +244,10 @@ export function RepresentationRenderer({
         </div>
       );
     default:
-      return <UnsupportedPlaceholder kind={template.kind} />;
+      return (
+        renderRepresentation({ template, onNodeClick }) ?? (
+          <UnsupportedPlaceholder kind={template.kind} />
+        )
+      );
   }
 }

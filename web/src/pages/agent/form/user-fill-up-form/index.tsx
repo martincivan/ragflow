@@ -12,7 +12,7 @@ import { useForm, useWatch } from 'react-hook-form';
 import { useTranslation } from 'react-i18next';
 import { z } from 'zod';
 import { BeginQueryType } from '../../constant';
-import { useOwnerTenantId } from '../../context';
+import { useResourceTenantId } from '../../context';
 import { BeginQuery, INextOperatorForm } from '../../interface';
 import { ParameterDialog } from '../begin-form/parameter-dialog';
 import { QueryTable } from '../begin-form/query-table';
@@ -22,29 +22,29 @@ import { PromptEditor } from '../components/prompt-editor';
 import { useValues } from './use-values';
 import { useWatchFormChange } from './use-watch-change';
 
+const FormSchema = z.object({
+  enable_tips: z.boolean().optional(),
+  tips: z.string().trim().optional(),
+  layout_recognize: z.string().optional(),
+  inputs: z
+    .array(
+      z.object({
+        key: z.string(),
+        type: z.string(),
+        value: z.string(),
+        optional: z.boolean(),
+        name: z.string(),
+        options: z.array(z.union([z.number(), z.string(), z.boolean()])),
+      }),
+    )
+    .optional(),
+});
+
 function UserFillUpForm({ node }: INextOperatorForm) {
   const { t } = useTranslation();
-  const ownerTenantId = useOwnerTenantId();
+  const resourceTenantId = useResourceTenantId();
 
   const values = useValues(node);
-
-  const FormSchema = z.object({
-    enable_tips: z.boolean().optional(),
-    tips: z.string().trim().optional(),
-    layout_recognize: z.string().optional(),
-    inputs: z
-      .array(
-        z.object({
-          key: z.string(),
-          type: z.string(),
-          value: z.string(),
-          optional: z.boolean(),
-          name: z.string(),
-          options: z.array(z.union([z.number(), z.string(), z.boolean()])),
-        }),
-      )
-      .optional(),
-  });
 
   const form = useForm({
     defaultValues: values,
@@ -63,10 +63,14 @@ function UserFillUpForm({ node }: INextOperatorForm) {
     [inputs],
   );
 
-  const outputList = inputs?.map((item) => ({
-    title: item.name,
-    type: item.type,
-  }));
+  const outputList = useMemo(
+    () =>
+      inputs?.map((item) => ({
+        title: item.name,
+        type: item.type,
+      })),
+    [inputs],
+  );
 
   const {
     ok,
@@ -142,7 +146,7 @@ function UserFillUpForm({ node }: INextOperatorForm) {
             horizontal={false}
             showMineruOptions={false}
             showPaddleocrOptions={false}
-            ownerTenantId={ownerTenantId}
+            resourceTenantId={resourceTenantId}
           ></LayoutRecognizeFormField>
         )}
       </Form>

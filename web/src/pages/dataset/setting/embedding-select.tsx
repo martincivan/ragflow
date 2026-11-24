@@ -3,46 +3,42 @@ import { Spin } from '@/components/ui/spin';
 import { useTranslate } from '@/hooks/common-hooks';
 import { useCheckKbEmbedding } from '@/hooks/use-knowledge-request';
 import { cn } from '@/lib/utils';
-import { useMemo } from 'react';
-import { FieldValues, useFormContext } from 'react-hook-form';
+import { FieldValues } from 'react-hook-form';
 
 export const EmbeddingSelect = ({
   isEdit,
   field,
-  name,
   disabled = false,
   testId,
-  ownerTenantId,
+  resourceTenantId,
+  accessUserId,
 }: {
   isEdit: boolean;
   field: FieldValues;
-  name?: string;
   disabled?: boolean;
   testId?: string;
-  ownerTenantId?: string;
+  resourceTenantId?: string;
+  accessUserId?: string;
 }) => {
   const { t } = useTranslate('knowledgeConfiguration');
-  const form = useFormContext();
   const { checkKbEmbedding, checking } = useCheckKbEmbedding();
 
-  const oldValue = useMemo(() => {
-    const embdStr = form.getValues(name || 'embedding_model');
-    return embdStr || '';
-  }, [form, name]);
   return (
     <div className="space-y-1.5">
       <ModelTreeSelect
         modelTypes={ModelTypeMap.embd_id}
         onChange={async (value) => {
+          const oldValue = field.value;
           field.onChange(value);
-          if (isEdit && disabled) {
+          if (isEdit && disabled && value.trim()) {
             const res = await checkKbEmbedding(value);
             if (res?.code !== 0) {
               field.onChange(oldValue);
             }
           }
         }}
-        ownerTenantId={ownerTenantId}
+        resourceTenantId={resourceTenantId}
+        accessUserId={accessUserId}
         disabled={(disabled && !isEdit) || checking}
         value={field.value}
         placeholder={t('embeddingModelPlaceholder')}

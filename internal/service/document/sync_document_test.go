@@ -7,10 +7,12 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
+	"ragflow/internal/permission"
 	"ragflow/internal/service"
 	"ragflow/internal/storage"
 	syncerconnector "ragflow/internal/syncer/connector"
@@ -47,7 +49,7 @@ func setupSyncDocumentTest(t *testing.T, existing bool) (*DocumentService, *gorm
 	t.Cleanup(func() { factory.SetStorage(original) })
 	svc := testDocumentService(t)
 	input := service.DocumentUpsertInput{
-		TaskContext: service.SyncTaskContext{Knowledgebase: *kb, Connector: entity.Connector{TenantID: "tenant-1"}},
+		TaskContext: service.SyncTaskContext{Knowledgebase: *kb, Connector: entity.Connector{UserID: "user-1", TenantID: "tenant-1"}},
 		SourceType:  "github_connector-1",
 		DocumentID:  "doc-sync",
 		SourceDocument: syncerconnector.SourceDocument{
@@ -83,6 +85,77 @@ func assertSyncDocumentState(t *testing.T, db *gorm.DB, store *fakeUploadStorage
 		t.Fatalf("published blob = %q, err = %v", blob, err)
 	}
 	return doc
+}
+
+func TestSyncDocumentUpsertUTF8Filename(t *testing.T) {
+	tests := []struct {
+		name      string
+		title     string
+		extension string
+		want      string
+	}{
+		{
+			name:      "cyrillic_page_hierarchy",
+			title:     "Wiki / Parent / " + strings.Repeat("П", 150),
+			extension: ".txt",
+			want:      "Wiki _ Parent _ " + strings.Repeat("П", 117) + ".txt",
+		},
+		{
+			name:      "chinese_inside_rune",
+			title:     strings.Repeat("文", 100),
+			extension: ".txt",
+			want:      strings.Repeat("文", 83) + ".txt",
+		},
+		{
+			name:      "emoji_with_existing_extension",
+			title:     strings.Repeat("📄", 80) + ".TXT",
+			extension: ".txt",
+			want:      strings.Repeat("📄", 62) + ".TXT",
+		},
+		{
+			name:      "cut_at_rune_boundary",
+			title:     "AB" + strings.Repeat("文", 84),
+			extension: ".txt",
+			want:      "AB" + strings.Repeat("文", 83) + ".txt",
+		},
+		{
+			name:      "already_at_byte_limit",
+			title:     "AB" + strings.Repeat("文", 83) + ".txt",
+			extension: ".txt",
+			want:      "AB" + strings.Repeat("文", 83) + ".txt",
+		},
+		{
+			name:      "ascii_over_byte_limit",
+			title:     strings.Repeat("a", 260),
+			extension: ".md",
+			want:      strings.Repeat("a", 252) + ".md",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			svc, db, store, input := setupSyncDocumentTest(t, false)
+			input.SourceDocument.SemanticIdentifier = tt.title
+			input.SourceDocument.Extension = tt.extension
+			result, err := svc.Upsert(t.Context(), input)
+			if err != nil || result.Action != service.DocumentActionAdded {
+				t.Fatalf("Upsert = %+v, err = %v, want added document", result, err)
+			}
+			doc := assertSyncDocumentState(t, db, store, input, input.SourceDocument.Fingerprint)
+			if doc.Name == nil {
+				t.Fatal("persisted document has no name")
+			}
+			got := *doc.Name
+			if !utf8.ValidString(got) {
+				t.Fatalf("persisted document name is invalid UTF-8 (last bytes %q)", got[max(0, len(got)-8):])
+			}
+			if len(got) > 255 {
+				t.Fatalf("persisted document name is %d bytes, want at most 255", len(got))
+			}
+			if got != tt.want {
+				t.Fatalf("persisted document name = %q, want %q", got, tt.want)
+			}
+		})
+	}
 }
 
 func TestSyncDocumentDownstreamFailurePreservesPublishedBlobAndRetries(t *testing.T) {
@@ -395,8 +468,78 @@ func TestSyncDocumentAcknowledgesParseEnqueueAfterCancellation(t *testing.T) {
 	if len(publisher.messages) != 1 {
 		t.Fatalf("parse publications = %d, want 1", len(publisher.messages))
 	}
+	task, err := svc.ingestionTaskDAO.GetByID(t.Context(), db, publisher.messages[0].TaskID)
+	if err != nil {
+		t.Fatalf("load enqueued ingestion task: %v", err)
+	}
+	if task.UserID != input.TaskContext.Connector.UserID {
+		t.Fatalf("ingestion task user id = %q, want connector owner %q", task.UserID, input.TaskContext.Connector.UserID)
+	}
 	result, err = svc.Upsert(t.Context(), input)
 	if err != nil || result.Action != service.DocumentActionSkipped || len(publisher.messages) != 1 {
 		t.Fatalf("completed revision retried enqueue: result = %+v err = %v publications = %d", result, err, len(publisher.messages))
+	}
+}
+
+func TestSyncDocumentAutoParseRejectsMissingConnectorOwner(t *testing.T) {
+	svc, db, _, input := setupSyncDocumentTest(t, false)
+	input.AutoParse = true
+	input.TaskContext.Connector.UserID = ""
+	publisher := &recordingTaskPublisher{}
+	svc.ingestionTaskSvc.SetTaskPublisher(publisher)
+
+	if _, err := svc.Upsert(t.Context(), input); err == nil || !strings.Contains(err.Error(), "no owner user_id") {
+		t.Fatalf("Upsert error = %v, want missing connector owner", err)
+	}
+	if len(publisher.messages) != 0 {
+		t.Fatalf("parse publications = %d, want none", len(publisher.messages))
+	}
+	var taskCount int64
+	if err := db.Model(&entity.IngestionTask{}).Where("document_id = ?", input.DocumentID).Count(&taskCount).Error; err != nil {
+		t.Fatal(err)
+	}
+	if taskCount != 0 {
+		t.Fatalf("ingestion tasks = %d, want none", taskCount)
+	}
+}
+
+func TestSyncDocumentReenqueuesParseWithConnectorOwner(t *testing.T) {
+	svc, db, _, input := setupSyncDocumentTest(t, true)
+	publisher := &recordingTaskPublisher{}
+	svc.ingestionTaskSvc.SetTaskPublisher(publisher)
+
+	if _, err := svc.Upsert(t.Context(), input); err != nil {
+		t.Fatalf("sync document before parse retry: %v", err)
+	}
+	input.AutoParse = true
+	result, err := svc.Upsert(t.Context(), input)
+	if err != nil || result.Action != service.DocumentActionSkipped {
+		t.Fatalf("parse retry = %+v, err = %v", result, err)
+	}
+	if len(publisher.messages) != 1 {
+		t.Fatalf("parse publications = %d, want 1", len(publisher.messages))
+	}
+	task, err := svc.ingestionTaskDAO.GetByID(t.Context(), db, publisher.messages[0].TaskID)
+	if err != nil {
+		t.Fatalf("load enqueued ingestion task: %v", err)
+	}
+	if task.UserID != input.TaskContext.Connector.UserID {
+		t.Fatalf("ingestion task user id = %q, want connector owner %q", task.UserID, input.TaskContext.Connector.UserID)
+	}
+}
+
+func TestSyncDocumentParseContextUsesConnectorIdentity(t *testing.T) {
+	ctx := permission.WithIdentity(t.Context(), "request-user", "request-tenant")
+	parseCtx, err := syncDocumentParseContext(ctx, service.SyncTaskContext{
+		Connector: entity.Connector{ID: "connector-1", UserID: "connector-owner", TenantID: "connector-tenant"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := permission.UserIDFromContext(parseCtx); got != "connector-owner" {
+		t.Fatalf("parse context user id = %q, want connector-owner", got)
+	}
+	if got := permission.TenantIDFromContext(parseCtx); got != "connector-tenant" {
+		t.Fatalf("parse context tenant id = %q, want connector-tenant", got)
 	}
 }

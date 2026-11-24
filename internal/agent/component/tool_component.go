@@ -19,6 +19,7 @@ package component
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -41,6 +42,14 @@ const componentNameExeSQL = "ExeSQL"
 
 func newToolComponentFactory(componentName, toolName string) Factory {
 	return func(params map[string]any) (Component, error) {
+		if componentName == componentNameExeSQL {
+			if err := validateExeSQLParams(params, false); err != nil {
+				if errors.Is(err, agenttool.ErrExeSQLNoCredentials) {
+					return nil, fmt.Errorf("%s: %w", componentName, err)
+				}
+				return nil, runtime.NewUserFacingError(fmt.Sprintf("%s: %s", componentName, err))
+			}
+		}
 		base, err := agenttool.BuildByName(toolName, params)
 		if err != nil {
 			return nil, err
@@ -128,6 +137,8 @@ var toolComponentRegistrations = []struct {
 }{
 	{componentName: "GitHub", toolName: "github"},
 	{componentName: "BGPT", toolName: "bgpt"},
+	{componentName: "AnySearchExtract", toolName: "anysearch_extract"},
+	{componentName: "AnySearchSearch", toolName: "anysearch_search"},
 	{componentName: "ArXiv", toolName: "arxiv"},
 	{componentName: "DuckDuckGo", toolName: "duckduckgo"},
 	{componentName: "Email", toolName: "email"},
@@ -135,6 +146,7 @@ var toolComponentRegistrations = []struct {
 	{componentName: "Google", toolName: "google"},
 	{componentName: "GoogleScholar", toolName: "google_scholar"},
 	{componentName: "KeenableSearch", toolName: "keenable"},
+	{componentName: "PerplexitySearch", toolName: "perplexity"},
 	{componentName: "PubMed", toolName: "pubmed"},
 	{componentName: "QueritContents", toolName: "querit_contents"},
 	{componentName: "QueritSearch", toolName: "querit_search"},
@@ -147,6 +159,7 @@ var toolComponentRegistrations = []struct {
 	{componentName: "WenCai", toolName: "wencai"},
 	{componentName: "Wikipedia", toolName: "wikipedia"},
 	{componentName: "YahooFinance", toolName: "yahoo_finance"},
+	{componentName: "YouComSearch", toolName: "youcom"},
 }
 
 func init() {

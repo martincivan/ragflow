@@ -10,6 +10,7 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { Form } from '@/components/ui/form';
 import { FileType } from '@/constants/file';
+import { ParserExtensionFields } from '@/ee/components/parser-extension-fields';
 import { useFetchDefaultModelDictionary } from '@/hooks/use-llm-request';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { LucideTrash2 } from 'lucide-react';
@@ -25,7 +26,6 @@ import { INextOperatorForm } from '../../interface';
 import { buildOutputList } from '../../utils/build-output-list';
 import { Output } from '../components/output';
 import { AudioFormFields } from './audio-form-fields';
-import { OutputFormatFormField } from './common-form-fields';
 import { EmailFormFields } from './email-form-fields';
 import { HtmlFormFields } from './html-form-fields';
 import { ImageFormFields } from './image-form-fields';
@@ -71,7 +71,7 @@ function ParserItem({ name, index, canRemove, onRemove }: ParserItemProps) {
   const Widget =
     typeof fileFormat === 'string' && fileFormat in FileFormatWidgetMap
       ? FileFormatWidgetMap[fileFormat as keyof typeof FileFormatWidgetMap]
-      : () => <></>;
+      : null;
 
   const handleRemove = useCallback(() => {
     onRemove(index);
@@ -98,16 +98,12 @@ function ParserItem({ name, index, canRemove, onRemove }: ParserItemProps) {
           ) : undefined
         }
       >
-        <div className="space-y-5">
-          <Widget prefix={prefix} fileType={fileFormat as FileType}></Widget>
-        </div>
+        {Widget && (
+          <div className="space-y-5">
+            <Widget prefix={prefix} />
+          </div>
+        )}
       </Collapse>
-      <div className="hidden">
-        <OutputFormatFormField
-          prefix={prefix}
-          fileType={fileFormat as FileType}
-        />
-      </div>
     </Card>
   );
 }
@@ -199,6 +195,7 @@ const ParserForm = ({
     <Form {...form}>
       <form className="space-y-5 px-5 pt-4">
         <VisionEnhancementFormFields />
+        <ParserExtensionFields />
         {fields.map((field, index) => {
           return (
             <ParserItem

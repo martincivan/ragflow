@@ -1,6 +1,7 @@
 package util
 
 import (
+	"encoding/base64"
 	"fmt"
 	"image"
 	"image/color"
@@ -13,8 +14,17 @@ import (
 func TestCropTextSectionPositionsKeepsUnresolvableCrop(t *testing.T) {
 	positions := []pdf.Position{{PageNumbers: []int{0}, Left: 10, Right: 90, Top: 150, Bottom: 200}}
 	pages := map[int]image.Image{0: makeTestPageImage(100, 400, color.RGBA{80, 80, 80, 255})}
-	if got, want := CropTextSectionPositions(positions, pages, 1), CropSectionPositions(positions, pages, 1); got != want {
-		t.Fatal("a crop with no clear rows should retain its body and context boundaries")
+	b64 := CropTextSectionPositions(positions, pages, 1)
+	if b64 == "" {
+		t.Fatal("expected non-empty result")
+	}
+	decoded, _ := base64.StdEncoding.DecodeString(b64)
+	img := decodePNG(t, decoded)
+	// Solid page: no clear rows to snap to, so the text path retains its
+	// body and context boundaries — 114px top band + 50px body + 114px
+	// bottom band + three 6px stitch gaps.
+	if bounds := img.Bounds(); bounds.Dx() != 80 || bounds.Dy() != 296 {
+		t.Fatalf("unresolvable crop bounds = %v, want 80x296 (body + context)", bounds)
 	}
 }
 
@@ -203,5 +213,19 @@ func TestCropTextSectionPositionsKeepsColumnsSeparate(t *testing.T) {
 	}
 	if want := (map[uint8]int{40: 18, 80: 18}); !reflect.DeepEqual(counts, want) {
 		t.Fatalf("column line rows = %v, want %v", counts, want)
+	}
+}
+
+func TestCropTextSectionPositionsLimitedRejectsOversizedStitchBeforeCopy(t *testing.T) {
+	page := &accessCountingImage{bounds: image.Rect(0, 0, 400, 400)}
+	positions := []pdf.Position{{PageNumbers: []int{0}, Left: 0, Right: 200, Top: 0, Bottom: 100}}
+	got := cropTextSectionPositionsLimited(positions, map[int]image.Image{0: page}, 1, 5_000)
+	if got != "" {
+		t.Fatalf("limited text crop = %q, want empty string when stitched pixels exceed limit", got)
+	}
+	// snapTextBoundary samples a bounded edge strip before final stitch sizing,
+	// whereas renderSectionRaster would copy >= 20,000 pixels of the 200x100 body.
+	if page.reads >= 20_000 {
+		t.Fatalf("source pixel reads = %d, expected < 20000 when skipping oversized stitch copy", page.reads)
 	}
 }

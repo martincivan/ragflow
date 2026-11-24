@@ -1,15 +1,14 @@
 import { FileIcon } from '@/components/icon-font';
 import { Button } from '@/components/ui/button';
 import { Checkbox } from '@/components/ui/checkbox';
-import { Switch } from '@/components/ui/switch';
 import {
   Tooltip,
   TooltipContent,
   TooltipTrigger,
 } from '@/components/ui/tooltip';
 import { useNavigatePage } from '@/hooks/logic-hooks/navigate-hooks';
+import { useDatasetEditButtonDisabled } from '@/ee/hooks/logic-hooks/use-permission';
 import { UseRowSelectionType } from '@/hooks/logic-hooks/use-row-selection';
-import { useSetDocumentStatus } from '@/hooks/use-document-request';
 import { IDocumentInfo } from '@/interfaces/database/document';
 import { cn } from '@/lib/utils';
 import { formatDate } from '@/utils/date';
@@ -17,11 +16,10 @@ import { ColumnDef } from '@tanstack/table-core';
 import { ArrowUpDown } from 'lucide-react';
 import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useParams } from 'react-router';
 import { MetadataType } from '../components/metedata/constant';
 import { ShowManageMetadataModalProps } from '../components/metedata/interface';
 import { DatasetActionCell } from './dataset-action-cell';
-import { ParseDropdownButton, ParsingStatusCell } from './parsing-status-cell';
+import { ParseCell, ParsingStatusCell } from './parsing-status-cell';
 import { UseChangeDocumentParserShowType } from './use-change-document-parser';
 import { UseRenameDocumentShowType } from './use-rename-document';
 
@@ -39,13 +37,12 @@ export function useDatasetTableColumns({
   showLog,
   setRowSelection,
 }: UseDatasetTableColumnsType) {
+  const datasetEditButtonDisabled = useDatasetEditButtonDisabled();
   const { t } = useTranslation('translation', {
     keyPrefix: 'knowledgeDetails',
   });
   // const { dataSourceInfo } = useDataSourceInfo();
   const { navigateToChunkParsedResult } = useNavigatePage();
-  const { setDocumentStatus } = useSetDocumentStatus();
-  const { id: datasetId } = useParams();
 
   const columns: ColumnDef<IDocumentInfo>[] = useMemo(
     () => [
@@ -61,6 +58,7 @@ export function useDatasetTableColumns({
               table.toggleAllPageRowsSelected(!!value)
             }
             aria-label="Select all"
+            disabled={datasetEditButtonDisabled}
           />
         ),
         cell: ({ row }) => (
@@ -68,6 +66,7 @@ export function useDatasetTableColumns({
             checked={row.getIsSelected()}
             onCheckedChange={(value) => row.toggleSelected(!!value)}
             aria-label="Select row"
+            disabled={datasetEditButtonDisabled}
           />
         ),
         enableSorting: false,
@@ -146,25 +145,6 @@ export function useDatasetTableColumns({
         ),
       },
       {
-        accessorKey: 'status',
-        header: t('enabled'),
-        cell: ({ row }) => {
-          const id = row.original.id;
-          return (
-            <Switch
-              checked={row.getValue('status') === '1'}
-              onCheckedChange={(e) => {
-                setDocumentStatus({
-                  status: e,
-                  documentId: id,
-                  datasetId: datasetId!,
-                });
-              }}
-            />
-          );
-        },
-      },
-      {
         accessorKey: 'chunk_count',
         header: t('chunkNumber'),
         cell: ({ row }) => (
@@ -223,24 +203,19 @@ export function useDatasetTableColumns({
         header: t('Parse'),
         cell: ({ row }) => {
           return (
-            <ParseDropdownButton
+            <ParseCell
               record={row.original}
               showChangeParserModal={showChangeParserModal}
+              datasetEditButtonDisabled={datasetEditButtonDisabled}
             />
           );
         },
       },
       {
         id: 'run-status',
-        header: '',
+        header: t('status'),
         cell: ({ row }) => {
-          return (
-            <ParsingStatusCell
-              record={row.original}
-              showChangeParserModal={showChangeParserModal}
-              showLog={showLog}
-            />
-          );
+          return <ParsingStatusCell record={row.original} showLog={showLog} />;
         },
       },
       {
@@ -255,6 +230,7 @@ export function useDatasetTableColumns({
               record={record}
               showRenameModal={showRenameModal}
               setRowSelection={setRowSelection}
+              datasetEditButtonDisabled={datasetEditButtonDisabled}
             />
           );
         },
@@ -263,13 +239,12 @@ export function useDatasetTableColumns({
     [
       t,
       navigateToChunkParsedResult,
-      setDocumentStatus,
-      datasetId,
       showChangeParserModal,
       showRenameModal,
       showManageMetadataModal,
       showLog,
       setRowSelection,
+      datasetEditButtonDisabled,
     ],
   );
 

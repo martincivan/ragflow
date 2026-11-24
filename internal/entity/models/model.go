@@ -22,9 +22,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 )
 
 // ReasoningSimple represents simple reasoning capability
@@ -237,10 +239,21 @@ func decodeProviderConfig(data []byte) (Provider, error) {
 	return provider, nil
 }
 
-var providerManager *ProviderManager
+// providerManager holds the published catalog. The catalog is immutable once
+// built, so publishing it through an atomic pointer gives every reader a fully
+// initialized snapshot without a lock.
+var providerManager atomic.Pointer[ProviderManager]
 
+// GetProviderManager returns the published provider catalog, or nil when no
+// catalog has been published yet.
 func GetProviderManager() *ProviderManager {
-	return providerManager
+	return providerManager.Load()
+}
+
+// setProviderManager publishes a catalog built by InitProviderManager. Tests
+// use it to install and restore fixture catalogs.
+func setProviderManager(pm *ProviderManager) {
+	providerManager.Store(pm)
 }
 
 // InitProviderManager creates a new ProviderManager by reading all JSON files from a directory
@@ -355,11 +368,11 @@ func InitProviderManager(dirPath string) error {
 		}
 	}
 
-	providerManager = &ProviderManager{
+	setProviderManager(&ProviderManager{
 		Providers:        providers,
 		AllModels:        allModels.Models,
 		Alias2ModelIndex: alias2ModelIndex,
-	}
+	})
 	return nil
 }
 
@@ -700,7 +713,7 @@ func (pm *ProviderManager) SearchModelInfo(providerName, modelName string, filte
 			}
 		case "type":
 			if typeVal, ok := filterValue.(string); ok {
-				if !containsModelType(model.ModelTypes, typeVal) {
+				if !slices.ContainsFunc(model.ModelTypes, func(t string) bool { return strings.EqualFold(t, typeVal) }) {
 					matchFilter = false
 					resp.Code = 400
 					resp.Message = fmt.Sprintf("Model does not meet filter criteria: type '%s' not found", typeVal)
@@ -738,21 +751,6 @@ func (pm *ProviderManager) SearchByFeature(featureType string) ModelResponse {
 		Message: "success",
 	}
 
-	//for _, provider := range pm.Providers {
-	//	for _, model := range provider.Models {
-	//		if modelHasFeature(model.Features, featureType) {
-	//			modelData := map[string]interface{}{
-	//				"provider":    provider.Name,
-	//				"name":        model.Name,
-	//				"max_tokens":  model.MaxTokens,
-	//				"model_types": model.ModelTypes,
-	//				"features":    getFeaturesMap(model.Features),
-	//			}
-	//			resp.Data = append(resp.Data, modelData)
-	//		}
-	//	}
-	//}
-
 	if len(resp.Data) == 0 {
 		resp.Code = 404
 		resp.Message = fmt.Sprintf("No models found with feature '%s'", featureType)
@@ -770,7 +768,7 @@ func (pm *ProviderManager) SearchByType(modelType string) ModelResponse {
 
 	for _, provider := range pm.Providers {
 		for _, model := range provider.Models {
-			if containsModelType(model.ModelTypes, modelType) {
+			if slices.ContainsFunc(model.ModelTypes, func(t string) bool { return strings.EqualFold(t, modelType) }) {
 				modelData := map[string]interface{}{
 					"provider":       provider.Name,
 					"name":           model.Name,
@@ -912,14 +910,4 @@ func (pm *ProviderManager) FindModel(provider *Provider, modelName string) *Mode
 		}
 	}
 	return nil
-}
-
-// Helper: Check if model types contains target
-func containsModelType(types []string, target string) bool {
-	for _, t := range types {
-		if strings.EqualFold(t, target) {
-			return true
-		}
-	}
-	return false
 }

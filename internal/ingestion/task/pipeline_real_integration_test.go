@@ -402,9 +402,7 @@ func taskRepoRoot(t *testing.T) string {
 
 func mustLoadTaskTestConfig(t *testing.T) *config.Config {
 	t.Helper()
-	if err := common.InitLogger("info", common.FileOutput{}, ""); err != nil {
-		t.Fatalf("init common logger: %v", err)
-	}
+	common.InitLogger("info", common.FileOutput{}, "")
 	configPath := filepath.Join(taskRepoRoot(t), "conf", "service_conf.yaml")
 	if err := server.Init(configPath); err != nil {
 		t.Fatalf("init service config from %s: %v", configPath, err)
@@ -433,6 +431,7 @@ func mustOpenTaskTestDB(t *testing.T) *gorm.DB {
 	}
 	if err = db.AutoMigrate(
 		&entity.Tenant{},
+		&entity.UserTenant{},
 		&entity.Knowledgebase{},
 		&entity.Document{},
 		&entity.File{},
@@ -528,7 +527,7 @@ func taskMustWriteTokenizerPOSDef(t *testing.T, dictPath, outPath string) {
 
 func taskMustPrepareTokenizerWordNet(t *testing.T, root string) {
 	t.Helper()
-	zipPath := filepath.Join(taskRepoRoot(t), "ragflow_deps", "nltk_data", "corpora", "wordnet.zip")
+	zipPath := filepath.Join(taskRepoRoot(t), "deps", "nltk_data", "corpora", "wordnet.zip")
 	reader, err := zip.OpenReader(zipPath)
 	if err != nil {
 		t.Skipf("open wordnet zip %s: %v", zipPath, err)
@@ -611,15 +610,16 @@ func mustSeedTaskRealPipelineDocumentBytes(
 	ocrID := "ocr-default"
 	if err := db.Create(&entity.Tenant{
 		ID:        tenantID,
-		LLMID:     "gpt-4",
-		ASRID:     "asr-default",
-		Img2TxtID: "img2txt-default",
-		RerankID:  "rerank-default",
 		ParserIDs: "parser-default",
-		OCRID:     &ocrID,
 		Status:    taskStrPtr("1"),
 	}).Error; err != nil {
 		t.Fatalf("create tenant: %v", err)
+	}
+	if err := db.Create(&entity.UserTenant{
+		ID: "owner-" + tenantID, UserID: tenantID, TenantID: tenantID, Role: "owner", Status: taskStrPtr("1"),
+		LLMID: "gpt-4", ASRID: "asr-default", Img2TxtID: "img2txt-default", RerankID: "rerank-default", OCRID: &ocrID,
+	}).Error; err != nil {
+		t.Fatalf("create tenant owner membership: %v", err)
 	}
 	if err := db.Create(&entity.Knowledgebase{
 		ID:           kbID,

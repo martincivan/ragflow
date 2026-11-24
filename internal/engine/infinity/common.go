@@ -20,10 +20,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"ragflow/internal/common"
 	"ragflow/internal/engine/types"
 	"regexp"
+	"sort"
 	"strings"
 	"unicode"
 
@@ -44,16 +46,14 @@ func (e *Engine) dropTable(ctx context.Context, tableName string) error {
 	}
 	defer release()
 
-	// Check if table exists
-	exists, err := e.tableExistsWithDB(db, tableName)
-	if err != nil {
-		return fmt.Errorf("failed to check table existence: %w", err)
-	}
-	if !exists {
-		return fmt.Errorf("table '%s' does not exist", tableName)
-	}
-
 	_, err = db.DropTable(tableName, infinity.ConflictTypeError)
+	var infinityErr *infinity.InfinityException
+	if errors.As(err, &infinityErr) && infinity.ErrorCode(infinityErr.ErrorCode) == infinity.ErrorCodeTableNotExist {
+		// Tolerate a missing table, as Elasticsearch's dropIndex does: tables
+		// are created on first write, so callers dropping by dataset or
+		// tenant routinely name one that was never created.
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("failed to drop table: %w", err)
 	}
@@ -230,6 +230,18 @@ func fieldJSONList(fieldName string) bool {
 	}
 }
 
+// fieldVarcharJSON reports varchar columns that hold JSON text: the write path
+// json-encodes their values and readers must parse them back. They are not
+// json-typed columns, so fieldJSON does not cover them.
+func fieldVarcharJSON(fieldName string) bool {
+	switch strings.ToLower(fieldName) {
+	case "tag_feas":
+		return true
+	default:
+		return false
+	}
+}
+
 // joinBalanced renders a boolean chain as a balanced tree instead of the flat,
 // left-deep chain strings.Join produces. Infinity's filter string is parsed by
 // the SDK into a Thrift expression tree (infinity-go-sdk expression_parser.go)
@@ -381,13 +393,27 @@ func buildFilterFromCondition(condition map[string]interface{}, tableColumns map
 	return buildFilterFromConditionRaw(types.CompilationFilter(condition), tableColumns)
 }
 
+// sortedConditionKeys walks a filter condition in a stable order. Both filter
+// builders append clauses while ranging over the condition map, so an unsorted
+// walk renders the same logical filter with a different clause order on each
+// call — including the predicate of a bulk update or delete.
+func sortedConditionKeys(condition map[string]interface{}) []string {
+	keys := make([]string, 0, len(condition))
+	for k := range condition {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 func buildFilterFromConditionRaw(condition map[string]interface{}, tableColumns map[string]struct {
 	Type    string
 	Default interface{}
 }) string {
 	var conditions []string
 
-	for k, v := range condition {
+	for _, k := range sortedConditionKeys(condition) {
+		v := condition[k]
 		if k == "and" || k == "or" {
 			var children []string
 			for _, child := range types.FilterClauses(v) {

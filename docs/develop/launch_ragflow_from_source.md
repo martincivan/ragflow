@@ -27,7 +27,7 @@ All long-running RAGFlow processes started below use `bin/ragflow_server`.
 - Go 1.27 or later, as declared in `go.mod` (check `go version`).
 - CMake 4.0 or later, Clang 20, LLD 20, and PCRE2 development headers.
 - Node.js 18.20.4 or later and npm for the frontend.
-- Python 3.10 or later for `tools/scripts/download_dev_deps.py` and `ragflow_deps/download_deps.py`, which download the native libraries and model resources required by the Go build.
+- Python 3.10 or later for `tools/scripts/download_dev_deps.py` and `deps/download_deps.py`, which download the native libraries and model resources required by the Go build.
 
 See the [Docker installation guide](https://docs.docker.com/engine/install/) if Docker is not installed. Use the Go version declared in `go.mod` and the compiler versions listed above when preparing the build environment.
 
@@ -60,7 +60,7 @@ Download the native static libraries and the runtime model / tokenizer resources
 uv run tools/scripts/download_dev_deps.py   # local-dev one-stop: native .a + cl100k, DeepDoc .ort, tokenizer assets
 ```
 
-`download_dev_deps.py` is the local-dev one-stop: it fetches the static libraries needed by `build.sh` (pdfium / pdf_oxide / office_oxide / onnxruntime → `~/ragflow-native-libs`) AND the runtime resources the backend loads at runtime — `det.ort`, `layout.ort`, `tsr.ort`, `rec.ort`, `ocr.res` into `internal/rag/res/deepdoc/` (required by the in-process Go DeepDoc backend) and `ragflow_deps/cl100k_base.tiktoken` and the embedding tokenizer assets under `ragflow_deps/huggingface.co/`. Run it once and the local environment is ready; already-present files are skipped on re-run. The image-facing `ragflow_deps/download_deps.py` fetches the same runtime resources PLUS the stagehand server (installed into `${XDG_CACHE_HOME:-$HOME/.cache}/stagehand/lib/go_<SDK version>/`) and skips the native `.a`; run it only when building the dependency image or in CI. Native archives support Linux x86_64. Keep the server's working directory at the repository root so it can find the DeepDoc models automatically; if you launch it elsewhere, set `DEEPDOC_MODEL_DIR` to the absolute path of `internal/rag/res/deepdoc`.
+`download_dev_deps.py` is the local-dev one-stop: it fetches the static libraries needed by `build.sh` (pdfium / pdf_oxide / office_oxide / onnxruntime → `~/ragflow-native-libs`) AND the runtime resources the backend loads at runtime — `det.ort`, `layout.ort`, `tsr.ort`, `rec.ort`, `ocr.res` into `internal/rag/res/deepdoc/` (required by the in-process Go DeepDoc backend) and `deps/cl100k_base.tiktoken` and the embedding tokenizer assets under `deps/huggingface.co/`. Run it once and the local environment is ready; already-present files are skipped on re-run. The image-facing `deps/download_deps.py` fetches the same runtime resources and skips the native `.a`; run it only when building the dependency image or in CI. Native archives support Linux x86_64. Keep the server's working directory at the repository root so it can find the DeepDoc models automatically; if you launch it elsewhere, set `DEEPDOC_MODEL_DIR` to the absolute path of `internal/rag/res/deepdoc`.
 
 Skip either script if you have prepared the same resources by other means.
 
@@ -70,31 +70,31 @@ Build the C++ bindings and Go binaries:
 bash build.sh --all
 ```
 
-For a smaller production binary, use `bash build.sh --strip --all` instead. The dependency downloader prepares `ragflow_deps/cl100k_base.tiktoken`. If the table is missing, download it before starting the server:
+For a smaller production binary, use `bash build.sh --strip --all` instead. The dependency downloader prepares `deps/cl100k_base.tiktoken`. If the table is missing, download it before starting the server:
 
 ```bash
-curl -fsSL -o ragflow_deps/cl100k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken
+curl -fsSL -o deps/cl100k_base.tiktoken https://openaipublic.blob.core.windows.net/encodings/cl100k_base.tiktoken
 ```
 
-Check that the newly built executable can load and parse API arguments:
+Check that the newly built executable can load and parse its arguments:
 
 ```bash
-./bin/ragflow_server --api --help
+./bin/ragflow_server --help
 ```
 
-It should print API usage information and may exit with status 1. This command only checks that the binary can load and parse arguments; it does not initialize DeepDoc, connect to dependencies, or prove that the API can start. Complete the runtime checks in section 5 after starting the dependencies and Go processes.
+It should print server usage information and exit successfully. This command only checks that the binary can load and parse arguments; it does not initialize DeepDoc, connect to dependencies, or prove that the API can start. Complete the runtime checks in section 5 after starting the dependencies and Go processes.
 
 The Go/C++ build requires LLD 20. Confirm that `ld.lld --version` reports LLD 20 before building; merely installing `lld-20` is insufficient when an older `ld.lld` remains the system default. If the binary builds successfully but exits or crashes before reaching Go `main`, verify the selected linker and rebuild with LLD 20.
 
-To prepare the resource image used by the Go Dockerfile, first run `uv run ragflow_deps/download_deps.py` (above) to populate `ragflow_deps/`, then build from `ragflow_deps/`:
+To prepare the resource image used by the Go Dockerfile, first run `uv run deps/download_deps.py` (above) to populate `deps/`, then build from `deps/`:
 
 ```bash
-cd ragflow_deps
+cd deps
 docker build -f Dockerfile -t infiniflow/ragflow_deps:latest .
 cd ..
 ```
 
-The downloader prepares the five Go DeepDoc files under `ragflow_deps/huggingface.co/InfiniFlow/deepdoc/` for the resource image, as well as `internal/rag/res/deepdoc/` for local use. The Go Dockerfile copies these models into the runtime model directory. Analyzer dictionaries and fonts are installed separately by the Go Dockerfile.
+The downloader prepares the five Go DeepDoc files under `deps/huggingface.co/InfiniFlow/deepdoc/` for the resource image, as well as `internal/rag/res/deepdoc/` for local use. The Go Dockerfile copies these models into the runtime model directory. Analyzer dictionaries and fonts are installed separately by the Go Dockerfile.
 
 ## 2. Start supporting services
 
@@ -118,44 +118,35 @@ The base Compose file also defines an unprofiled Redis service. Starting every s
 
 Check that the services are ready before migrating. For this host-run setup, edit **`conf/service_conf.yaml`** if you changed the published ports or credentials in `docker/.env`. The defaults include MySQL at `localhost:3306`, Elasticsearch at `localhost:1200`, MinIO at `localhost:9000`, Kvrocks at `localhost:6379`, NATS at `localhost:4222`, and ClickHouse at `localhost:9900`. Do not edit `docker/service_conf.yaml.template` for a Go process launched directly on the host, and no `/etc/hosts` entries for Docker service names are needed.
 
-## 3. Migrate and launch the Go backend
+## 3. Launch the Go backend
 
-Run the migration once before starting any server process:
-
-```bash
-./bin/ragflow_server --migrate
-```
-
-Then start each Go mode in a separate terminal from the repository root. These four modes are the complete backend service chain. The source-development commands below use `RAGFLOW_DEV_MODE=true` to bypass the code and database version downgrade check; this setting does not run migrations or change the schema. Do not set it in production. Start Admin first so API, Ingestor, and Syncer can report their heartbeats:
+From the repository root:
 
 ```bash
-# Terminal 1: admin (target port 9381)
-RAGFLOW_DEV_MODE=true ./bin/ragflow_server --admin
+./bin/ragflow_server
 ```
 
-```bash
-# Terminal 2: API (target port 9380)
-RAGFLOW_DEV_MODE=true ./bin/ragflow_server --api
-```
+The OSS server runs all services in one Go process. It runs database migrations first, starts Admin and initializes the
+superuser, waits for API readiness, then starts Ingestor, Syncer and Chatter.
+Services run as goroutines with shared connections, model resources and tokenizers.
+All services stop together on cancellation or a service failure.
+Admin defaults to `9381` and API to `9380`. `bash build.sh --run` builds and
+starts the same server.
 
-```bash
-# Terminal 3: document ingestion
-RAGFLOW_DEV_MODE=true ./bin/ragflow_server --ingestor
-```
+Use `-f` / `--config` to select a configuration file. Other common options are
+`-v` / `--version`, `--log-level`, `--profile`, and `-h` / `--help`.
+Set service names with `<service>.name` or `RAGFLOW_<SERVICE>_NAME`.
+Set admin discovery with `admin.host` / `admin.http_port` or
+`RAGFLOW_ADMIN_HOST` / `RAGFLOW_ADMIN_HTTP_PORT`.
+Set worker and page concurrency with `ingestor.concurrent_workers` /
+`ingestor.page_concurrency` or `RAGFLOW_INGESTOR_CONCURRENT_WORKERS` /
+`RAGFLOW_INGESTOR_PAGE_CONCURRENCY`. Environment variables override the file.
 
-Start the Go syncer in another terminal:
+Update `conf/service_conf.yaml` for host-run dependency ports and credentials.
+`kvrocks.host` is a single `host:port` value, defaulting to `localhost:6379`.
+Leave `RAGFLOW_DEV_MODE` unset in production; it bypasses downgrade protection.
 
-```bash
-RAGFLOW_DEV_MODE=true ./bin/ragflow_server --syncer
-```
-
-After the migration completes, `RAGFLOW_DEV_MODE=true bash build.sh --run` can be used as a shortcut to start the Go Admin, Ingestor, and API modes. The shortcut does not start Syncer; run the Syncer command above separately when the complete service chain is required. It does not replace the standalone migration step.
-
-If you changed a dependency's published port or credentials, update `conf/service_conf.yaml` before starting the Go processes. In particular, `kvrocks.host` is a single `host:port` value; the default source configuration is `localhost:6379`. Do not rely on `KVROCKS_HOST` and `KVROCKS_PORT` to override this source configuration.
-
-`RAGFLOW_DEV_MODE=true` bypasses the code-versus-database version check. Use it only for development, not to run an older production binary against a newer database. The standalone `--migrate` action must still complete first.
-
-If startup reports `no in-process DeepDoc backend serving`, check that all five model files above are in `internal/rag/res/deepdoc/`, then re-run the Go dependency downloader and rebuild if necessary. If the tokenizer reports a missing `cl100k_base.tiktoken`, ensure the BPE table is in `ragflow_deps/`.
+If startup reports `no in-process DeepDoc backend serving`, check that all five model files above are in `internal/rag/res/deepdoc/`, then re-run the Go dependency downloader and rebuild if necessary. If the tokenizer reports a missing `cl100k_base.tiktoken`, ensure the BPE table is in `deps/`.
 
 ## 4. Start the frontend
 

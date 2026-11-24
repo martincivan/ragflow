@@ -21,21 +21,26 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/engine"
 	enginetypes "ragflow/internal/engine/types"
 	"ragflow/internal/entity"
+	"ragflow/internal/permission"
 	"ragflow/internal/storage"
+	"ragflow/internal/utility"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"go.uber.org/zap"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 // FileCommitService file commit service
@@ -56,8 +61,80 @@ func NewFileCommitService() *FileCommitService {
 	}
 }
 
+// maxCommitFolderDepth bounds the ancestor walk that places a commit's file IDs
+// inside the commit folder. Folder chains are short; the bound only stops a
+// corrupted parent_id cycle.
+const maxCommitFolderDepth = 64
+
+// ErrDeleteLiveFile rejects a delete change for a file that still exists in the
+// commit folder. Recording the tombstone would hide the live file from
+// GetUncommittedChanges, which skips every committed tombstone and marks the
+// entry as processed, so later edits would never be reported.
+var ErrDeleteLiveFile = errors.New("cannot commit the deletion of a file that is still in the folder")
+
+// ErrInvalidRenameTarget rejects a rename change whose target is empty or
+// exceeds the stored name limit. The handler maps it to a client error instead
+// of a server fault.
+var ErrInvalidRenameTarget = errors.New("invalid file rename target")
+
+// fileTreeContains reports whether fileID, or one of its ancestors, is folderID.
+// It walks from the file upwards rather than scanning the folder, and treats an
+// unknown ID as outside: a deletion is only valid for a file that is already
+// gone. The seen set stops a corrupted parent_id cycle.
+func (s *FileCommitService) fileTreeContains(ctx context.Context, tx *gorm.DB, folderID, fileID string) (bool, error) {
+	seen := make(map[string]bool)
+	current := fileID
+	for current != "" && !seen[current] {
+		seen[current] = true
+		if current == folderID {
+			return true, nil
+		}
+		var file entity.File
+		err := tx.WithContext(ctx).Select("id", "parent_id").Where("id = ?", current).First(&file).Error
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return false, nil
+		}
+		if err != nil {
+			return false, fmt.Errorf("resolve file %s: %w", fileID, err)
+		}
+		current = file.ParentID
+	}
+	return false, nil
+}
+
+// normalizeCommitRenames trims and validates every rename target before the
+// transaction writes objects or rows. Object storage has no transaction, so a
+// later invalid rename would otherwise leave objects written by earlier
+// add/modify changes behind.
+func normalizeCommitRenames(changes []entity.FileChange) ([]entity.FileChange, error) {
+	normalized := make([]entity.FileChange, len(changes))
+	copy(normalized, changes)
+	for i := range normalized {
+		if normalized[i].Operation != "rename" {
+			continue
+		}
+		normalized[i].NewName = strings.TrimSpace(normalized[i].NewName)
+		if err := common.ValidateNameRunes(normalized[i].NewName, common.NameLimit255); err != nil {
+			return nil, fmt.Errorf("%w for file %s: %v", ErrInvalidRenameTarget, normalized[i].FileID, err)
+		}
+	}
+	return normalized, nil
+}
+
 // CreateCommit creates a new commit for a workspace folder
 func (s *FileCommitService) CreateCommit(ctx context.Context, folderID, authorID, message string, changes []entity.FileChange) (*entity.FileCommit, error) {
+	message = strings.TrimSpace(message)
+	if message == "" {
+		return nil, errors.New("commit message is required")
+	}
+	if utf8.RuneCountInString(message) > 512 {
+		return nil, errors.New("commit message must be at most 512 characters")
+	}
+	normalizedChanges, err := normalizeCommitRenames(changes)
+	if err != nil {
+		return nil, err
+	}
+	changes = normalizedChanges
 	// 1. Get the latest commit for this folder
 	latestCommit, _ := s.commitDAO.GetLatestByFolderID(ctx, dao.DB, folderID)
 
@@ -90,6 +167,13 @@ func (s *FileCommitService) CreateCommit(ctx context.Context, folderID, authorID
 	// All DB operations run inside a single transaction.
 	var treeStr string
 	if err := dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		// Authorize the named files against the rows this transaction is about
+		// to write, holding them so a concurrent move cannot relocate a file
+		// between the ancestry check and the update below.
+		if err := s.authorizeCommitFiles(ctx, tx, folderID, changes, treeState); err != nil {
+			return err
+		}
+
 		// Save commit
 		if err := tx.Create(commit).Error; err != nil {
 			return fmt.Errorf("failed to create commit: %w", err)
@@ -182,8 +266,19 @@ func (s *FileCommitService) CreateCommit(ctx context.Context, folderID, authorID
 					}
 				}
 
-				if err := tx.Model(&entity.File{}).Where("id = ?", change.FileID).Update("status", "0").Error; err != nil {
-					return fmt.Errorf("failed to soft-delete file: %w", err)
+				// The file table has no status column: a deleted file is one
+				// already removed from the live tree, so the commit only keeps
+				// the tombstone in tree_state for history and diffs. A file
+				// that is still live would otherwise be hidden from
+				// GetUncommittedChanges for good: that scan marks every
+				// committed entry as processed and skips tombstones, so the
+				// live row is reported as neither deleted nor added.
+				liveInFolder, err := s.fileTreeContains(ctx, tx, folderID, change.FileID)
+				if err != nil {
+					return err
+				}
+				if liveInFolder {
+					return fmt.Errorf("%w: %s", ErrDeleteLiveFile, change.FileID)
 				}
 
 				if entry, ok := treeState[change.FileID]; ok {
@@ -193,20 +288,21 @@ func (s *FileCommitService) CreateCommit(ctx context.Context, folderID, authorID
 				}
 
 			case "rename":
+				newName := change.NewName
 				item.OldName = &change.OldName
-				item.NewName = &change.NewName
+				item.NewName = &newName
 
-				if err := tx.Model(&entity.File{}).Where("id = ?", change.FileID).Update("name", change.NewName).Error; err != nil {
+				if err := tx.Model(&entity.File{}).Where("id = ?", change.FileID).Update("name", newName).Error; err != nil {
 					return fmt.Errorf("failed to rename file: %w", err)
 				}
 
 				if entry, ok := treeState[change.FileID]; ok {
 					if entryMap, ok := entry.(map[string]interface{}); ok {
-						entryMap["name"] = change.NewName
+						entryMap["name"] = newName
 					}
 				} else {
 					treeState[change.FileID] = map[string]interface{}{
-						"name":   change.NewName,
+						"name":   newName,
 						"status": "1",
 					}
 				}
@@ -239,6 +335,165 @@ func (s *FileCommitService) CreateCommit(ctx context.Context, folderID, authorID
 	return commit, nil
 }
 
+// authorizeCommitFiles rejects commit changes whose file IDs fall outside the
+// commit folder. The route only proves the caller may use folderID, while every
+// files[].file_id is independent client input and the writes below address file
+// rows by ID alone, so an unchecked ID retargets another workspace or tenant
+// (IDOR, CWE-639). A change may record the deletion of a file that was already
+// removed or moved away, so such a delete-only ID is validated against the
+// previous tree state instead of the file table: every ID that ever entered the
+// folder history has a tree entry, and one that does not would mint a tombstone
+// for an arbitrary ID that the global per-file version history then exposes.
+//
+// It runs inside the commit transaction and locks the rows it reads: a
+// concurrent move would otherwise be able to relocate a file (or one of its
+// ancestors) after the parent chain was checked and before the write.
+func (s *FileCommitService) authorizeCommitFiles(ctx context.Context, tx *gorm.DB, folderID string, changes []entity.FileChange, treeState map[string]interface{}) error {
+	var folder entity.File
+	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", folderID).First(&folder).Error; err != nil {
+		return fmt.Errorf("resolve commit folder %s: %w", folderID, err)
+	}
+	if folder.Type != FileTypeFolder {
+		return fmt.Errorf("%w: %s is not a folder", permission.ErrResourceNotFound, folderID)
+	}
+
+	operations := make(map[string][]string, len(changes))
+	ids := make([]string, 0, len(changes))
+	for _, change := range changes {
+		if change.FileID == "" {
+			return fmt.Errorf("%w: file_id is required", permission.ErrResourceNotFound)
+		}
+		if _, seen := operations[change.FileID]; !seen {
+			ids = append(ids, change.FileID)
+		}
+		operations[change.FileID] = append(operations[change.FileID], change.Operation)
+	}
+
+	files, err := lockedCommitFiles(tx, ids)
+	if err != nil {
+		return fmt.Errorf("resolve commit files: %w", err)
+	}
+	existing := make(map[string]*entity.File, len(files))
+	for _, file := range files {
+		existing[file.ID] = file
+	}
+	scoped := make(map[string]*entity.File, len(existing))
+	for _, id := range ids {
+		hasNonDelete := false
+		for _, operation := range operations[id] {
+			if operation != "delete" {
+				hasNonDelete = true
+				break
+			}
+		}
+		if hasNonDelete {
+			file, ok := existing[id]
+			if !ok {
+				return fmt.Errorf("%w: file %s not found in folder %s", permission.ErrPermissionDenied, id, folderID)
+			}
+			scoped[id] = file
+		} else {
+			// A delete-only change records a tombstone in tree_state and never
+			// writes the file row, so the ID must be one this folder actually
+			// committed before (a file since removed or moved away). An ID
+			// absent from the previous tree never belonged to this history,
+			// whether it still has a live row elsewhere or not.
+			if _, ok := treeState[id]; !ok {
+				return fmt.Errorf("%w: file %s not found in folder %s", permission.ErrPermissionDenied, id, folderID)
+			}
+		}
+	}
+	return ensureFilesInFolder(tx, folderID, scoped)
+}
+
+// lockedCommitFiles loads file rows for the commit transaction with write locks
+// so their parent_id cannot change underneath the ancestry check.
+func lockedCommitFiles(tx *gorm.DB, ids []string) ([]*entity.File, error) {
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	var files []*entity.File
+	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id IN ?", ids).Find(&files).Error
+	return files, err
+}
+
+// ensureFilesInFolder rejects files whose parent chain does not reach folderID.
+// Ancestors are resolved one folder level at a time, so a commit verifies all of
+// its files with one query per tree depth instead of one query per file.
+func ensureFilesInFolder(tx *gorm.DB, folderID string, files map[string]*entity.File) error {
+	if len(files) == 0 {
+		return nil
+	}
+	parentOf := make(map[string]string, len(files))
+	frontier := make([]string, 0, len(files))
+	for id, file := range files {
+		if id == folderID {
+			continue
+		}
+		parentOf[id] = file.ParentID
+		frontier = append(frontier, file.ParentID)
+	}
+
+	for depth := 0; depth < maxCommitFolderDepth && len(frontier) > 0; depth++ {
+		load := make([]string, 0, len(frontier))
+		queued := make(map[string]struct{}, len(frontier))
+		for _, id := range frontier {
+			if id == "" || id == folderID {
+				continue
+			}
+			if _, known := parentOf[id]; known {
+				continue
+			}
+			if _, dup := queued[id]; dup {
+				continue
+			}
+			queued[id] = struct{}{}
+			load = append(load, id)
+		}
+		if len(load) == 0 {
+			break
+		}
+		ancestors, err := lockedCommitFiles(tx, load)
+		if err != nil {
+			return fmt.Errorf("resolve commit file ancestors: %w", err)
+		}
+		for _, ancestor := range ancestors {
+			parentOf[ancestor.ID] = ancestor.ParentID
+		}
+		frontier = frontier[:0]
+		for _, id := range load {
+			parent, ok := parentOf[id]
+			if !ok {
+				// A missing ancestor terminates the chain for its descendants.
+				parentOf[id] = ""
+			}
+			frontier = append(frontier, parent)
+		}
+	}
+
+	for id := range files {
+		if !commitFileInFolder(id, folderID, parentOf) {
+			return fmt.Errorf("%w: file %s is outside folder %s", permission.ErrPermissionDenied, id, folderID)
+		}
+	}
+	return nil
+}
+
+func commitFileInFolder(fileID, folderID string, parentOf map[string]string) bool {
+	visited := make(map[string]struct{})
+	for current := fileID; current != ""; {
+		if current == folderID {
+			return true
+		}
+		if _, cycle := visited[current]; cycle {
+			return false
+		}
+		visited[current] = struct{}{}
+		current = parentOf[current]
+	}
+	return false
+}
+
 // PageEditCommitInput carries the data needed to record a single wiki/skill
 // page edit as an audit commit.
 type PageEditCommitInput struct {
@@ -250,7 +505,31 @@ type PageEditCommitInput struct {
 	AuthorID   string
 	OldContent string
 	NewContent string
+	// Page is the whole page as the engine holds it - content, title, summary,
+	// topic, entities, links, source ids. It is what the snapshot stores, because
+	// a restore has to put the page back whole: the body alone leaves the page's
+	// summary and links describing a version that no longer exists.
+	//
+	// A caller that has no whole page (an edit that only knows the body) leaves it
+	// nil and the snapshot falls back to the body, exactly as the history stored
+	// pages before it carried whole documents.
+	Page map[string]any
 }
+
+// pageSnapshot is the object a page commit stores: the whole page, plus the
+// format version that says how to read it.
+//
+// The version is what keeps old objects readable. Before this existed the object
+// was the page body itself, so a decoder that finds no format field treats the
+// bytes as content rather than failing - the history is append-only and its older
+// half cannot be rewritten.
+type pageSnapshot struct {
+	Format int            `json:"format"`
+	Page   map[string]any `json:"page"`
+}
+
+// pageSnapshotFormat is the version this build writes.
+const pageSnapshotFormat = 1
 
 // wikiFileID derives the stable file key used to scope page-edit commits to a
 // specific knowledgebase and page, so identical slugs in different
@@ -281,17 +560,28 @@ func (s *FileCommitService) RecordPageEdit(ctx context.Context, in PageEditCommi
 
 	commitID := common.GenerateUUID()
 
+	operation := "modify"
+	switch {
+	case in.OldContent == "" && in.NewContent != "":
+		operation = "add"
+	case in.OldContent != "" && in.NewContent == "":
+		// A page that lost its body was removed. The history has to say so, or a
+		// restore cannot tell a page that was deleted from one that never existed -
+		// and would bring back pages the version never had.
+		operation = "delete"
+	}
 	diffText := unifiedDiff(in.OldContent, in.NewContent)
-	if diffText == "" {
+	if diffText == "" && operation != "delete" {
 		return nil, nil
 	}
-	contentAfterStorage, contentAfterLocation := s.storePageContent(ctx, in.DatasetID, in.NewContent)
+	// A delete stores no body: the page is gone, and the snapshot it would write
+	// is the empty page that follows it, not the one it replaced.
+	var contentAfterStorage, contentAfterLocation string
+	if operation != "delete" {
+		contentAfterStorage, contentAfterLocation = s.storePageSnapshot(ctx, in.DatasetID, pageSnapshotOf(in))
+	}
 	slugKwd := in.Slug
 	pageTypeKwd := in.PageType
-	operation := "modify"
-	if in.OldContent == "" {
-		operation = "add"
-	}
 
 	item := &entity.FileCommitItem{
 		ID:          common.GenerateUUID(),
@@ -327,17 +617,28 @@ func (s *FileCommitService) RecordPageEdit(ctx context.Context, in PageEditCommi
 		return nil, fmt.Errorf("failed to resolve page commit parent: %w", perr)
 	}
 
+	title := utility.TruncateRunes(strings.TrimSpace(in.Title), common.NameLimit255)
 	commit = &entity.FileCommit{
 		ID:        commitID,
 		FolderID:  in.DatasetID,
-		Message:   in.Title,
+		Message:   title,
 		AuthorID:  in.AuthorID,
-		Title:     &in.Title,
+		Title:     &title,
 		Comments:  &in.Comments,
 		FileCount: 1,
 	}
 	if parentID != "" {
 		commit.ParentID = &parentID
+	}
+	// Stamp the row with the metadata database's clock, the timeline every other
+	// history row is on (see entity.DBTimeMillis). A restore anchors on
+	// dataset_version.create_time, so a commit stamped a few milliseconds ahead of
+	// it by a fast local clock would fall outside the very version it was written
+	// for - and the page would read as missing at that version. The local clock
+	// stays as the fallback for a dialect the database clock cannot answer.
+	if stamp, err := entity.DBTimeMillis(dao.DB); err == nil {
+		commit.CreateTime = &stamp
+		item.CreateTime = &stamp
 	}
 
 	if err := dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -355,21 +656,69 @@ func (s *FileCommitService) RecordPageEdit(ctx context.Context, in PageEditCommi
 	return commit, nil
 }
 
-// storePageContent saves a page version in the same dataset-scoped object
-// layout used by Python's MinIO-backed artifact history. Missing storage is
-// tolerated because page updates and audit rows are intentionally best-effort.
-func (s *FileCommitService) storePageContent(ctx context.Context, datasetID, content string) (string, string) {
+// pageSnapshotOf is the page a commit stores: the caller's whole page when it has
+// one, otherwise the smallest page that still describes the edit - the body it
+// wrote plus the identity the item already carries.
+func pageSnapshotOf(in PageEditCommitInput) map[string]any {
+	if len(in.Page) > 0 {
+		page := make(map[string]any, len(in.Page)+3)
+		for key, value := range in.Page {
+			page[key] = value
+		}
+		applyPageSnapshotDefaults(page, in)
+		return page
+	}
+	page := map[string]any{"content_with_weight": in.NewContent}
+	applyPageSnapshotDefaults(page, in)
+	return page
+}
+
+// applyPageSnapshotDefaults fills the fields the caller's page may leave out, so
+// a snapshot always knows which page it belongs to and what it says.
+func applyPageSnapshotDefaults(page map[string]any, in PageEditCommitInput) {
+	if value, ok := page["slug_kwd"]; !ok || value == "" {
+		page["slug_kwd"] = in.PageType + "/" + in.Slug
+	}
+	if value, ok := page["page_type_kwd"]; !ok || value == "" {
+		page["page_type_kwd"] = in.PageType
+	}
+	if value, ok := page["title_kwd"]; !ok || value == "" {
+		page["title_kwd"] = in.Title
+	}
+}
+
+// storePageSnapshot saves a page version in the same dataset-scoped object layout
+// used by Python's MinIO-backed artifact history. Missing storage is tolerated
+// because page updates and audit rows are intentionally best-effort.
+func (s *FileCommitService) storePageSnapshot(ctx context.Context, datasetID string, page map[string]any) (string, string) {
 	storageImpl := storage.GetStorageFactory().GetStorage()
 	if storageImpl == nil {
 		return "", ""
 	}
-	hash := sha256.Sum256([]byte(content))
+	encoded, err := json.Marshal(pageSnapshot{Format: pageSnapshotFormat, Page: page})
+	if err != nil {
+		common.Warn("Failed to encode wiki page snapshot", zap.Error(err))
+		return "", ""
+	}
+	hash := sha256.Sum256(encoded)
 	location := wikiCommitBucketPrefix + "/" + hex.EncodeToString(hash[:])
-	if err := storageImpl.Put(ctx, datasetID, location, []byte(content)); err != nil {
-		common.Warn("failed to store wiki commit content", zap.Error(err))
+	if err := storageImpl.Put(ctx, datasetID, location, encoded); err != nil {
+		common.Warn("Failed to store wiki page snapshot", zap.Error(err))
 		return "", ""
 	}
 	return wikiContentStorage, location
+}
+
+// decodePageSnapshot reads the object a commit points at. An object that carries
+// no format version is a body written before snapshots existed, so it is read as
+// content rather than refused: the history is append-only and its older half
+// cannot be rewritten into the new shape.
+func decodePageSnapshot(raw []byte) map[string]any {
+	var snapshot pageSnapshot
+	if err := json.Unmarshal(raw, &snapshot); err == nil && snapshot.Format > 0 && snapshot.Page != nil {
+		return snapshot.Page
+	}
+	return map[string]any{"content_with_weight": string(raw)}
 }
 
 // pageCommitLocks is a per-page-file-key mutex registry that serializes
@@ -445,131 +794,11 @@ func (s *FileCommitService) ListPageCommits(ctx context.Context, datasetID, page
 	return rows, total, nil
 }
 
-type unifiedDiffLine struct {
-	prefix  byte
-	text    string
-	oldLine int
-	newLine int
-}
-
 // unifiedDiff produces a standard unified diff that can be parsed by the
 // frontend's wiki diff renderer and Python's artifact history implementation.
+// The implementation is shared with the chunk version diff endpoint.
 func unifiedDiff(oldText, newText string) string {
-	oldLines := strings.Split(oldText, "\n")
-	newLines := strings.Split(newText, "\n")
-
-	const contextLines = 3
-	// Longest common subsequence over lines, then render the diff.
-	cur := make([][]int, len(oldLines)+1)
-	for i := range cur {
-		cur[i] = make([]int, len(newLines)+1)
-	}
-	for i := len(oldLines) - 1; i >= 0; i-- {
-		for j := len(newLines) - 1; j >= 0; j-- {
-			if oldLines[i] == newLines[j] {
-				cur[i][j] = cur[i+1][j+1] + 1
-			} else if cur[i+1][j] >= cur[i][j+1] {
-				cur[i][j] = cur[i+1][j]
-			} else {
-				cur[i][j] = cur[i][j+1]
-			}
-		}
-	}
-
-	lines := make([]unifiedDiffLine, 0, len(oldLines)+len(newLines))
-	i, j := 0, 0
-	for i < len(oldLines) && j < len(newLines) {
-		if oldLines[i] == newLines[j] {
-			lines = append(lines, unifiedDiffLine{' ', oldLines[i], i + 1, j + 1})
-			i++
-			j++
-		} else if cur[i+1][j] >= cur[i][j+1] {
-			lines = append(lines, unifiedDiffLine{'-', oldLines[i], i + 1, 0})
-			i++
-		} else {
-			lines = append(lines, unifiedDiffLine{'+', newLines[j], 0, j + 1})
-			j++
-		}
-	}
-	for ; i < len(oldLines); i++ {
-		lines = append(lines, unifiedDiffLine{'-', oldLines[i], i + 1, 0})
-	}
-	for ; j < len(newLines); j++ {
-		lines = append(lines, unifiedDiffLine{'+', newLines[j], 0, j + 1})
-	}
-
-	changed := make([]int, 0)
-	for index, line := range lines {
-		if line.prefix != ' ' {
-			changed = append(changed, index)
-		}
-	}
-	if len(changed) == 0 {
-		return ""
-	}
-
-	// Group nearby changes into hunks with up to three context lines, matching
-	// the format produced by Python's difflib.unified_diff.
-	type diffHunk struct {
-		start int
-		end   int
-	}
-	hunks := make([]diffHunk, 0)
-	for _, index := range changed {
-		start := index - contextLines
-		if start < 0 {
-			start = 0
-		}
-		end := index + contextLines
-		if end >= len(lines) {
-			end = len(lines) - 1
-		}
-		if len(hunks) > 0 && start <= hunks[len(hunks)-1].end+1 {
-			if end > hunks[len(hunks)-1].end {
-				hunks[len(hunks)-1].end = end
-			}
-			continue
-		}
-		hunks = append(hunks, diffHunk{start: start, end: end})
-	}
-
-	var b strings.Builder
-	b.WriteString("--- a\n+++ b\n")
-	for _, hunk := range hunks {
-		oldStart, oldCount := diffRange(lines, hunk.start, hunk.end, false, len(oldLines))
-		newStart, newCount := diffRange(lines, hunk.start, hunk.end, true, len(newLines))
-		b.WriteString(fmt.Sprintf("@@ -%d,%d +%d,%d @@\n", oldStart, oldCount, newStart, newCount))
-		for index := hunk.start; index <= hunk.end; index++ {
-			b.WriteByte(lines[index].prefix)
-			b.WriteString(lines[index].text)
-			b.WriteByte('\n')
-		}
-	}
-	return b.String()
-}
-
-// diffRange returns the first line number and line count for one side of a
-// unified diff hunk. A zero count is valid for pure insertions or deletions.
-func diffRange(lines []unifiedDiffLine, start, end int, newSide bool, totalLines int) (int, int) {
-	first := 0
-	count := 0
-	for index := start; index <= end; index++ {
-		lineNumber := lines[index].oldLine
-		if newSide {
-			lineNumber = lines[index].newLine
-		}
-		if lineNumber == 0 {
-			continue
-		}
-		if first == 0 {
-			first = lineNumber
-		}
-		count++
-	}
-	if first == 0 {
-		first = totalLines
-	}
-	return first, count
+	return utility.UnifiedDiff(oldText, newText)
 }
 
 // ListCommits lists commits for a workspace folder with pagination
@@ -668,8 +897,11 @@ func (s *FileCommitService) readPageContent(ctx context.Context, datasetID, tena
 		switch storageKind {
 		case wikiContentStorage, "minio_storage":
 			if storageImpl := storage.GetStorageFactory().GetStorage(); storageImpl != nil {
-				if content, err := storageImpl.Get(ctx, datasetID, location); err == nil {
-					return string(content)
+				if stored, err := storageImpl.Get(ctx, datasetID, location); err == nil {
+					// The object is a whole-page snapshot; the detail view wants the
+					// body, and an object written before snapshots existed is the body
+					// itself (see decodePageSnapshot).
+					return metadataStringOf(decodePageSnapshot(stored), "content_with_weight")
 				}
 			}
 		case "es":

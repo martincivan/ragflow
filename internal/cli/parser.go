@@ -125,7 +125,7 @@ func (p *Parser) parseAdminCommand() (*Command, error) {
 	case TokenRemove:
 		return p.parseAdminRemoveCommands()
 	case TokenStop:
-		return p.parseAdminStopIngestionTasks()
+		return p.parseAdminStopCommands()
 	case TokenAdd:
 		return p.parseAdminAddCommand()
 	case TokenDelete:
@@ -242,6 +242,8 @@ func (p *Parser) parseCommand(cliMode CommandLineMode) (*Command, error) {
 		return p.parseAdminCommand()
 	case APIMode:
 		return p.parseUserCommand()
+	case CommandMode:
+		return p.parseSingleCommand()
 	default:
 		return nil, fmt.Errorf("unknown mode: %s", cliMode)
 	}

@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package component
 
 import (
@@ -8,6 +24,7 @@ import (
 	"ragflow/internal/agent/runtime"
 	"ragflow/internal/entity"
 	"ragflow/internal/permission"
+	"ragflow/internal/permission/testsupport"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
@@ -29,7 +46,7 @@ func TestCheckCanvasRetrievalDependencies(t *testing.T) {
 		Permission: string(entity.TenantPermissionTeam), Status: &valid,
 	}
 	privateDataset := entity.Knowledgebase{
-		ID: "private-dataset", TenantID: "other-owner", CreatedBy: "other-owner",
+		ID: "private-dataset", TenantID: "canvas-owner", CreatedBy: "other-owner",
 		Permission: string(entity.TenantPermissionMe), Status: &valid,
 	}
 	sharedMemory := entity.Memory{
@@ -37,7 +54,7 @@ func TestCheckCanvasRetrievalDependencies(t *testing.T) {
 		Permissions: string(entity.TenantPermissionTeam),
 	}
 	callerOnlyMemory := entity.Memory{
-		ID: "caller-only-memory", Name: "Caller only", TenantID: "caller",
+		ID: "caller-only-memory", Name: "Caller only", TenantID: "canvas-owner",
 		Permissions: string(entity.TenantPermissionMe),
 	}
 	ownerOnlyMemory := entity.Memory{
@@ -59,11 +76,15 @@ func TestCheckCanvasRetrievalDependencies(t *testing.T) {
 			t.Fatalf("create membership: %v", err)
 		}
 	}
+	if err := testsupport.PrepareEnterprisePermissionFixture(db, "canvas-owner", "canvas-owner", "caller", "other-owner"); err != nil {
+		t.Fatalf("prepare permission fixture: %v", err)
+	}
 
 	state := runtime.NewCanvasState("run-1", "session-1")
 	state.Sys["canvas_id"] = canvas.ID
 	state.Sys["user_id"] = "caller"
-	ctx := runtime.WithState(t.Context(), state)
+	state.Sys["tenant_id"] = "canvas-owner"
+	ctx := permission.WithIdentity(runtime.WithState(t.Context(), state), "caller", "canvas-owner")
 
 	if err := checkCanvasRetrievalDependencies(ctx, db, map[string]any{"dataset_ids": []string{dataset.ID}}); err != nil {
 		t.Fatalf("check accessible dataset dependency: %v", err)

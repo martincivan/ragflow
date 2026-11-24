@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"ragflow/internal/common"
 	"strings"
+	"unicode"
 	"unicode/utf8"
 )
 
@@ -185,15 +186,32 @@ func (o *SplitOperator) splitSentences(text string) []ChunkData {
 }
 
 func (o *SplitOperator) splitByChar(text string) []ChunkData {
-	var chunks []ChunkData
-	for len(text) > 0 {
-		r, size := utf8.DecodeRuneInString(text)
+	runes := []rune(text)
+	n := len(runes)
+	if n == 0 {
+		return nil
+	}
+	// Each chunk's language is DetectLanguage over the remaining suffix from
+	// that rune onward. Precompute suffix (cjk, letter) counts in one reverse
+	// pass so every chunk decides in O(1) instead of re-scanning O(n) runes.
+	cjkSuffix := make([]int, n+1)
+	letterSuffix := make([]int, n+1)
+	for i := n - 1; i >= 0; i-- {
+		cjkSuffix[i], letterSuffix[i] = cjkSuffix[i+1], letterSuffix[i+1]
+		if unicode.Is(unicode.Han, runes[i]) {
+			cjkSuffix[i]++
+		}
+		if unicode.IsLetter(runes[i]) {
+			letterSuffix[i]++
+		}
+	}
+	chunks := make([]ChunkData, 0, n)
+	for i := 0; i < n; i++ {
 		chunks = append(chunks, ChunkData{
-			Content:  string(r),
-			Index:    len(chunks),
-			Metadata: map[string]interface{}{"language": DetectLanguage(text)},
+			Content:  string(runes[i]),
+			Index:    i,
+			Metadata: map[string]interface{}{"language": languageFromCounts(cjkSuffix[i], letterSuffix[i])},
 		})
-		text = text[size:]
 	}
 	return chunks
 }
@@ -249,14 +267,19 @@ func (o *SplitOperator) splitByLength(text string) []ChunkData {
 func (o *SplitOperator) splitByParagraph(text string) []ChunkData {
 	paragraphs := strings.Split(text, "\n")
 	chunks := make([]ChunkData, 0, len(paragraphs))
-	for i, p := range paragraphs {
+	for _, p := range paragraphs {
 		trimmed := strings.TrimSpace(p)
 		if trimmed == "" {
 			continue
 		}
 		chunks = append(chunks, ChunkData{
-			Content:  trimmed,
-			Index:    i,
+			Content: trimmed,
+			// Index is the chunk's position in the output, the same as for
+			// the other strategies. Using the paragraph's position in the
+			// split left gaps wherever a blank line was skipped (a two-chunk
+			// document came back as 0 and 3), and those gaps only disappeared
+			// when a postprocess stage happened to re-index the result.
+			Index:    len(chunks),
 			Metadata: map[string]interface{}{"language": DetectLanguage(trimmed)},
 		})
 	}

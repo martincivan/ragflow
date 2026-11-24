@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package canvas
 
 import (
@@ -36,11 +52,11 @@ func TestBuildNodeBody_OverrideParams(t *testing.T) {
 
 	baseParams := map[string]any{
 		"pdf": map[string]any{
-			"output_format": "one",
-			"parse_method":  "naive",
+			"lang":         "one",
+			"parse_method": "naive",
 		},
 		"doc": map[string]any{
-			"output_format": "one",
+			"lang": "one",
 		},
 	}
 	// Run-level override is keyed by cpnID. For "cpn-parser": the whole
@@ -50,15 +66,15 @@ func TestBuildNodeBody_OverrideParams(t *testing.T) {
 	override := map[string]any{
 		"cpn-parser": map[string]any{
 			"pdf": map[string]any{
-				"output_format": "detailed",
+				"lang": "detailed",
 			},
 			"docx": map[string]any{
-				"output_format": "one",
+				"lang": "one",
 			},
 		},
 		"cpn-other": map[string]any{
 			"pdf": map[string]any{
-				"output_format": "should-not-apply",
+				"lang": "should-not-apply",
 			},
 		},
 	}
@@ -75,21 +91,21 @@ func TestBuildNodeBody_OverrideParams(t *testing.T) {
 	}
 
 	// doc is untouched (absent from the override).
-	if v, _ := captured["doc"].(map[string]any); v == nil || v["output_format"] != "one" {
+	if v, _ := captured["doc"].(map[string]any); v == nil || v["lang"] != "one" {
 		t.Errorf("doc should be preserved from base: %#v", captured["doc"])
 	}
 	// docx injected by the override (was absent in base).
-	if v, _ := captured["docx"].(map[string]any); v == nil || v["output_format"] != "one" {
+	if v, _ := captured["docx"].(map[string]any); v == nil || v["lang"] != "one" {
 		t.Errorf("docx injection missing: %#v", captured["docx"])
 	}
-	// pdf: the override fully replaces the base entry, so output_format is
+	// pdf: the override fully replaces the base entry, so lang is
 	// overridden and the base-only parse_method is dropped (shallow merge).
 	pdf, _ := captured["pdf"].(map[string]any)
 	if pdf == nil {
 		t.Fatalf("pdf setup missing: %#v", captured)
 	}
-	if pdf["output_format"] != "detailed" {
-		t.Errorf("pdf.output_format not overridden: %#v", pdf)
+	if pdf["lang"] != "detailed" {
+		t.Errorf("pdf.lang not overridden: %#v", pdf)
 	}
 	if _, ok := pdf["parse_method"]; ok {
 		t.Errorf("pdf.parse_method should be dropped by shallow merge: %#v", pdf)

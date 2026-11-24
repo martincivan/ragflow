@@ -19,19 +19,24 @@ package chunk
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/jpeg"
 	"math"
+
 	"ragflow/internal/common"
 	"ragflow/internal/entity"
 	"ragflow/internal/entity/models"
 	"ragflow/internal/permission"
 	permissionresponse "ragflow/internal/permission/response"
 	"ragflow/internal/service"
+	"ragflow/internal/service/chunkversion"
 	"strings"
 	"sync"
 	"time"
@@ -85,13 +90,13 @@ type ChunkService struct {
 	ingestionTaskDAO *dao.IngestionTaskDAO
 	searchService    *service.SearchService
 
-	checkDatasetAccessFunc   func(string, string) error
+	checkDatasetAccessFunc   func(string) error
 	getKnowledgebaseByIDFunc func(string) (*entity.Knowledgebase, error)
 	getDocumentsByIDsFunc    func([]string) ([]*entity.Document, error)
 	// startParseDocumentsFunc overrides the DSL start-parse flow. Production
 	// uses service.DocumentService.StartParseDocuments; tests inject a fake
 	// to avoid the MQ publisher.
-	startParseDocumentsFunc func(ctx context.Context, doc *entity.Document, kb *entity.Knowledgebase, userID string, opts document.StartParseOptions) error
+	startParseDocumentsFunc func(ctx context.Context, doc *entity.Document, kb *entity.Knowledgebase, opts document.StartParseOptions) error
 	// cancelIngestionTaskFunc overrides the document-parsing cancellation.
 	// Production uses service.DocumentService.CancelDocParse; tests inject
 	// a fake to avoid the MQ publisher.
@@ -99,7 +104,7 @@ type ChunkService struct {
 	getEmbeddingModelFunc   func(string, string) (*models.EmbeddingModel, error)
 	incrementChunkStatsFunc func(string, string, int64, int64, float64) error
 	decrementChunkStatsFunc func(string, string, int64, int64, float64) error
-	storeChunkImageFunc     func(string, string, []byte, string) error
+	storeChunkImageFunc     func(string, string, string, []byte, string) (string, error)
 	removeChunkImageFunc    func(string, string) error
 	markWikiDirtyFunc       func(tenantID, datasetID, documentID string, chunkIDs []string)
 	tokenizeFunc            func(text, language string) (string, error)
@@ -135,8 +140,8 @@ func NewChunkService() *ChunkService {
 //     - Builds doc_aggs by aggregating chunks per document
 //  7. knowledge graph retrieval (not implemented)
 //  8. Apply retrieval by children to group child chunks under parent chunks
-func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.RetrievalTestRequest, userID string) (*service.RetrievalTestResponse, error) {
-	common.Info("RetrievalTest started", zap.String("userID", userID), zap.Any("kbID", req.Datasets), zap.String("question", req.Question))
+func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.RetrievalTestRequest) (*service.RetrievalTestResponse, error) {
+	common.Info("RetrievalTest started", zap.String("userID", permission.UserIDFromContext(ctx)), zap.Any("kbID", req.Datasets), zap.String("question", req.Question))
 
 	common.Debug(fmt.Sprintf("RetrievalTest request:\n"+
 		"    kbID=%v\n"+
@@ -170,7 +175,10 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	var tenantIDs []string
 	var kbRecords []*entity.Knowledgebase
 	for _, datasetID := range req.Datasets {
-		if err := s.checkDatasetAccess(ctx, datasetID, userID, permission.OperationUse); err != nil {
+		if err := permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{
+			Kind: permission.ResourceKindDataset,
+			ID:   datasetID,
+		}, permission.OperationUse); err != nil {
 			_, permissionErr := permissionresponse.NormalizeHidden(err)
 			return nil, permissionErr
 		}
@@ -220,7 +228,7 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 		if s.searchService == nil {
 			return nil, fmt.Errorf("search service not configured")
 		}
-		searchDetail, err := s.searchService.GetDetail(ctx, userID, *req.SearchID)
+		searchDetail, err := s.searchService.GetDetail(ctx, *req.SearchID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to get search app %s: %w", *req.SearchID, err)
 		}
@@ -256,9 +264,9 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	if filter != nil {
 		method, _ := filter["method"].(string)
 		if method == "auto" || method == "semi_auto" {
-			access := service.ModelAccess{TenantID: tenantIDs[0]}
+			modelCtx := permission.WithTenantID(ctx, tenantIDs[0])
 			if chatID != "" {
-				chatModelForFilter, getErr = modelFactory.NewChatModel(ctx, access, chatID)
+				chatModelForFilter, getErr = modelFactory.NewChatModel(modelCtx, chatID)
 				if getErr != nil {
 					common.Warn("Failed to get chat model from search_config chat_id, using tenant default", zap.String("chatID", chatID), zap.Error(getErr))
 				} else {
@@ -269,7 +277,7 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 			}
 
 			if chatModelForFilter == nil {
-				chatModelForFilter, getErr = modelFactory.NewDefaultChatModel(ctx, access)
+				chatModelForFilter, getErr = modelFactory.NewDefaultChatModel(modelCtx)
 				if getErr != nil {
 					common.Warn("Failed to get tenant default chat model for meta_data_filter", zap.Error(getErr))
 				}
@@ -278,9 +286,16 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	}
 
 	// Apply meta_data_filter to get filtered doc_ids (filter by metadata before retrieval)
-	docIDs := make([]string, len(req.DocIDs))
-	copy(docIDs, req.DocIDs)
-	if filter != nil {
+	candidateDocIDs, datasetProductIDs := nlp.SplitRetrievalDocIDs([]string(req.Datasets), req.DocIDs)
+	docIDs, getErr := service.ListReadableDocumentIDs(ctx, []string(req.Datasets), candidateDocIDs)
+	if getErr != nil {
+		return nil, fmt.Errorf("failed to resolve readable documents: %w", getErr)
+	}
+	if len(docIDs) == 0 && len(datasetProductIDs) == 0 {
+		emptyLabels := map[string]float64{}
+		return &service.RetrievalTestResponse{Chunks: []map[string]interface{}{}, DocAggs: []map[string]interface{}{}, Labels: &emptyLabels, Total: 0}, nil
+	}
+	if filter != nil && len(docIDs) > 0 {
 		// Get flattened metadata
 		metadataSvc := service.NewMetadataService()
 		flattedMeta, err := metadataSvc.GetFlattedMetaByKBs(ctx, []string(req.Datasets))
@@ -288,10 +303,20 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 			common.Warn("Failed to get flatted metadata", zap.Error(err))
 		} else {
 			common.Info("metadata filter conditions", zap.Any("filter", filter))
-			filteredDocIDs, _ := service.ApplyMetaDataFilter(ctx, filter, flattedMeta, req.Question, chatModelForFilter, req.DocIDs, []string(req.Datasets))
-			docIDs = filteredDocIDs
+			// nil means no metadata narrowing: search the caller's scope
+			// unfiltered rather than scoping to nothing.
+			if filteredDocIDs := service.ApplyMetaDataFilter(ctx, filter, flattedMeta, req.Question, chatModelForFilter, docIDs, []string(req.Datasets)); filteredDocIDs != nil {
+				docIDs = filteredDocIDs
+			}
 			common.Info("ApplyMetaDataFilter result", zap.Strings("docIDs", docIDs))
 		}
+	}
+	for _, datasetProductID := range datasetProductIDs {
+		docIDs = append(docIDs, datasetProductID)
+	}
+	if len(docIDs) == 0 {
+		emptyLabels := map[string]float64{}
+		return &service.RetrievalTestResponse{Chunks: []map[string]interface{}{}, DocAggs: []map[string]interface{}{}, Labels: &emptyLabels, Total: 0}, nil
 	}
 
 	// Apply cross_languages and keyword extraction with tenant default chat model
@@ -301,20 +326,17 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	// Get chat model for cross_languages and keyword_extraction
 	var llmModelName string
 	if len(req.CrossLanguages) > 0 || (req.Keyword != nil && *req.Keyword) {
-		tenantSvc := service.NewTenantService()
 		var err error
-		llmModelName, err = tenantSvc.GetDefaultModelName(ctx, tenantIDs[0], entity.ModelTypeChat)
-		if err != nil || llmModelName == "" {
+		chatModel, err = modelFactory.NewDefaultChatModel(permission.WithTenantID(ctx, tenantIDs[0]))
+		if err != nil {
 			common.Warn("Failed to get default chat model name for LLM transformations", zap.Error(err))
 		} else {
-			chatModel, err = modelFactory.NewChatModel(ctx, service.ModelAccess{TenantID: tenantIDs[0]}, llmModelName)
-			if err != nil {
-				common.Warn("Failed to get chat model for LLM transformations", zap.Error(err))
-			} else {
-				common.Info("Fetched chat model (tenant default) for cross_languages/keyword_extraction",
-					zap.String("tenantID", tenantIDs[0]),
-					zap.String("modelName", llmModelName))
+			if info := chatModel.Info(); info != nil {
+				llmModelName = service.ModelReference(info)
 			}
+			common.Info("Fetched chat model (tenant default) for cross_languages/keyword_extraction",
+				zap.String("tenantID", tenantIDs[0]),
+				zap.String("modelName", llmModelName))
 		}
 	}
 
@@ -352,22 +374,22 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	labels := metadataSvc.LabelQuestion(ctx, modifiedQuestion, kbRecords)
 
 	// Determine embedding model.
-	access := service.ModelAccess{TenantID: tenantIDs[0]}
+	modelCtx := permission.WithTenantID(ctx, tenantIDs[0])
 	var embeddingModel *models.EmbeddingModel
 	var embdID string
 	if kbRecords[0].TenantEmbdID != nil && *kbRecords[0].TenantEmbdID != "" {
-		embeddingModel, getErr = modelFactory.NewEmbeddingModel(ctx, access, *kbRecords[0].TenantEmbdID)
+		embeddingModel, getErr = modelFactory.NewEmbeddingModel(modelCtx, *kbRecords[0].TenantEmbdID)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get embedding model by tenant_embd_id: %w", getErr)
 		}
 	} else if kbRecords[0].EmbdID != "" {
 		embdID = kbRecords[0].EmbdID
-		embeddingModel, getErr = modelFactory.NewEmbeddingModel(ctx, access, embdID)
+		embeddingModel, getErr = modelFactory.NewEmbeddingModel(modelCtx, embdID)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get embedding model by embd_id: %w", getErr)
 		}
 	} else {
-		embeddingModel, getErr = modelFactory.NewDefaultEmbeddingModel(ctx, access)
+		embeddingModel, getErr = modelFactory.NewDefaultEmbeddingModel(modelCtx)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get tenant default embedding model: %w", getErr)
 		}
@@ -387,12 +409,12 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	// Get rerank model if RerankID is specified
 	var rerankModel *models.RerankModel
 	if tenantRerankID != nil && *tenantRerankID != "" {
-		rerankModel, getErr = modelFactory.NewRerankModel(ctx, access, *tenantRerankID)
+		rerankModel, getErr = modelFactory.NewRerankModel(modelCtx, *tenantRerankID)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get rerank model by tenant_rerank_id: %w", getErr)
 		}
 	} else if rerankID != nil && *rerankID != "" {
-		rerankModel, getErr = modelFactory.NewRerankModel(ctx, access, *rerankID)
+		rerankModel, getErr = modelFactory.NewRerankModel(modelCtx, *rerankID)
 		if getErr != nil {
 			return nil, fmt.Errorf("failed to get rerank model by rerank_id: %w", getErr)
 		}
@@ -403,21 +425,22 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	similarityThreshold, vectorSimilarityWeight, topK := resolveSearchbotRetrievalParams(req, searchConfig)
 
 	retrievalReq := &nlp.RetrievalRequest{
-		TenantIDs:              tenantIDs,
-		Question:               modifiedQuestion,
-		KbIDs:                  []string(req.Datasets),
-		DocIDs:                 docIDs,
-		Page:                   common.CoalesceInt(req.Page, 1),
-		PageSize:               common.CoalesceInt(req.Size, 30),
-		RerankCandidatesCount:  &rerankCandidatesCount,
-		KNNTopK:                &topK,
-		SimilarityThreshold:    &similarityThreshold,
-		VectorSimilarityWeight: &vectorSimilarityWeight,
-		RerankModel:            rerankModel,
-		RankFeature:            &labels,
-		EmbeddingModel:         embeddingModel,
-		Highlight:              req.Highlight,
-		Language:               entity.KnowledgebasesLanguage(kbRecords),
+		TenantIDs:                  tenantIDs,
+		Question:                   modifiedQuestion,
+		KbIDs:                      []string(req.Datasets),
+		DocIDs:                     docIDs,
+		DocumentPermissionsChecked: true,
+		Page:                       common.CoalesceInt(req.Page, common.DefaultPage),
+		PageSize:                   common.CoalesceInt(req.Size, common.DefaultPageSize),
+		RerankCandidatesCount:      &rerankCandidatesCount,
+		KNNTopK:                    &topK,
+		SimilarityThreshold:        &similarityThreshold,
+		VectorSimilarityWeight:     &vectorSimilarityWeight,
+		RerankModel:                rerankModel,
+		RankFeature:                &labels,
+		EmbeddingModel:             embeddingModel,
+		Highlight:                  req.Highlight,
+		Language:                   entity.KnowledgebasesLanguage(kbRecords),
 	}
 
 	// Call RetrievalService to perform retrieval
@@ -441,7 +464,7 @@ func (s *ChunkService) RetrievalTest(ctx context.Context, req *service.Retrieval
 	// Infinity/OceanBase chunks already carry real vectors and are left unchanged.
 	hydrateChunkVectors(ctx, s.docEngine, filteredChunks, req.Datasets, tenantIDs)
 
-	common.Info("RetrievalTest completed", zap.String("userID", userID), zap.Any("kbID", req.Datasets), zap.String("question", req.Question), zap.Int64("chunkCount", int64(len(filteredChunks))))
+	common.Info("RetrievalTest completed", zap.String("userID", permission.UserIDFromContext(ctx)), zap.Any("kbID", req.Datasets), zap.String("question", req.Question), zap.Int64("chunkCount", int64(len(filteredChunks))))
 
 	return &service.RetrievalTestResponse{
 		Chunks:  filteredChunks,
@@ -553,7 +576,7 @@ func hydrateChunkVectors(ctx context.Context, engine engine.DocEngine, chunks []
 }
 
 // Get retrieves a chunk by ID
-func (s *ChunkService) Get(ctx context.Context, req *service.GetChunkRequest, userID string) (*service.GetChunkResponse, error) {
+func (s *ChunkService) Get(ctx context.Context, req *service.GetChunkRequest) (*service.GetChunkResponse, error) {
 	if s.docEngine == nil {
 		return nil, fmt.Errorf("doc engine not initialized")
 	}
@@ -562,7 +585,7 @@ func (s *ChunkService) Get(ctx context.Context, req *service.GetChunkRequest, us
 		return nil, fmt.Errorf("chunk_id is required")
 	}
 
-	kb, err := s.getAccessibleKnowledgebase(ctx, req.DatasetID, userID, permission.OperationRead)
+	kb, err := s.getAccessibleKnowledgebase(ctx, req.DatasetID, permission.OperationRead)
 	if err != nil {
 		return nil, err
 	}
@@ -576,6 +599,9 @@ func (s *ChunkService) Get(ctx context.Context, req *service.GetChunkRequest, us
 	}
 	if doc.KbID != req.DatasetID {
 		return nil, fmt.Errorf("document does not belong to this dataset")
+	}
+	if err := permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDocument, ID: doc.ID}, permission.OperationRead); err != nil {
+		return nil, err
 	}
 
 	// The lookup stays inside the dataset named in the route, and the row must
@@ -605,6 +631,17 @@ func (s *ChunkService) Get(ctx context.Context, req *service.GetChunkRequest, us
 		}
 		result[k] = v
 	}
+	// The body has two spellings, and a row can carry both with different values
+	// once anything rewrote only one of them. The editor feeds this response
+	// straight into its form and submits every field back, and its payload
+	// builder prefers `content` over `content_with_weight` - so handing back a
+	// second copy of the text makes the edit revert itself, without even opening
+	// a version, because the stored text then already matches. Only the live
+	// field is named; a row that has nothing but `content` keeps it, since that
+	// is the only text it has.
+	if _, ok := result["content_with_weight"]; ok {
+		delete(result, "content")
+	}
 	return &service.GetChunkResponse{Chunk: result}, nil
 }
 
@@ -630,8 +667,8 @@ func (s *ChunkService) cancelAllTasksOfDoc(ctx context.Context, doc *entity.Docu
 	return cancel(ctx, doc)
 }
 
-func (s *ChunkService) StopParsing(ctx context.Context, userID, datasetID string, req service.StopParsingRequest) (*service.StopParsingResponse, common.ErrorCode, error) {
-	if err := service.CheckDatasetAccess(ctx, permission.Subject{UserID: userID}, datasetID, permission.OperationRun); err != nil {
+func (s *ChunkService) StopParsing(ctx context.Context, datasetID string, req service.StopParsingRequest) (*service.StopParsingResponse, common.ErrorCode, error) {
+	if err := permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID}, permission.OperationRun); err != nil {
 		code, permissionErr := permissionresponse.Normalize(err)
 		return nil, code, permissionErr
 	}
@@ -654,18 +691,12 @@ func (s *ChunkService) StopParsing(ctx context.Context, userID, datasetID string
 			return nil, common.CodeDataError, fmt.Errorf("you don't own the document %s", docID)
 		}
 
-		task, err := dao.NewIngestionTaskDAO().GetByDocumentID(ctx, dao.DB, docID)
-		if err != nil {
-			return nil, common.CodeServerError, fmt.Errorf("get ingestion task for %s: %w", docID, err)
-		}
-		if task == nil || task.Status == common.COMPLETED ||
-			task.Status == common.STOPPED || task.Status == common.FAILED {
-			return &service.StopParsingResponse{
-				Data: map[string]interface{}{"error_code": docStopParsingInvalidStateErrorCode},
-			}, common.CodeDataError, fmt.Errorf("%s", docStopParsingInvalidStateMessage)
-		}
-
 		if err = s.cancelAllTasksOfDoc(ctx, doc); err != nil {
+			if errors.Is(err, document.ErrParseNotRunning) {
+				return &service.StopParsingResponse{
+					Data: map[string]interface{}{"error_code": docStopParsingInvalidStateErrorCode},
+				}, common.CodeDataError, fmt.Errorf("%s", docStopParsingInvalidStateMessage)
+			}
 			return nil, common.CodeServerError, err
 		}
 		// CancelDocParse (inside cancelAllTasksOfDoc) already issues
@@ -708,11 +739,11 @@ func checkDuplicateIDs(documentIDs []string, idTypes string) ([]string, []string
 	return uniqueDocIDs, duplicateMessages
 }
 
-func (s *ChunkService) checkDatasetAccess(ctx context.Context, datasetID, userID string, operation permission.Operation) error {
+func (s *ChunkService) checkDatasetAccess(ctx context.Context, datasetID string, operation permission.Operation) error {
 	if s.checkDatasetAccessFunc != nil {
-		return s.checkDatasetAccessFunc(datasetID, userID)
+		return s.checkDatasetAccessFunc(datasetID)
 	}
-	return service.CheckDatasetAccess(ctx, permission.Subject{UserID: userID}, datasetID, operation)
+	return permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID}, operation)
 }
 
 func (s *ChunkService) getKnowledgebaseByID(ctx context.Context, datasetID string) (*entity.Knowledgebase, error) {
@@ -722,8 +753,8 @@ func (s *ChunkService) getKnowledgebaseByID(ctx context.Context, datasetID strin
 	return s.kbDAO.GetByID(ctx, dao.DB, datasetID)
 }
 
-func (s *ChunkService) getAccessibleKnowledgebase(ctx context.Context, datasetID, userID string, operation permission.Operation) (*entity.Knowledgebase, error) {
-	if err := s.checkDatasetAccess(ctx, datasetID, userID, operation); err != nil {
+func (s *ChunkService) getAccessibleKnowledgebase(ctx context.Context, datasetID string, operation permission.Operation) (*entity.Knowledgebase, error) {
+	if err := s.checkDatasetAccess(ctx, datasetID, operation); err != nil {
 		return nil, err
 	}
 	kb, err := s.getKnowledgebaseByID(ctx, datasetID)
@@ -740,8 +771,8 @@ func (s *ChunkService) getDocumentsByIDs(ctx context.Context, docIDs []string) (
 	return s.documentDAO.GetByIDs(ctx, dao.DB, docIDs)
 }
 
-func (s *ChunkService) Parse(ctx context.Context, userID, datasetID string, req *service.ParseFileRequest) (map[string]interface{}, common.ErrorCode, error) {
-	if err := s.checkDatasetAccess(ctx, datasetID, userID, permission.OperationRun); err != nil {
+func (s *ChunkService) Parse(ctx context.Context, datasetID string, req *service.ParseFileRequest) (map[string]interface{}, common.ErrorCode, error) {
+	if err := s.checkDatasetAccess(ctx, datasetID, permission.OperationRun); err != nil {
 		code, permissionErr := permissionresponse.Normalize(err)
 		return nil, code, permissionErr
 	}
@@ -791,11 +822,16 @@ func (s *ChunkService) Parse(ctx context.Context, userID, datasetID string, req 
 
 	for _, docID := range docIDs {
 		doc := docByID[docID]
-		if err = startParse(ctx, doc, kb, userID, document.StartParseOptions{RerunWithDelete: true}); err != nil {
+		if err = startParse(ctx, doc, kb, document.StartParseOptions{RerunWithDelete: true}); err != nil {
 			return nil, common.CodeServerError, err
 		}
 		successCount++
 	}
+
+	// A parse request rewrites the document's chunks, but its version is recorded
+	// when the pipeline finishes writing them, not here: a version is a restore
+	// anchor, and one taken now would precede every chunk it claims to describe.
+	// See PipelineExecutor.recordParseVersion.
 
 	if len(duplicateMessages) > 0 {
 		if successCount > 0 {
@@ -810,7 +846,7 @@ func (s *ChunkService) Parse(ctx context.Context, userID, datasetID string, req 
 }
 
 // List retrieves chunks for a document
-func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest, userID string) (*service.ListChunksResponse, error) {
+func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest) (*service.ListChunksResponse, error) {
 	if s.docEngine == nil {
 		return nil, fmt.Errorf("doc engine not initialized")
 	}
@@ -829,16 +865,19 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 		return nil, fmt.Errorf("document not found")
 	}
 
-	kb, err := s.getAccessibleKnowledgebase(ctx, doc.KbID, userID, permission.OperationRead)
+	kb, err := s.getAccessibleKnowledgebase(ctx, doc.KbID, permission.OperationRead)
 	if err != nil {
+		return nil, err
+	}
+	if err := permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDocument, ID: doc.ID}, permission.OperationRead); err != nil {
 		return nil, err
 	}
 	targetTenantID := kb.TenantID
 
 	indexName := fmt.Sprintf("ragflow_%s", targetTenantID)
 
-	page := common.CoalesceInt(req.Page, 1)
-	size := common.CoalesceInt(req.Size, 30)
+	page := common.CoalesceInt(req.Page, common.DefaultPage)
+	size := common.CoalesceInt(req.Size, common.DefaultPageSize)
 	keywords := strings.TrimSpace(req.Keywords)
 	var orderBy *types.OrderByExpr
 	matchExprs := make([]interface{}, 0, 1)
@@ -989,10 +1028,15 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 				}
 			}
 		}
+		result["id"] = result["chunk_id"]
+		result["content"] = result["content_with_weight"]
+		utility.SetFieldArray(result, "important_keywords", result["important_kwd"])
+		utility.SetFieldArray(result, "questions", result["question_kwd"])
+		result["document_id"] = req.DocID
+		result["dataset_id"] = doc.KbID
 		chunks = append(chunks, result)
 	}
 
-	ingestionStatus := "UNSTART"
 	taskDAO := s.ingestionTaskDAO
 	if taskDAO == nil {
 		taskDAO = dao.NewIngestionTaskDAO()
@@ -1001,9 +1045,17 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 	if err != nil {
 		return nil, fmt.Errorf("failed to get ingestion task for document %s: %w", doc.ID, err)
 	}
+	taskStatus := ""
 	if task != nil && task.Status != "" {
-		ingestionStatus = task.Status
+		taskStatus = task.Status
 	}
+	// Only the empty-parse marker distinguishes an empty parse from no parse.
+	if doc.RestoredVersion != nil && doc.ChunkNum == 0 {
+		if known, err := chunkversion.HasEmptyParseMarker(ctx, dao.DB, doc.ID); err == nil && known {
+			doc.RestoredFromParse = true
+		}
+	}
+	ingestionStatus := doc.IngestionStatusWith(taskStatus)
 
 	// Build document info, mirroring Python's _map_doc key renames:
 	// kb_id→dataset_id, parser_id→chunk_method, token_num→token_count,
@@ -1038,6 +1090,10 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 		"update_date":      utility.FormatTimeToString(doc.UpdateDate, timeFormat),
 	}
 
+	// The list shows which version of a chunk the text shown is; an edition
+	// without a chunk history leaves every row at its parser version 0.
+	s.annotateChunkVersionsEE(ctx, chunks)
+
 	return &service.ListChunksResponse{
 		Total:  searchResp.Total,
 		Chunks: chunks,
@@ -1045,7 +1101,7 @@ func (s *ChunkService) List(ctx context.Context, req *service.ListChunksRequest,
 	}, nil
 }
 
-func (s *ChunkService) SwitchChunks(ctx context.Context, userID, datasetID, documentID string, availableInt int, chunkIDs []string) error {
+func (s *ChunkService) SwitchChunks(ctx context.Context, datasetID, documentID string, availableInt int, chunkIDs []string) error {
 	if s.docEngine == nil {
 		return fmt.Errorf("doc engine not initialized")
 	}
@@ -1058,7 +1114,7 @@ func (s *ChunkService) SwitchChunks(ctx context.Context, userID, datasetID, docu
 		return fmt.Errorf("req is null")
 	}
 
-	kb, err := s.getAccessibleKnowledgebase(ctx, datasetID, userID, permission.OperationUpdate)
+	kb, err := s.getAccessibleKnowledgebase(ctx, datasetID, permission.OperationUpdate)
 	if err != nil {
 		return err
 	}
@@ -1072,26 +1128,97 @@ func (s *ChunkService) SwitchChunks(ctx context.Context, userID, datasetID, docu
 	if doc.KbID != datasetID {
 		return fmt.Errorf("document does not belong to this dataset")
 	}
+	if err := service.CheckDocumentAccess(ctx, documentID, datasetID, permission.OperationUpdate); err != nil {
+		return err
+	}
 
+	indexName := fmt.Sprintf("ragflow_%s", targetTenantID)
+
+	// The rows are read before the dataset version is taken: the snapshot a
+	// version stores is the pre-toggle row, and a chunk already in the requested
+	// state is not a change at all. A replay rebuilds an engine row from its
+	// snapshot alone, so a version storing only the availability would blank the
+	// chunk on the way back - the whole row is needed. A failed read only costs
+	// the history entry: the toggle itself must still be applied, so it is
+	// logged instead of returned.
+	type switchTarget struct {
+		chunkID  string
+		existing map[string]interface{}
+	}
+	targets := make([]switchTarget, 0, len(chunkIDs))
+	moved := make(map[string]bool, len(chunkIDs))
 	for _, cid := range chunkIDs {
-		indexName := fmt.Sprintf("ragflow_%s", targetTenantID)
+		existingChunk, getErr := s.docEngine.GetChunk(ctx, indexName, cid, []string{datasetID})
+		var existing map[string]interface{}
+		if getErr != nil {
+			common.Warn("Chunk switch: failed to read the chunk before toggling it",
+				zap.String("dataset_id", datasetID),
+				zap.String("chunk_id", cid),
+				zap.Error(getErr))
+		} else {
+			existing, _ = existingChunk.(map[string]interface{})
+		}
+		targets = append(targets, switchTarget{chunkID: cid, existing: existing})
+		if chunkSwitchMoves(existing, availableInt) {
+			moved[cid] = true
+		}
+	}
 
+	// The dataset version is taken before the rows that carry its number: a chunk
+	// history row is anchored at the version it was written under, so the number
+	// has to exist first. A toggle that moves no chunk records none - a switch the
+	// chunk is already in is not a change, and an entry there would tell the
+	// timeline the dataset had moved when it had not. A toggle that fails midway
+	// leaves a version naming chunks it did not reach, while the rows themselves -
+	// the thing a replay reads - are only written for the chunks the engine
+	// actually changed.
+	// The change records the direction of the switch, not a plain edit: the
+	// timeline line reads "Enabled chunk X" or "Disabled chunk X", and the kind
+	// beside it is derived from the same action.
+	switchAction := entity.DatasetVersionChangeActionEnable
+	if availableInt == 0 {
+		switchAction = entity.DatasetVersionChangeActionDisable
+	}
+	historyVersion := int64(0)
+	if len(moved) > 0 {
+		changed := make([]string, 0, len(moved))
+		for _, cid := range chunkIDs {
+			if moved[cid] {
+				changed = append(changed, cid)
+			}
+		}
+		historyVersion, err = chunkHistoryVersion(ctx, datasetID,
+			chunkVersionChanges(switchAction, documentID, changed))
+		if err != nil {
+			return err
+		}
+	}
+	for _, target := range targets {
 		if err = s.docEngine.UpdateChunks(ctx, map[string]interface{}{
-			"id":     cid,
+			"id":     target.chunkID,
 			"doc_id": documentID,
 		}, map[string]interface{}{
-			"id":            cid,
+			"id":            target.chunkID,
 			"available_int": availableInt,
 		}, indexName, datasetID); err != nil {
 			return err
 		}
+		// Visibility is versioned: the toggle opens a version of its own, so a
+		// restore puts the switch back and a replay never re-publishes a row the
+		// user hid. Versions are recorded only for the rows that moved and whose
+		// pre-toggle state the engine returned - a row it did not answer carries no
+		// content to snapshot.
+		if target.existing != nil && moved[target.chunkID] && historyVersion > 0 {
+			s.recordChunkVersionEE(ctx, datasetID, documentID, target.chunkID, historyVersion, target.existing,
+				map[string]interface{}{"available_int": availableInt},
+				chunkSnapshotMeta(kb, datasetLanguageOf(kb)))
+		}
 	}
 	s.markWikiDirty(ctx, targetTenantID, datasetID, documentID, chunkIDs)
-
 	return nil
 }
 
-func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunkRequest, userID string) error {
+func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunkRequest) error {
 	if s.docEngine == nil {
 		return fmt.Errorf("doc engine not initialized")
 	}
@@ -1100,7 +1227,7 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 		return fmt.Errorf("chunk_id is required")
 	}
 
-	kb, err := s.getAccessibleKnowledgebase(ctx, req.DatasetID, userID, permission.OperationUpdate)
+	kb, err := s.getAccessibleKnowledgebase(ctx, req.DatasetID, permission.OperationUpdate)
 	if err != nil {
 		return err
 	}
@@ -1116,6 +1243,9 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 	if doc.KbID != req.DatasetID {
 		return fmt.Errorf("document does not belong to this dataset")
 	}
+	if err := service.CheckDocumentAccess(ctx, req.DocumentID, req.DatasetID, permission.OperationUpdate); err != nil {
+		return err
+	}
 
 	// Fetch existing chunk first
 	indexName := fmt.Sprintf("ragflow_%s", targetTenantID)
@@ -1125,8 +1255,13 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 	}
 
 	existing, ok := existingChunk.(map[string]interface{})
-	if !ok {
-		return fmt.Errorf("invalid chunk format")
+	if !ok || existing == nil {
+		// The engine held no row for this id: either the caller is editing a
+		// chunk that no longer exists (a restore removes the chunks a version
+		// did not hold), or the page it is showing is older than the last
+		// restore. Saying so beats "invalid chunk format", which reads as a bug
+		// in the row rather than as a missing row.
+		return fmt.Errorf("chunk not found: %s", req.ChunkID)
 	}
 	existingDocumentID, ok := existing["doc_id"].(string)
 	if !ok || existingDocumentID != req.DocumentID {
@@ -1136,23 +1271,20 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 	// Build update dict
 	d := make(map[string]interface{})
 
-	// Content - use new value or existing
+	// Content - use new value or existing. A new value must not smuggle in an
+	// image reference the platform cannot serve (remote URL or data URI): the
+	// upload path below is the only way an image enters a chunk.
 	if req.Content != nil {
+		if err := validateEditedContent(chunkStoredContent(existing), *req.Content); err != nil {
+			return err
+		}
+		if err := validateChunkContentLength(*req.Content); err != nil {
+			return err
+		}
 		d["content_with_weight"] = *req.Content
 	} else {
-		if v, ok := existing["content_with_weight"].(string); ok {
-			d["content_with_weight"] = v
-		} else if v, ok := existing["content"].(string); ok {
-			d["content_with_weight"] = v
-		} else {
-			d["content_with_weight"] = ""
-		}
+		d["content_with_weight"] = chunkStoredContent(existing)
 	}
-
-	// Tokenize content
-	contentStr := d["content_with_weight"].(string)
-	d["content_ltks"], _ = s.tokenize(contentStr, language)
-	d["content_sm_ltks"], _ = s.fineGrainedTokenize(d["content_ltks"].(string), language)
 
 	// Important keywords - convert []string to []interface{} for transformChunkFields
 	if req.ImportantKwd != nil {
@@ -1185,7 +1317,12 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 		}
 	}
 
-	// Positions
+	// Positions. The coordinates say where the chunk came from in the source
+	// document, not what it currently says, and editing the text in place does
+	// not move that source region: a citation keeps opening the page the chunk
+	// was parsed from. They are written only when the caller sends coordinates
+	// (a re-parse of the document, not an edit), so an edit leaves position_int,
+	// page_num_int and top_int exactly as the parser left them.
 	if req.Positions != nil {
 		d["position_int"] = req.Positions
 	}
@@ -1203,10 +1340,12 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 		d["tag_feas"] = tagFeas
 	}
 
-	// Image (Python: chunk_api.update_chunk). The image is stored before the
-	// index update and dropped from storage only after it, so a failed update
-	// never leaves the index pointing at a deleted image.
-	removeImageAfterUpdate := false
+	// Image (Python: chunk_api.update_chunk). The bytes are written under a
+	// content-addressed object key before the index update, so a failed update
+	// never points the index at a missing object and a new picture never
+	// overwrites the object an older chunk version refers to.
+	currentImageID, _ := existing["img_id"].(string)
+	imageRemoved := false
 	if req.ImageUpdateMode != nil || req.ImageBase64 != nil {
 		imageMode, err := parseImageUpdateMode(req.ImageUpdateMode)
 		if err != nil {
@@ -1215,24 +1354,45 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 		switch {
 		case imageMode == imageUpdateModeRemove:
 			d["img_id"] = ""
-			d["doc_type_kwd"] = "text"
-			removeImageAfterUpdate = true
+			// Keep the chunk's own kind. A table or a formula that carried a
+			// preview image is still a table or a formula once the image is
+			// gone; forcing "text" on every removal silently demoted it and the
+			// chunk stopped answering table/formula queries. Only an image
+			// block (or a row with no kind at all) degrades to text.
+			if docType, _ := existing["doc_type_kwd"].(string); docType != "" && docType != "image" {
+				d["doc_type_kwd"] = docType
+			} else {
+				d["doc_type_kwd"] = "text"
+			}
+			imageRemoved = true
 		case req.ImageBase64 != nil:
 			imageBinary, err := decodeChunkImageBase64(*req.ImageBase64)
 			if err != nil {
 				return updateChunkError{code: common.CodeDataError, message: err.Error()}
 			}
-			if err = s.storeChunkImage(ctx, req.DatasetID, req.ChunkID, imageBinary, imageMode); err != nil {
-				common.Error("failed to store chunk image", err,
+			objectKey, storeErr := s.storeChunkImage(ctx, req.DatasetID, req.ChunkID, currentImageID, imageBinary, imageMode)
+			if storeErr != nil {
+				common.Error("Failed to store chunk image", storeErr,
 					zap.String("dataset_id", req.DatasetID),
 					zap.String("chunk_id", req.ChunkID),
 					zap.String("mode", imageMode))
-				return updateChunkError{code: common.CodeDataError, message: "Failed to store chunk image"}
+				return updateChunkError{code: common.CodeDataError, message: "Failed to store chunk image: " + storeErr.Error()}
 			}
-			d["img_id"] = fmt.Sprintf("%s-%s", req.DatasetID, req.ChunkID)
+			d["img_id"] = fmt.Sprintf("%s-%s", req.DatasetID, objectKey)
 			d["doc_type_kwd"] = "image"
 		default:
 			return updateChunkError{code: common.CodeDataError, message: "`image_base64` is required when `image_update_mode` is `append` or `replace`"}
+		}
+	}
+
+	// Removing the image of a block whose text was only the image caption
+	// leaves nothing to search: the row would keep matching by its doc name and
+	// return an empty hit with a broken preview. Deactivate it — the chunk and
+	// its history stay, so the image can be uploaded again later — unless the
+	// caller explicitly states the chunk must stay available.
+	if imageRemoved && req.Available == nil {
+		if content, _ := d["content_with_weight"].(string); strings.TrimSpace(content) == "" {
+			d["available_int"] = 0
 		}
 	}
 
@@ -1245,29 +1405,152 @@ func (s *ChunkService) UpdateChunk(ctx context.Context, req *service.UpdateChunk
 		"doc_id": req.DocumentID,
 	}
 
-	err = s.docEngine.UpdateChunks(ctx, condition, d, indexName, req.DatasetID)
-	if err != nil {
-		return fmt.Errorf("failed to update chunk: %w", err)
+	// The derived columns are produced before anything is written, for the same
+	// reason the vector is: an engine row holding the new text with stale tokens
+	// or a stale vector ranks by terms and semantics the chunk no longer has,
+	// and nothing repairs it later (only a re-parse or a manual retry would).
+	// Producing them here also lets the engine write below carry text, tokens
+	// and vector in one shot.
+	if err := s.applyChunkTextDerivatives(d, existing, language); err != nil {
+		return updateChunkError{
+			code:    common.CodeServerError,
+			message: "failed to tokenize the edited content, nothing was saved: " + err.Error(),
+		}
 	}
-	// The index update above already committed, so a failing image removal must
-	// not skip the Wiki refresh for a content/availability change in the same
-	// request. The request still answers with the removal error (the Python
-	// reference does the same); the stored object is an orphan by then.
-	if req.Content != nil || req.Available != nil {
-		s.markWikiDirty(ctx, targetTenantID, req.DatasetID, req.DocumentID, []string{req.ChunkID})
-	}
-	if removeImageAfterUpdate {
-		if err = s.removeChunkImage(ctx, req.DatasetID, req.ChunkID); err != nil {
-			common.Error("failed to remove chunk image", err,
-				zap.String("dataset_id", req.DatasetID),
-				zap.String("chunk_id", req.ChunkID))
-			return updateChunkError{code: common.CodeDataError, message: "Failed to remove chunk image"}
+	contentChanged := chunkContentChanged(existing, d)
+	if contentChanged {
+		content, _ := d["content_with_weight"].(string)
+		embedding, embedErr := s.chunkEmbeddingForEditEE(ctx, kb, doc, content)
+		if embedErr != nil {
+			return updateChunkError{
+				code:    common.CodeServerError,
+				message: "failed to embed the edited content, nothing was saved: " + embedErr.Error(),
+			}
+		}
+		if embedding != nil && embedding.Field != "" {
+			d[embedding.Field] = embedding.Vector
 		}
 	}
 
+	// An edit carrying expected_version CASes the chunk's history version: the
+	// edition that keeps history locks the latest row, rejects a stale base
+	// version before the chunk is touched and holds its transaction open until
+	// the index write below has landed. Editions without history answer with
+	// no-op and keep recording after the write.
+	finish, _, err := s.beginChunkEditEE(ctx, req.DatasetID, req.DocumentID, req.ChunkID, req.ExpectedVersion, existing, d,
+		chunkSnapshotMeta(kb, language))
+	if err != nil {
+		return err
+	}
+	err = s.docEngine.UpdateChunks(ctx, condition, d, indexName, req.DatasetID)
+	if err != nil {
+		if finish != nil {
+			_ = finish(err)
+		}
+		return fmt.Errorf("failed to update chunk: %w", err)
+	}
+	if finish != nil {
+		// The version and its body were written inside the transaction the CAS
+		// opened, and the content write above has landed: a failed commit is the
+		// one window left, where the chunk changed and its history did not. It is
+		// reported rather than logged, because the caller is the only one that can
+		// tell the user the content was saved without a version.
+		if commitErr := finish(nil); commitErr != nil {
+			return fmt.Errorf("chunk %s was updated but its version was not recorded: %w", req.ChunkID, commitErr)
+		}
+	} else if chunkEditMovesDataset(existing, d) {
+		// No chunk history on this deployment - the store cannot hold a version
+		// body - so nothing above recorded the edit. The dataset keeps its own
+		// history beside it, and a write that changes what the chunk is (its body
+		// or its picture) is still a change to what the dataset contains:
+		// recorded best-effort, after the content has landed. An annotation edit
+		// (keywords, questions, tags, visibility) is not one here either, exactly
+		// as in the history-recording path above.
+		if _, err := chunkHistoryVersion(ctx, req.DatasetID,
+			[]entity.DatasetVersionChange{chunkVersionChange(entity.DatasetVersionChangeActionUpdate, req.DocumentID, req.ChunkID)}); err != nil {
+			return err
+		}
+	}
+	if req.Content != nil || req.Available != nil {
+		s.markWikiDirty(ctx, targetTenantID, req.DatasetID, req.DocumentID, []string{req.ChunkID})
+	}
+	// The dataset version beside the chunk's own history was written by
+	// beginChunkEditEE, in the same transaction as the chunk row it stamps: the
+	// row's anchor is that version's number, so the two cannot be recorded apart.
+	// A removed picture keeps its stored object: the version this edit just
+	// recorded holds its ID, and restoring that version has to find the bytes.
+	// The object is dropped with the history that refers to it, by the
+	// removed-document cleanup.
+
 	return nil
 }
-func (s *ChunkService) RemoveChunks(ctx context.Context, req *service.RemoveChunksRequest, userID string) (int64, error) {
+
+// applyChunkTextDerivatives recomputes the tokenized fields an engine indexes
+// from the text fields an update rewrites. Content, important keywords and
+// questions each feed their own token column, so a write that changes one must
+// refresh its column in the same update; leaving it behind keeps the old terms
+// ranking for the chunk.
+//
+// previous is the row as the engine holds it now: the body is only re-tokenized
+// when it actually changes, since an update that merely echoes the stored text
+// (or touches nothing but availability) cannot invalidate its tokens.
+//
+// A tokenizer failure is returned, not swallowed: the caller writes the text
+// and its tokens in one update, so storing the text while its tokens are stale
+// (or empty) would make the chunk unrankable by the very terms it holds.
+func (s *ChunkService) applyChunkTextDerivatives(update, previous map[string]interface{}, language string) error {
+	if chunkContentChanged(previous, update) {
+		content, _ := update["content_with_weight"].(string)
+		contentLtks, err := s.tokenize(content, language)
+		if err != nil {
+			return fmt.Errorf("tokenize content: %w", err)
+		}
+		update["content_ltks"] = contentLtks
+		fineGrained, err := s.fineGrainedTokenize(contentLtks, language)
+		if err != nil {
+			return fmt.Errorf("tokenize content (fine grained): %w", err)
+		}
+		update["content_sm_ltks"] = fineGrained
+	}
+	if keywords, ok := update["important_kwd"]; ok {
+		tokens, err := s.tokenize(strings.Join(chunkStringSlice(keywords), " "), language)
+		if err != nil {
+			return fmt.Errorf("tokenize important keywords: %w", err)
+		}
+		update["important_tks"] = tokens
+	}
+	if questions, ok := update["question_kwd"]; ok {
+		tokens, err := s.tokenize(strings.Join(chunkStringSlice(questions), "\n"), language)
+		if err != nil {
+			return fmt.Errorf("tokenize questions: %w", err)
+		}
+		update["question_tks"] = tokens
+	}
+	return nil
+}
+
+// chunkStringSlice normalizes a list field into the []string shape the engine
+// writes use, mapping an absent or malformed value to an empty list.
+func chunkStringSlice(value interface{}) []string {
+	switch typed := value.(type) {
+	case []string:
+		out := make([]string, len(typed))
+		copy(out, typed)
+		return out
+	case []interface{}:
+		out := make([]string, 0, len(typed))
+		for _, item := range typed {
+			if text, ok := item.(string); ok {
+				out = append(out, text)
+			}
+		}
+		return out
+	default:
+		return []string{}
+	}
+}
+
+func (s *ChunkService) RemoveChunks(ctx context.Context, req *service.RemoveChunksRequest) (int64, error) {
 	if s.docEngine == nil {
 		return 0, fmt.Errorf("doc engine not initialized")
 	}
@@ -1286,8 +1569,11 @@ func (s *ChunkService) RemoveChunks(ctx context.Context, req *service.RemoveChun
 		return 0, permission.ErrResourceNotFound
 	}
 
-	kb, err := s.getAccessibleKnowledgebase(ctx, doc.KbID, userID, permission.OperationUpdate)
+	kb, err := s.getAccessibleKnowledgebase(ctx, doc.KbID, permission.OperationUpdate)
 	if err != nil {
+		return 0, err
+	}
+	if err = service.CheckDocumentAccess(ctx, req.DocID, doc.KbID, permission.OperationUpdate); err != nil {
 		return 0, err
 	}
 	targetTenantID := kb.TenantID
@@ -1311,7 +1597,7 @@ func (s *ChunkService) RemoveChunks(ctx context.Context, req *service.RemoveChun
 		// Delete all chunks for this document
 		condition["doc_id"] = req.DocID
 	default:
-		return 0, fmt.Errorf("either chunk_ids or delete_all must be provided")
+		return 0, nil
 	}
 
 	deletedCount, err := s.docEngine.DeleteChunks(ctx, condition, indexName, doc.KbID)
@@ -1322,6 +1608,38 @@ func (s *ChunkService) RemoveChunks(ctx context.Context, req *service.RemoveChun
 	if deletedCount > 0 {
 		if err = s.decrementChunkStats(req.DocID, doc.KbID, 0, deletedCount, 0); err != nil {
 			return deletedCount, fmt.Errorf("failed to update chunk stats: %w", err)
+		}
+		// The chunk history is kept: a dataset content version recorded before
+		// this delete can put the chunk back from it. The removed-document cleanup
+		// drops it when the owner deletes the removal row.
+		//
+		// The change set names the chunks that went away. Clearing a whole
+		// document's chunks is one entry: the ids are in the engine, already gone
+		// by the time the tombstones are written.
+		changes := chunkVersionChanges(entity.DatasetVersionChangeActionDelete, req.DocID, req.ChunkIDs)
+		if req.DeleteAll {
+			changes = []entity.DatasetVersionChange{
+				documentVersionChange(entity.DatasetVersionChangeActionDelete, doc.ID, documentName(doc)),
+			}
+		}
+		// The version is taken first so the tombstones carry its number: they are
+		// anchored at the version the removal was recorded under.
+		historyVersion, err := chunkHistoryVersion(ctx, req.DatasetID, changes)
+		if err != nil {
+			return deletedCount, err
+		}
+		// The removal is recorded as a tombstone so a replay knows the chunk did
+		// not exist after this point; without it the last content version would
+		// resurrect it. The tombstone names the user who removed it, so the chunk
+		// history reads "deleted by <user>" instead of crediting the system for an
+		// action someone took.
+		if historyVersion > 0 {
+			deletedBy := permission.UserIDFromContext(ctx)
+			if req.DeleteAll {
+				chunkversion.AppendDocumentTombstones(ctx, dao.DB, req.DatasetID, req.DocID, historyVersion, deletedBy)
+			} else {
+				chunkversion.AppendTombstones(ctx, dao.DB, req.DatasetID, req.DocID, historyVersion, req.ChunkIDs, deletedBy)
+			}
 		}
 		s.markWikiDirty(ctx, targetTenantID, doc.KbID, req.DocID, req.ChunkIDs)
 	}
@@ -1377,14 +1695,14 @@ func (s *ChunkService) nextSourceChunkOrder(ctx context.Context, indexName, data
 	return 0
 }
 
-func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkRequest, userID string) (*service.AddChunkResponse, error) {
+func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkRequest) (*service.AddChunkResponse, error) {
 	if s.docEngine == nil {
 		return nil, addChunkError{code: common.CodeServerError, message: "doc engine not initialized"}
 	}
 	if req == nil {
 		return nil, addChunkError{code: common.CodeDataError, message: "invalid request payload"}
 	}
-	if err := s.checkDatasetAccess(ctx, req.DatasetID, userID, permission.OperationUpdate); err != nil {
+	if err := s.checkDatasetAccess(ctx, req.DatasetID, permission.OperationUpdate); err != nil {
 		code, permissionErr := permissionresponse.Normalize(err)
 		return nil, addChunkError{code: code, message: permissionErr.Error(), cause: permissionErr}
 	}
@@ -1398,10 +1716,26 @@ func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkReques
 	if err != nil || doc == nil {
 		return nil, addChunkError{code: common.CodeDataError, message: fmt.Sprintf("you don't own the document %s", req.DocumentID)}
 	}
+	if err := service.CheckDocumentAccess(ctx, req.DocumentID, req.DatasetID, permission.OperationUpdate); err != nil {
+		code, permissionErr := permissionresponse.Normalize(err)
+		return nil, addChunkError{code: code, message: permissionErr.Error(), cause: permissionErr}
+	}
 
 	content := strings.TrimSpace(req.Content)
 	if content == "" {
 		return nil, addChunkError{code: common.CodeDataError, message: "`content` is required"}
+	}
+	// A brand new chunk has no stored image reference to grandfather in, so any
+	// external image source in its text is an addition: like an edit, it has to
+	// upload the image through `image_base64`.
+	if err := validateEditedContent("", req.Content); err != nil {
+		return nil, addChunkError{code: common.CodeArgumentError, message: err.Error()}
+	}
+	if len(content) > maxEditedChunkLength {
+		return nil, addChunkError{
+			code:    common.CodeArgumentError,
+			message: fmt.Sprintf("`content` exceeds %d bytes; split it into several chunks", maxEditedChunkLength),
+		}
 	}
 
 	var tagFeas map[string]float64
@@ -1476,6 +1810,12 @@ func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkReques
 	if tagFeas != nil {
 		chunkData["tag_feas"] = tagFeas
 	}
+	if kb.Pagerank != 0 {
+		// Python's chunk_api.create stamps the dataset's pagerank on a manually
+		// added chunk (`if kb.pagerank: d["pagerank_fea"] = kb.pagerank`); a
+		// chunk that skipped it would rank at 0 until the setting is re-saved.
+		chunkData[common.PAGERANK_FLD] = kb.Pagerank
+	}
 
 	if req.ImageBase64 != nil {
 		var imageBinary []byte
@@ -1483,14 +1823,15 @@ func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkReques
 		if err != nil {
 			return nil, addChunkError{code: common.CodeDataError, message: err.Error()}
 		}
-		if err = s.storeChunkImage(ctx, req.DatasetID, chunkID, imageBinary, imageUpdateModeAppend); err != nil {
-			common.Error("failed to store chunk image", err,
+		objectKey, storeErr := s.storeChunkImage(ctx, req.DatasetID, chunkID, "", imageBinary, imageUpdateModeAppend)
+		if storeErr != nil {
+			common.Error("Failed to store chunk image", storeErr,
 				zap.String("dataset_id", req.DatasetID),
 				zap.String("chunk_id", chunkID),
 				zap.String("mode", imageUpdateModeAppend))
-			return nil, addChunkError{code: common.CodeDataError, message: "Failed to store chunk image"}
+			return nil, addChunkError{code: common.CodeDataError, message: "Failed to store chunk image: " + storeErr.Error()}
 		}
-		chunkData["img_id"] = fmt.Sprintf("%s-%s", req.DatasetID, chunkID)
+		chunkData["img_id"] = fmt.Sprintf("%s-%s", req.DatasetID, objectKey)
 		chunkData["doc_type_kwd"] = "image"
 	}
 
@@ -1515,12 +1856,25 @@ func (s *ChunkService) AddChunk(ctx context.Context, req *service.AddChunkReques
 	if err != nil {
 		return nil, addChunkError{code: common.CodeServerError, message: err.Error()}
 	}
-	chunkData[fmt.Sprintf("q_%d_vec", len(mergedVec))] = mergedVec
+	chunkData[common.VectorColumnName(len(mergedVec))] = mergedVec
 
 	ctx, cancel := context.WithTimeout(ctx, 600*time.Second)
 	defer cancel()
 	if _, err = s.docEngine.InsertChunks(ctx, []map[string]interface{}{chunkData}, indexName, req.DatasetID, datasetLanguageOf(kb)); err != nil {
 		return nil, addChunkError{code: common.CodeServerError, message: fmt.Sprintf("insert chunk: %v", err)}
+	}
+	// The baseline is anchored at the dataset version the add produced, so the
+	// version is taken first. A restore replays the chunk history and only knows
+	// the chunks its timeline has, so a manually added chunk without a baseline
+	// row would be missing from every restored version that held it.
+	historyVersion, err := chunkHistoryVersion(ctx, req.DatasetID,
+		[]entity.DatasetVersionChange{chunkVersionChange(entity.DatasetVersionChangeActionAdd, req.DocumentID, chunkID)})
+	if err != nil {
+		return nil, addChunkError{code: common.CodeServerError, message: fmt.Sprintf("record the chunk version: %v", err)}
+	}
+	if historyVersion > 0 {
+		chunkversion.AppendAddBaseline(ctx, dao.DB, req.DatasetID, req.DocumentID, chunkID, historyVersion,
+			chunkSnapshotMeta(kb, datasetLanguageOf(kb)), chunkData, permission.UserIDFromContext(ctx))
 	}
 
 	tokenNum := int64(s.numTokens(req.Content))
@@ -1731,7 +2085,7 @@ func (s *ChunkService) getEmbeddingModel(ctx context.Context, tenantID, embdID s
 	if s.getEmbeddingModelFunc != nil {
 		return s.getEmbeddingModelFunc(tenantID, embdID)
 	}
-	embeddingModel, err := service.NewModelFactory().NewEmbeddingModel(ctx, service.ModelAccess{TenantID: tenantID}, embdID)
+	embeddingModel, err := service.NewModelFactory().NewEmbeddingModel(permission.WithTenantID(ctx, tenantID), embdID)
 	if err != nil {
 		return nil, err
 	}
@@ -1808,18 +2162,34 @@ func (s *ChunkService) decrementChunkStats(docID, kbID string, tokenNum, chunkNu
 	})
 }
 
-// storeChunkImage writes imageBinary under (bucket, chunkID). In append mode an
-// existing image is stacked below the new one; replace mode overwrites it
-// (Python: api/utils/image_utils.store_chunk_image). Every mode holds the same
-// per-chunk lock: a replace landing between an append's read and write would
-// otherwise be overwritten by the merged image.
-func (s *ChunkService) storeChunkImage(ctx context.Context, bucket, chunkID string, imageBinary []byte, mode string) error {
+// chunkImageObjectKey names the object an image payload is stored under. The
+// digest makes the key content-addressed: writing a different picture produces
+// a new object instead of overwriting the one an older chunk version points at,
+// which is what lets a version restore bring the earlier picture back.
+func chunkImageObjectKey(chunkID string, imageBinary []byte) string {
+	sum := sha256.Sum256(imageBinary)
+	return chunkID + "-" + hex.EncodeToString(sum[:8])
+}
+
+// An image ID ("<bucket>-<object key>") names its storage key through
+// chunkversion.ImageObjectName: the picture store here and the version purge in the
+// dataset cleanup have to derive the same key.
+
+// storeChunkImage writes imageBinary to object storage and returns the object
+// key it can be fetched from. In append mode the chunk's current picture
+// (currentImageID) is stacked above the new one; replace mode writes the new
+// picture alone (Python: api/utils/image_utils.store_chunk_image). Keys are
+// content-addressed, so neither mode touches the object an older version
+// refers to. Every mode holds the same per-chunk lock: a replace landing
+// between an append's read and write would otherwise be overwritten by the
+// merged image.
+func (s *ChunkService) storeChunkImage(ctx context.Context, bucket, chunkID, currentImageID string, imageBinary []byte, mode string) (string, error) {
 	if s.storeChunkImageFunc != nil {
-		return s.storeChunkImageFunc(bucket, chunkID, imageBinary, mode)
+		return s.storeChunkImageFunc(bucket, chunkID, currentImageID, imageBinary, mode)
 	}
 	storageImpl := storage.GetStorageFactory().GetStorage()
 	if storageImpl == nil {
-		return fmt.Errorf("storage not initialized")
+		return "", fmt.Errorf("storage not initialized")
 	}
 	lockKey := bucket + "/" + chunkID
 	lock := acquireChunkImageLock(lockKey)
@@ -1829,25 +2199,40 @@ func (s *ChunkService) storeChunkImage(ctx context.Context, bucket, chunkID stri
 		releaseChunkImageLock(lockKey)
 	}()
 
-	if mode == imageUpdateModeReplace {
-		return storageImpl.Put(ctx, bucket, chunkID, imageBinary)
+	stored := imageBinary
+	if mode != imageUpdateModeReplace && currentImageID != "" {
+		objectName := chunkversion.ImageObjectName(bucket, currentImageID)
+		if storageImpl.ObjExist(ctx, bucket, objectName) {
+			oldBinary, err := storageImpl.Get(ctx, bucket, objectName)
+			if err != nil {
+				return "", err
+			}
+			merged, err := stackChunkImages(oldBinary, imageBinary)
+			if err != nil {
+				return "", err
+			}
+			stored = merged
+		}
 	}
 
-	if !storageImpl.ObjExist(ctx, bucket, chunkID) {
-		return storageImpl.Put(ctx, bucket, chunkID, imageBinary)
+	objectKey := chunkImageObjectKey(chunkID, stored)
+	if err := storageImpl.Put(ctx, bucket, objectKey, stored); err != nil {
+		return "", err
 	}
+	return objectKey, nil
+}
 
-	oldBinary, err := storageImpl.Get(ctx, bucket, chunkID)
-	if err != nil {
-		return err
-	}
+// stackChunkImages returns one JPEG holding the old picture above the new one.
+// Append mode stacks instead of replacing, so an image chunk can accumulate the
+// pictures of a multi-page table or a corrected screenshot.
+func stackChunkImages(oldBinary, imageBinary []byte) ([]byte, error) {
 	oldImage, _, err := image.Decode(bytes.NewReader(oldBinary))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	newImage, _, err := image.Decode(bytes.NewReader(imageBinary))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	oldBounds, newBounds := oldImage.Bounds(), newImage.Bounds()
 	width := oldBounds.Dx()
@@ -1862,24 +2247,26 @@ func (s *ChunkService) storeChunkImage(ctx context.Context, bucket, chunkID stri
 
 	var buf bytes.Buffer
 	if err = jpeg.Encode(&buf, combined, nil); err != nil {
-		return err
+		return nil, err
 	}
-	return storageImpl.Put(ctx, bucket, chunkID, buf.Bytes())
+	return buf.Bytes(), nil
 }
 
-// removeChunkImage drops a chunk's stored image, tolerating a missing object
-// (Python: api/utils/image_utils.remove_chunk_image). It takes the same
-// per-chunk lock as storeChunkImage, so a delete cannot slip into an append's
-// read-modify-write and leave the index pointing at a deleted object.
-func (s *ChunkService) removeChunkImage(ctx context.Context, bucket, chunkID string) error {
+// removeChunkImage drops one stored image object, tolerating a missing object
+// (Python: api/utils/image_utils.remove_chunk_image). objectKey is the storage
+// key, i.e. an image ID without its "<bucket>-" prefix. It takes the same
+// per-chunk lock as storeChunkImage so a delete cannot slip into an append's
+// read-modify-write, and the version cleanup uses it to drop the objects of the
+// history it is deleting.
+func (s *ChunkService) removeChunkImage(ctx context.Context, bucket, objectKey string) error {
 	if s.removeChunkImageFunc != nil {
-		return s.removeChunkImageFunc(bucket, chunkID)
+		return s.removeChunkImageFunc(bucket, objectKey)
 	}
 	storageImpl := storage.GetStorageFactory().GetStorage()
 	if storageImpl == nil {
 		return fmt.Errorf("storage not initialized")
 	}
-	lockKey := bucket + "/" + chunkID
+	lockKey := bucket + "/" + objectKey
 	lock := acquireChunkImageLock(lockKey)
 	lock.mu.Lock()
 	defer func() {
@@ -1887,10 +2274,10 @@ func (s *ChunkService) removeChunkImage(ctx context.Context, bucket, chunkID str
 		releaseChunkImageLock(lockKey)
 	}()
 
-	if !storageImpl.ObjExist(ctx, bucket, chunkID) {
+	if !storageImpl.ObjExist(ctx, bucket, objectKey) {
 		return nil
 	}
-	return storageImpl.Remove(ctx, bucket, chunkID)
+	return storageImpl.Remove(ctx, bucket, objectKey)
 }
 
 func acquireChunkImageLock(key string) *chunkImageLock {

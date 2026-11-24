@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package component
 
 import (
@@ -95,6 +111,19 @@ func TestValidateDynamicEntries(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
+			draftErr := ValidateDraftDynamicEntries(dslWithComponents(test.component))
+			invokeDraft := test.component["component_name"] == "Invoke"
+			switch test.name {
+			case "invoke variable row not a map", "invoke variable nil row", "invoke variable with numeric key", "invoke variables not an array", "invoke variables object":
+				invokeDraft = false
+			}
+			if test.component["component_name"] == "Message" || test.component["component_name"] == "Agent" || test.component["component_name"] == "DataOperations" || test.component["component_name"] == "Compiler" || test.component["component_name"] == "Loop" || test.component["component_name"] == "Iteration" || test.component["component_name"] == "TokenChunker" || invokeDraft || test.name == "input option" || test.name == "aggregated variable" {
+				if draftErr != nil {
+					t.Fatalf("draft rejected unfinished entries: %v", draftErr)
+				}
+			} else if draftErr == nil || !strings.Contains(draftErr.Error(), test.want) {
+				t.Fatalf("draft validation changed: %v, want %q", draftErr, test.want)
+			}
 			err := ValidateDynamicEntries(dslWithComponents(test.component))
 			if err == nil || !strings.Contains(err.Error(), test.want) {
 				t.Fatalf("ValidateDynamicEntries() error = %v, want %q", err, test.want)
@@ -113,4 +142,14 @@ func dslWithComponents(components ...map[string]any) map[string]any {
 
 func componentDSL(name string, params map[string]any) map[string]any {
 	return map[string]any{"component_name": name, "params": params}
+}
+
+func TestMessageDSLFactoryRejectsIncompleteContent(t *testing.T) {
+	for _, params := range []map[string]any{
+		nil, {}, {"text": ""}, {"content": []string{}}, {"content": []string{"hello", ""}},
+	} {
+		if _, err := New("Message", params); err == nil || !strings.Contains(err.Error(), "content does not support empty") {
+			t.Fatalf("factory accepted %#v: %v", params, err)
+		}
+	}
 }
