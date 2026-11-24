@@ -202,7 +202,7 @@ func TestScoreGrepChunks_ScoreAndDedupe(t *testing.T) {
 }
 
 func TestGrepChunksTool_InvalidRegex(t *testing.T) {
-	out, err := NewGrepChunksTool("", nil).InvokableRun(context.Background(), `{"query":"("}`)
+	out, err := NewGrepChunksTool(nil).InvokableRun(context.Background(), `{"query":"("}`)
 	if err != nil {
 		t.Fatalf("failure must become a result, got error: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestGrepChunksTool_InvalidRegex(t *testing.T) {
 }
 
 func TestGrepChunksTool_EmptyQuery(t *testing.T) {
-	out, err := NewGrepChunksTool("", nil).InvokableRun(context.Background(), `{"query":""}`)
+	out, err := NewGrepChunksTool(nil).InvokableRun(context.Background(), `{"query":""}`)
 	if err != nil {
 		t.Fatalf("failure must become a result, got error: %v", err)
 	}
@@ -395,18 +395,74 @@ type grepFakeEngine struct {
 	searchErr         error
 	searchCalls       int
 	lastReq           *enginetypes.SearchRequest
+	lastRegexpReq     *enginetypes.RegexpSearchRequest
 }
 
 func (e *grepFakeEngine) GetType() string { return string(engine.EngineElasticsearch) }
+
+// pool is the fixture set the deep read sees. Tests that were written against
+// the old regexp-only deep read populate regexpChunks; the filter-based read
+// must still return their chunks, so it falls back to them.
+func (e *grepFakeEngine) pool() []map[string]interface{} {
+	if e.searchChunks != nil {
+		return e.searchChunks
+	}
+	return e.regexpChunks
+}
+
+// Search mirrors the engine contract the deep read relies on: a bool filter over
+// doc_id / id term lists, a pushed-down reading-order sort, and a size cap.
+// available_int is deliberately NOT enforced — the fixtures omit the flag and
+// these tests are about scope, not availability.
 func (e *grepFakeEngine) Search(_ context.Context, req *enginetypes.SearchRequest) (*enginetypes.SearchResult, error) {
 	e.searchCalls++
 	e.lastReq = req
 	if e.searchErr != nil {
 		return nil, e.searchErr
 	}
-	return &enginetypes.SearchResult{Chunks: e.searchChunks}, nil
+	chunks := keepByFilterKeys(e.pool(), req.Filter)
+	if req.OrderBy != nil && len(req.OrderBy.Fields) > 0 {
+		ordered := append([]map[string]interface{}(nil), chunks...)
+		sort.SliceStable(ordered, func(i, j int) bool {
+			return runtime.IntFromMap(ordered[i], "chunk_order_int") < runtime.IntFromMap(ordered[j], "chunk_order_int")
+		})
+		chunks = ordered
+	}
+	total := len(chunks)
+	if req.Limit > 0 && len(chunks) > req.Limit {
+		chunks = chunks[:req.Limit]
+	}
+	return &enginetypes.SearchResult{Chunks: chunks, Total: int64(total)}, nil
+}
+
+// keepByFilterKeys applies the doc_id / id term-list scoping a real engine would
+// apply, as a plain bool filter with no content matching.
+func keepByFilterKeys(chunks []map[string]interface{}, filter map[string]interface{}) []map[string]interface{} {
+	out := chunks
+	if docs, ok := filter["doc_id"].([]string); ok && len(docs) > 0 {
+		out = keepByKey(out, docs, "doc_id")
+	}
+	if ids, ok := filter["id"].([]string); ok && len(ids) > 0 {
+		out = keepByKey(out, ids, "id", "_id")
+	}
+	return out
+}
+
+func keepByKey(chunks []map[string]interface{}, want []string, keys ...string) []map[string]interface{} {
+	set := make(map[string]bool, len(want))
+	for _, w := range want {
+		set[w] = true
+	}
+	out := make([]map[string]interface{}, 0, len(chunks))
+	for _, c := range chunks {
+		if set[runtime.FirstStringFromMap(c, keys...)] {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 func (e *grepFakeEngine) SearchByRegexp(_ context.Context, req *enginetypes.RegexpSearchRequest) (*enginetypes.SearchResult, error) {
+	e.lastRegexpReq = req
 	if e.searchByRegexpErr != nil {
 		return nil, e.searchByRegexpErr
 	}
@@ -451,14 +507,13 @@ func TestGrepAdapter_NoFallbackOnRegexpError(t *testing.T) {
 	}
 	adapter := NewGrepAdapter(fe)
 
-	_, err := adapter.Grep(context.Background(), runtime.GrepRequest{
-		TenantID:   "t",
+	_, err := adapter.Grep(WithDatasetTenants(context.Background(), map[string]string{"kb1": "t"}), runtime.GrepRequest{
 		Pattern:    `\bbeta\b`,
 		DatasetIDs: []string{"kb1"},
 		Limit:      30,
 	})
-	if err == nil {
-		t.Fatal("expected Grep to surface the regexp pushdown error (no in-memory fallback)")
+	if !errors.Is(err, runtime.ErrRegexpPushdown) {
+		t.Fatalf("expected Grep to surface the regexp pushdown error (no in-memory fallback), got %v", err)
 	}
 	if fe.searchCalls != 0 {
 		t.Fatalf("expected no in-memory recall Search after fallback removal, got %d", fe.searchCalls)
@@ -475,8 +530,8 @@ func TestGrepAdapter_RegexpPushdownSucceeds(t *testing.T) {
 	}
 	adapter := NewGrepAdapter(fe)
 
-	chunks, err := adapter.Grep(context.Background(), runtime.GrepRequest{
-		TenantID: "t", Pattern: "beta", DatasetIDs: []string{"kb1"}, Limit: 30,
+	chunks, err := adapter.Grep(WithDatasetTenants(context.Background(), map[string]string{"kb1": "t"}), runtime.GrepRequest{
+		Pattern: "beta", DatasetIDs: []string{"kb1"}, Limit: 30,
 	})
 	if err != nil {
 		t.Fatalf("Grep: %v", err)
@@ -557,7 +612,7 @@ func TestListChunks_DeepRead(t *testing.T) {
 	defer runtime.SetGrepService(nil)
 	stubOwner(t, "kb1")
 
-	out, err := NewListChunksTool("t", []string{"kb1"}).InvokableRun(context.Background(),
+	out, err := NewListChunksTool([]string{"kb1"}).InvokableRun(context.Background(),
 		`{"doc_id":"d1","anchor_chunk_ids":["c1","c3"]}`)
 	if err != nil {
 		t.Fatalf("InvokableRun: %v", err)
@@ -600,7 +655,7 @@ func TestListChunks_AnchorNeighbors(t *testing.T) {
 	defer runtime.SetGrepService(nil)
 	stubOwner(t, "kb1")
 
-	tool := NewListChunksTool("t", []string{"kb1"})
+	tool := NewListChunksTool([]string{"kb1"})
 
 	// Single anchor + 1 neighbor → window c2..c4, header carries doc_chunks_total.
 	out, err := tool.InvokableRun(context.Background(),
@@ -721,15 +776,15 @@ func TestListChunks_DocIDRequired(t *testing.T) {
 	stubOwner(t, "kb1")
 
 	// Both required args must be present: doc_id and at least one anchor.
-	if out, err := NewListChunksTool("t", []string{"kb1"}).InvokableRun(context.Background(),
+	if out, err := NewListChunksTool([]string{"kb1"}).InvokableRun(context.Background(),
 		`{"anchor_chunk_ids":["c1"]}`); err != nil || !strings.Contains(out, "doc_id is required") {
 		t.Fatalf("missing doc_id must produce a tool_error result, got err=%v out=%.200q", err, out)
 	}
-	if out, err := NewListChunksTool("t", []string{"kb1"}).InvokableRun(context.Background(),
+	if out, err := NewListChunksTool([]string{"kb1"}).InvokableRun(context.Background(),
 		`{"doc_id":"d1"}`); err != nil || !strings.Contains(out, "anchor_chunk_ids is required") {
 		t.Fatalf("missing anchors must produce a tool_error result, got err=%v out=%.200q", err, out)
 	}
-	if out, err := NewListChunksTool("t", []string{"kb1"}).InvokableRun(context.Background(), `{}`); err != nil ||
+	if out, err := NewListChunksTool([]string{"kb1"}).InvokableRun(context.Background(), `{}`); err != nil ||
 		!strings.Contains(out, toolErrorMarker) {
 		t.Fatalf("everything missing must produce a tool_error result, got err=%v out=%.200q", err, out)
 	}

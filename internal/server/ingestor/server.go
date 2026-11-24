@@ -21,78 +21,22 @@ package ingestor
 import (
 	"context"
 	"fmt"
-	"os"
-	"strconv"
-	"strings"
 	"time"
 
 	"go.uber.org/zap"
 
 	"ragflow/internal/common"
+	"ragflow/internal/dao"
+	"ragflow/internal/engine"
+	kvrocks "ragflow/internal/engine/kvrocks"
+	ingestioncore "ragflow/internal/ingestion"
 	"ragflow/internal/ingestion/knowledge_compile"
 	ingestion "ragflow/internal/ingestion/service"
 	"ragflow/internal/server"
 	"ragflow/internal/server/bootstrap"
-	"ragflow/internal/server/config"
 	"ragflow/internal/service"
-	"ragflow/internal/service/nav"
-	"ragflow/internal/service/nlp"
 	"ragflow/internal/tokenizer"
 )
-
-// resolveIngestorMaxConcurrentWorkers applies the precedence
-// CLI flag > environment variable > config file > default(1) and returns the
-// resolved ingestor worker count (K), validating it against the inclusive
-// range [MinIngestorWorkers, MaxIngestorWorkers]. An out-of-range or
-// noninteger value at any layer is a fatal startup error.
-func resolveIngestorMaxConcurrentWorkers(args *bootstrap.ServerArgs, configured int) (int, error) {
-	val := config.MinIngestorWorkers
-	if configured > 0 {
-		val = configured
-	}
-	if v := strings.TrimSpace(os.Getenv(common.EnvIngestorMaxConcurrentWorkers)); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return 0, fmt.Errorf("invalid %s %q: %w", common.EnvIngestorMaxConcurrentWorkers, v, err)
-		}
-		val = n
-	}
-	if args.IngestorMaxConcurrentWorkers != nil {
-		val = *args.IngestorMaxConcurrentWorkers
-	}
-	if val < config.MinIngestorWorkers || val > config.MaxIngestorWorkers {
-		return 0, fmt.Errorf("ingestor max_concurrent_workers %d out of range [%d, %d]",
-			val, config.MinIngestorWorkers, config.MaxIngestorWorkers)
-	}
-	return val, nil
-}
-
-// resolveIngestorPageConcurrency applies the precedence
-// CLI flag > environment variable > config file > default(2) and returns the
-// resolved per-document page concurrency (N), validating it against the
-// inclusive range [MinPageConcurrency, MaxPageConcurrency]. An out-of-range or
-// noninteger value at any layer is a fatal startup error.
-func ResolveIngestorPageConcurrency(args *bootstrap.ServerArgs, configured int) (int, error) {
-	val := 2 // default page concurrency
-	if configured > 0 {
-		val = configured
-	}
-	if v := strings.TrimSpace(os.Getenv(common.EnvIngestorPageConcurrency)); v != "" {
-		n, err := strconv.Atoi(v)
-		if err != nil {
-			return 0, fmt.Errorf("invalid %s %q: %w", common.EnvIngestorPageConcurrency, v, err)
-		}
-		val = n
-	}
-	if args.IngestorPageConcurrency != nil {
-		val = *args.IngestorPageConcurrency
-	}
-	if val < config.MinPageConcurrency || val > config.MaxPageConcurrency {
-		return 0, fmt.Errorf("ingestor page_concurrency %d out of range [%d, %d]",
-			val, config.MinPageConcurrency, config.MaxPageConcurrency)
-	}
-	return val, nil
-}
 
 func logTokenizerCounters() {
 	var available, unavailable []string
@@ -107,27 +51,15 @@ func logTokenizerCounters() {
 	if len(unavailable) > 0 {
 		common.Warn("embedding tokenizers unavailable; models that declare them cannot be ingested until the asset is restored",
 			zap.Strings("unavailable", unavailable),
-			zap.String("hint", "run `uv run ragflow_deps/download_deps.py`, or set "+common.EnvModelAssetsDir+" to a directory holding them"))
+			zap.String("hint", "run `uv run deps/download_deps.py`, or set "+common.EnvModelAssetsDir+" to a directory holding them"))
 	}
 }
 
 // Run starts the RAGFlow ingestion worker. It blocks until ctx is cancelled
 // (OS shutdown signal) or the ingestor receives a shutdown command from the
 // admin, then gracefully stops the ingestor.
-func Run(ctx context.Context, cancel context.CancelFunc, serverName string, args *bootstrap.ServerArgs) error {
-	// Initialize tokenizer (rag_analyzer)
-	// tokenizer.Init handles DictPath fallback: env var → /usr/share/infinity/resource
-	if err := tokenizer.Init(&tokenizer.PoolConfig{}); err != nil {
-		common.Fatal("Failed to initialize tokenizer", zap.Error(err))
-	}
-	defer tokenizer.Close()
-
-	// Fail fast if the cl100k_base BPE table is missing. NumTokensFromString /
-	// TrimContentToTokenLimit now panic rather than degrading silently, so this
-	// trades a mid-request panic for a clear startup failure.
-	if err := tokenizer.InitCL100KEncoder(); err != nil {
-		common.Fatal("Failed to initialize cl100k_base tokenizer", zap.Error(err))
-	}
+func Run(ctx context.Context, cancel context.CancelFunc, args *bootstrap.ServerArgs, services *bootstrap.AgentServices) error {
+	globalConfig := server.GetConfig()
 	logTokenizerCounters()
 
 	// The dataset-level post-processing consumer cluster (§11) is owned and run by
@@ -138,42 +70,41 @@ func Run(ctx context.Context, cancel context.CancelFunc, serverName string, args
 	// provisioning error is logged by the Ingestor and the pipeline still
 	// writes available_int=0 compiled chunks; they just won't be merged until
 	// the consumer is available.
-	globalConfig := server.GetConfig()
 	ingestorCfg := globalConfig.GetIngestorConfig()
-	// Resolve the ingestor worker count (K) from CLI > env > config > default(1)
+	// Resolve the ingestor worker count (K) from env > config > default(1)
 	// and fail fast on an out-of-range value.
-	workers, err := resolveIngestorMaxConcurrentWorkers(args, ingestorCfg.MaxConcurrentWorkers)
+	workers, err := globalConfig.GetIngestorConcurrentWorkers()
+	if err != nil {
+		return err
+	}
+	// Resolve the ingestor tier (which lanes this ingestor consumes) from
+	// CLI > env > default(low), failing fast on an invalid value.
+	tier, err := globalConfig.GetIngestorTier(args.IngestorTier)
 	if err != nil {
 		return err
 	}
 	// Apply the configured compiler pool size (no-op when 0; the pool keeps its
 	// vCPU default, overridable via KC_COMPILE_CONCURRENCY).
 	knowledge_compile.SetCompilerConcurrency(ingestorCfg.CompilerPoolSize)
-	ingestor := ingestion.NewIngestor(*args.Name, int32(workers), []string{"pdf", "docx", "txt"})
+	ingestorDeps := &ingestioncore.Deps{
+		Engine: engine.Get(),
+		DB:     dao.DB,
+		MQ:     engine.GetMessageQueueEngine(),
+		KV:     kvrocks.Get(),
+	}
+	// Fail fast at the assembly point: a misconfigured ingestor (missing doc
+	// engine, database, message queue, or Kvrocks) must never reach Start as a "healthy"
+	// service that silently cannot consume.
+	if err = ingestorDeps.Validate(); err != nil {
+		common.Error("Invalid ingestor dependencies", err)
+		return fmt.Errorf("ingestor dependencies invalid: %w", err)
+	}
+	ingestor := ingestion.NewIngestor(*args.Name, int32(workers), tier, ingestorDeps)
 	ingestor.SetKnowledgeCompileModelConfig(
 		globalConfig.GetDefaultChatModel().Name,
 		globalConfig.GetDefaultEmbeddingModel().Name,
 	)
-	// The dataset-level knowledge-compile consumer (tree/structure products) upserts
-	// into the dataset-nav tree, so the Ingestor must install the same ES-backed
-	// NavService the API server installs. Without this, nav.GetNavService() returns
-	// nil and tree/structure products are dropped (the consumer logs "nav service
-	// unavailable, skipping dataset-nav upsert"), leaving the dataset tree empty.
-	// The embedder resolves the tenant's embedding model on demand, so both
-	// Search and UpsertDoc can embed queries/summaries automatically.
-	navService := nlp.NewNavService(service.NewNavEmbedder(service.NewModelFactory(), ""))
-	// The cluster namer/merger is the counterpart of Python's
-	// _llm_create_summary / _llm_merge: a new cluster is named after the model's
-	// topic title and an existing cluster's description is fused with the joining
-	// document. Passing an empty model ref resolves each tenant's default chat
-	// model on demand; without one the nav service keeps its deterministic
-	// behavior.
-	navService.SetNavMergeLLM(service.NewNavMergeLLM(service.NewModelFactory(), ""))
-	nav.SetNavService(navService)
-	// Memory extraction runs on the Ingestor's shared NATS consumer + worker
-	// pool (task_type="memory" dispatched by handleAndExecute -> executeMemoryTask),
-	// so there is no longer a dedicated Redis memory consumer to start.
-	ingestor.SetMemoryMessageService(service.NewMemoryMessageService(service.NewMemoryService()))
+	ingestor.SetMemoryMessageService(service.NewMemoryMessageService(services.MemoryService))
 
 	// Start returns immediately (it launches the owned consume/compile
 	// goroutines and joins them via Stop); a provisioning failure here must
@@ -184,18 +115,17 @@ func Run(ctx context.Context, cancel context.CancelFunc, serverName string, args
 		return err
 	}
 
-	common.Info("\n    ____                      __  _\n" +
-		"   /  _/___  ____ ____  _____/ /_(_)___  ____     ________  ______   _____  _____\n" +
-		"   / // __ \\/ __ `/ _ \\/ ___/ __/ / __ \\/ __ \\   / ___/ _ \\/ ___/ | / / _ \\/ ___/\n" +
-		" _/ // / / / /_/ /  __(__  ) /_/ / /_/ / / / /  (__  )  __/ /   | |/ /  __/ /\n" +
-		"/___/_/ /_/\\__, /\\___/____/\\__/_/\\____/_/ /_/  /____/\\___/_/    |___/\\___/_/\n" +
-		"          /____/\n")
+	if common.GetRAGFlowType() == common.EnterpriseEdition {
+		common.Info("\n    ____                      __  _\n" +
+			"   /  _/___  ____ ____  _____/ /_(_)___  ____     ________  ______   _____  _____\n" +
+			"   / // __ \\/ __ `/ _ \\/ ___/ __/ / __ \\/ __ \\   / ___/ _ \\/ ___/ | / / _ \\/ ___/\n" +
+			" _/ // / / / /_/ /  __(__  ) /_/ / /_/ / / / /  (__  )  __/ /   | |/ /  __/ /\n" +
+			"/___/_/ /_/\\__, /\\___/____/\\__/_/\\____/_/ /_/  /____/\\___/_/    |___/\\___/_/\n" +
+			"          /____/\n")
+	}
 
 	// Print RAGFlow version
 	common.Info(fmt.Sprintf("RAGFlow ingestion service version: %s", common.GetRAGFlowVersion()))
-
-	// Set log level
-	bootstrap.SetLogger(serverName, args)
 
 	// Start heartbeat reporter to admin server
 	if hb := bootstrap.StartHeartbeat(
@@ -204,7 +134,16 @@ func Run(ctx context.Context, cancel context.CancelFunc, serverName string, args
 		0,
 		globalConfig.GetHeartbeatInterval(),
 	); hb != nil {
+		defer hb.Wait()
 		defer hb.Stop()
+	}
+
+	var readyErr error
+	if args.Ready != nil {
+		readyErr = args.Ready()
+		if readyErr != nil {
+			cancel()
+		}
 	}
 
 	// Wait for either an OS shutdown signal or a shutdown command from the admin
@@ -218,12 +157,12 @@ func Run(ctx context.Context, cancel context.CancelFunc, serverName string, args
 	}
 
 	// Create context with timeout for graceful shutdown
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancel()
 
 	ingestor.Stop(shutdownCtx)
 
 	common.Info(fmt.Sprintf("Ingestor %s shutdown complete", *args.Name))
 
-	return nil
+	return readyErr
 }

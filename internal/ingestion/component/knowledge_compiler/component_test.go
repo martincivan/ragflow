@@ -153,7 +153,7 @@ func firstWords(s string, n int) string {
 func installProseDeps(t *testing.T) {
 	t.Helper()
 	common.SetDepsResolver(func(_ context.Context, tenantID, llmID, embeddingModel string) (common.Deps, error) {
-		return common.Deps{Chat: proseChat{}, Embed: mockEmbedder{dim: 8}, TenantID: tenantID}, nil
+		return common.Deps{Chat: proseChat{}, Embed: mockEmbedder{dim: 8}, TenantID: tenantID, ModelContextLen: common.DefaultLLMContextLength}, nil
 	})
 	t.Cleanup(func() { common.SetDepsResolver(nil) })
 }
@@ -458,6 +458,7 @@ func installStrictScopeWikiDeps(t *testing.T, store *strictScopeWikiMapVersions)
 			Embed:           mockEmbedder{dim: 8},
 			WikiMapVersions: store,
 			TenantID:        tenantID,
+			ModelContextLen: common.DefaultLLMContextLength,
 		}, nil
 	})
 	t.Cleanup(func() { common.SetDepsResolver(nil) })
@@ -791,9 +792,10 @@ func TestKnowledgeCompiler_Tree_DegenerateNoInfiniteLoop(t *testing.T) {
 func TestKnowledgeCompiler_Wiki_HistoricalDedupDropsDuplicates(t *testing.T) {
 	common.SetDepsResolver(func(_ context.Context, tenantID, llmID, embeddingModel string) (common.Deps, error) {
 		return common.Deps{
-			Chat:     proseChat{},
-			Embed:    constEmbedder{dim: 8, vec: []float32{1, 0, 0, 0, 0, 0, 0, 0}},
-			TenantID: tenantID,
+			ModelContextLen: common.DefaultLLMContextLength,
+			Chat:            proseChat{},
+			Embed:           constEmbedder{dim: 8, vec: []float32{1, 0, 0, 0, 0, 0, 0, 0}},
+			TenantID:        tenantID,
 		}, nil
 	})
 	t.Cleanup(func() { common.SetDepsResolver(nil) })
@@ -839,9 +841,10 @@ func TestKnowledgeCompiler_Wiki_HistoricalDedupDropsDuplicates(t *testing.T) {
 func TestKnowledgeCompiler_Wiki_UpdateMergesExistingPage(t *testing.T) {
 	common.SetDepsResolver(func(_ context.Context, tenantID, llmID, embeddingModel string) (common.Deps, error) {
 		return common.Deps{
-			Chat:     wikiUpdateChat{},
-			Embed:    mockEmbedder{dim: 8},
-			TenantID: tenantID,
+			ModelContextLen: common.DefaultLLMContextLength,
+			Chat:            wikiUpdateChat{},
+			Embed:           mockEmbedder{dim: 8},
+			TenantID:        tenantID,
 			WikiPages: wikiStoreTestStub{page: &common.WikiPageCandidate{
 				ID:           "existing-1",
 				Slug:         "entity/person/alpha",
@@ -930,10 +933,11 @@ func TestKnowledgeCompiler_Wiki_HistoricalDedupScopedByDataset(t *testing.T) {
 	knn := &fakeHistoricalKNN{hit: true} // every product is a near-dup -> dropped
 	common.SetDepsResolver(func(_ context.Context, tenantID, llmID, embeddingModel string) (common.Deps, error) {
 		return common.Deps{
-			Chat:          proseChat{},
-			Embed:         constEmbedder{dim: 8, vec: []float32{1, 0, 0, 0, 0, 0, 0, 0}},
-			TenantID:      tenantID,
-			HistoricalKNN: knn,
+			ModelContextLen: common.DefaultLLMContextLength,
+			Chat:            proseChat{},
+			Embed:           constEmbedder{dim: 8, vec: []float32{1, 0, 0, 0, 0, 0, 0, 0}},
+			TenantID:        tenantID,
+			HistoricalKNN:   knn,
 		}, nil
 	})
 	t.Cleanup(func() { common.SetDepsResolver(nil) })
@@ -1415,7 +1419,7 @@ func TestOverlayTemplateConfigPlanPrecedence(t *testing.T) {
 
 // TestKnowledgeCompiler_BuildInputsAcceptsMapSliceChunks locks the chunk-carrier
 // contract: the upstream chunker hands chunks over as []map[string]any (see the
-// chunk map shape {"id","text","ck_type","doc_type_kwd","tk_nums"} observed from
+// chunk map shape {"id","text","doc_type_kwd","tk_nums"} observed from
 // the running pipeline), not as []any of map. buildInputs must accept both
 // shapes; a strict []any assertion alone would silently drop every chunk and
 // leave the knowledge compiler with empty input (compiling nothing yet still
@@ -1423,8 +1427,8 @@ func TestOverlayTemplateConfigPlanPrecedence(t *testing.T) {
 func TestKnowledgeCompiler_BuildInputsAcceptsMapSliceChunks(t *testing.T) {
 	in, err := buildInputs(map[string]any{
 		"chunks": []map[string]any{
-			{"id": "c1", "text": "《三国演义》", "ck_type": "text"},
-			{"id": "c2", "text": "滚滚长江东逝水", "ck_type": "text"},
+			{"id": "c1", "text": "《三国演义》"},
+			{"id": "c2", "text": "滚滚长江东逝水"},
 		},
 	}, common.Param{})
 	if err != nil {

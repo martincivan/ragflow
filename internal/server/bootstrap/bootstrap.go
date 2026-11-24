@@ -20,30 +20,33 @@
 // makes the naming rules unit-testable without booting any subsystem.
 package bootstrap
 
-import "fmt"
+import (
+	"fmt"
+	"ragflow/internal/common"
+)
 
 // TempServerName returns the placeholder server name used for the temporary,
 // stdout-only logger that exists before the configuration is loaded. An
-// explicit --name (non-nil pointer) wins; otherwise the name is
+// explicit configured name (non-nil pointer) wins; otherwise the name is
 // "<mode>_server".
 //
 // This is intentionally distinct from ResolveServerName: the final name for
 // api/admin additionally embeds the resolved HTTP port, which is only known
 // after the configuration is initialized.
-func TempServerName(mode string, nameFlag *string) string {
+func TempServerName(serverType common.ServerType, nameFlag *string) string {
 	if nameFlag != nil {
 		return *nameFlag
 	}
-	return mode + "_server"
+	return string(serverType) + "_server"
 }
 
 // ResolveServerName derives the final server name for a mode, preserving the
 // precedence and per-mode rules that cmd/ragflow_server.go previously inlined:
 //
-//   - An explicit --name (non-nil pointer, including an empty string) always
+//   - An explicit configured name (non-nil pointer, including an empty string) always
 //     wins.
 //   - api/admin embed the resolved HTTP port: "<mode>_server_<port>".
-//   - ingestor/syncer/deepdoc fall back to the "<mode>_server" placeholder
+//   - ingestor/syncer/chatter/deepdoc fall back to the "<mode>_server" placeholder
 //     (the port is not part of their name).
 //   - migrate uses the fixed literal "migrate".
 //
@@ -56,7 +59,7 @@ func ResolveServerName(mode string, nameFlag *string, port int) (string, error) 
 			return *nameFlag, nil
 		}
 		return fmt.Sprintf("%s_server_%d", mode, port), nil
-	case "ingestor", "syncer", "deepdoc":
+	case "ingestor", "syncer", "chatter", "deepdoc":
 		if nameFlag != nil {
 			return *nameFlag, nil
 		}
@@ -68,5 +71,26 @@ func ResolveServerName(mode string, nameFlag *string, port int) (string, error) 
 		return "migrate", nil
 	default:
 		return "", fmt.Errorf("unsupported server mode %q", mode)
+	}
+}
+
+func GetServerType(args *ServerArgs) common.ServerType {
+	switch *args.Mode {
+	case "api":
+		return common.ServerTypeAPI
+	case "admin":
+		return common.ServerTypeAdmin
+	case "ingestor":
+		return common.ServerTypeIngestion
+	case "syncer":
+		return common.ServerTypeFileSyncer
+	case "chatter":
+		return common.ServerTypeChatter
+	case "deepdoc":
+		return common.ServerTypeDeepDocCPU
+	case "migrate":
+		return common.ServerTypeMigrate
+	default:
+		return common.ServerTypeUnknown
 	}
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
@@ -30,15 +31,19 @@ type datasetPagerankUpdate struct {
 	datasetID string
 }
 
-func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID string, req service.UpdateDatasetRequest) (map[string]interface{}, common.ErrorCode, error) {
+func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID string, req service.UpdateDatasetRequest) (map[string]interface{}, common.ErrorCode, error) {
 	datasetID = strings.TrimSpace(datasetID)
-	userID = strings.TrimSpace(userID)
-	if _, err := d.kbDAO.GetByID(ctx, dao.DB, datasetID); err != nil {
+	userID := strings.TrimSpace(permission.UserIDFromContext(ctx))
+	// The row read here also feeds the embedding-switch guard below, which
+	// costs an engine round trip and a provider call: it has to run before the
+	// transaction opens rather than under the row lock.
+	kb, err := d.kbDAO.GetByID(ctx, dao.DB, datasetID)
+	if err != nil {
 		if dao.IsNotFoundErr(err) {
 			code, permissionErr := permissionresponse.NormalizeHidden(permission.ErrResourceNotFound)
 			return nil, code, permissionErr
 		}
-		return nil, common.CodeServerError, errors.New("database operation failed")
+		return nil, common.CodeServerError, fmt.Errorf("database operation failed: %w", err)
 	}
 
 	connectorsProvided := req.Connectors != nil
@@ -68,8 +73,8 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 		if name == "" {
 			return nil, common.CodeDataError, errors.New("String should have at least 1 character")
 		}
-		if len(name) > 128 {
-			return nil, common.CodeDataError, errors.New("String should have at most 128 characters")
+		if utf8.RuneCountInString(name) > entity.DatasetNameLimit {
+			return nil, common.CodeDataError, fmt.Errorf("String should have at most %d characters", entity.DatasetNameLimit)
 		}
 		simpleUpdates["name"] = name
 	}
@@ -139,6 +144,27 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 		return nil, common.CodeDataError, err
 	}
 
+	// A switch to a model with a different dimension leaves every stored vector
+	// in a column retrieval no longer queries. The console refuses it before
+	// submitting; repeat the dimension half of that check here so an API client
+	// cannot skip it. Authorize first: a caller who may not update the dataset
+	// must neither trigger engine and provider work nor learn the dataset's
+	// vector dimension from the rejection. The update is authorized again under
+	// the row lock, which stays the authority.
+	if embdIDProvided && embeddingSwitchNeedsCheck(kb, embdID) {
+		if accessErr := permission.NewDatabaseChecker(dao.DB).CheckResource(
+			ctx,
+			permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID},
+			permission.OperationUpdate,
+		); accessErr != nil {
+			code, permissionErr := permissionresponse.NormalizeHidden(accessErr)
+			return nil, code, permissionErr
+		}
+		if code, switchErr := d.validateEmbeddingSwitch(ctx, kb, embdID); switchErr != nil {
+			return nil, code, switchErr
+		}
+	}
+
 	if req.ParserConfig != nil {
 		dropped, err := ValidateParserConfig(req.ParserConfig)
 		if len(dropped) > 0 {
@@ -160,7 +186,10 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 	pagerankRequested := req.Pagerank != nil
 	if pagerankRequested {
 		requestedPagerank = *req.Pagerank
-		if *req.Pagerank < 0 || *req.Pagerank > 100 {
+		if *req.Pagerank < 0 {
+			return nil, common.CodeDataError, errors.New("input should be greater than or equal to 0")
+		}
+		if *req.Pagerank > 100 {
 			return nil, common.CodeDataError, errors.New("input should be less than or equal to 100")
 		}
 		if d.docEngine == nil {
@@ -169,7 +198,7 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 	}
 
 	requestedAnyUpdate := len(simpleUpdates) > 0 || connectorsProvided || parserIDProvided ||
-		pipelineID != nil || embdIDProvided || pagerankRequested || req.ParserConfig != nil || req.ParserConfigProvided
+		pipelineID != nil || embdIDProvided || pagerankRequested || req.ParserConfig != nil || req.ParserConfigProvided || req.PipelineVersionID != nil
 	if !requestedAnyUpdate {
 		return nil, common.CodeDataError, errors.New("no properties were modified")
 	}
@@ -180,7 +209,7 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 	var scheduledTaskIDs []string
 	var pagerankUpdate *datasetPagerankUpdate
 	err = dao.DB.Transaction(func(tx *gorm.DB) error {
-		lockedKB, code, authErr := d.lockAccessibleDatasetForUpdate(ctx, tx, datasetID, userID)
+		lockedKB, code, authErr := d.lockAccessibleDatasetForUpdate(ctx, tx, datasetID)
 		if authErr != nil {
 			txCode = code
 			return authErr
@@ -196,7 +225,6 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 			if isPipeline && effectivePipelineID != nil && strings.TrimSpace(*effectivePipelineID) != "" {
 				accessErr := permission.NewLockingDatabaseChecker(tx).CheckDependency(
 					ctx,
-					permission.Subject{UserID: userID, TenantID: lockedKB.TenantID},
 					permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: lockedKB.ID},
 					permission.ResourceRef{Kind: permission.ResourceKindCanvas, ID: strings.TrimSpace(*effectivePipelineID)},
 					permission.OperationUpdate,
@@ -217,7 +245,6 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 			if permissionValue != lockedKB.Permission {
 				accessErr := permission.NewLockingDatabaseChecker(tx).CheckResource(
 					ctx,
-					permission.Subject{UserID: userID},
 					permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID},
 					permission.OperationShare,
 				)
@@ -245,11 +272,23 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 			})
 			if nameErr != nil {
 				txCode = common.CodeServerError
-				return errors.New("database operation failed")
+				return fmt.Errorf("database operation failed: %w", nameErr)
 			}
 			if !available {
 				txCode = common.CodeDataError
 				return fmt.Errorf("Dataset name '%s' already exists", nameValue)
+			}
+			if nameValue != lockedKB.Name {
+				code, renameErr := renameDatasetFolder(ctx, tx, lockedKB, nameValue)
+				if renameErr != nil {
+					txCode = code
+					if code == common.CodeServerError {
+						common.Warn("dataset folder rename failed",
+							zap.String("dataset_id", lockedKB.ID), zap.Error(renameErr))
+						return fmt.Errorf("database operation failed: %w", renameErr)
+					}
+					return renameErr
+				}
 			}
 		}
 
@@ -267,14 +306,15 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 			} else {
 				tenantEmbdID = ""
 			}
-			modelAccess := service.ModelAccess{UserID: userID, TenantID: lockedKB.TenantID}
-			ok, message := d.verifyEmbeddingAvailability(ctx, effectiveEmbdID, modelAccess)
+			// Resolve the model in the dataset tenant without changing the caller.
+			modelCtx := permission.WithIdentity(ctx, permission.UserIDFromContext(ctx), lockedKB.TenantID)
+			ok, message := d.verifyEmbeddingAvailability(modelCtx, effectiveEmbdID, lockedKB.TenantID)
 			if !ok {
 				txCode = common.CodeDataError
 				return errors.New(message)
 			}
 			if effectiveEmbdID != "" && tenantEmbdID == "" {
-				target, err := service.NewModelFactory().ResolveInfo(ctx, modelAccess, entity.ModelTypeEmbedding, effectiveEmbdID)
+				target, err := service.NewModelFactory().ResolveInfo(modelCtx, entity.ModelTypeEmbedding, effectiveEmbdID)
 				if err == nil {
 					tenantEmbdID = target.ID
 				}
@@ -283,7 +323,44 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 			updates["tenant_embd_id"] = stringPtrIfNotEmpty(tenantEmbdID)
 		}
 
-		if req.ParserConfig != nil && len(req.ParserConfig) > 0 {
+		// Design §5 fallback chains (v5.1/v5.2): when the request omits a field,
+		// fall back to the persisted (locked) binding rather than resetting to
+		// latest/nil. This is what makes the sticky snapshot (B4), the pinned-DSL
+		// parser_config rebuild (B1), and single-field PATCH (B2) correct.
+		canvasCtx := pipelineID
+		if canvasCtx == nil {
+			canvasCtx = lockedKB.PipelineID
+		}
+		pipelineChanged := pipelineID != nil && (lockedKB.PipelineID == nil || *pipelineID != *lockedKB.PipelineID)
+		requestedVersion := req.PipelineVersionID
+		if requestedVersion == nil && !pipelineChanged {
+			requestedVersion = lockedKB.PipelineVersionID
+		}
+
+		// A save that does not touch parsing must not rewrite parser_config. The
+		// settings form submits its whole parser_config on every save, and the
+		// form's own round trip re-serialises it (retired params dropped, current
+		// defaults filled in), so "parser_config was sent" is not evidence that the
+		// user edited it: rebuilding on presence is what turned a language-only
+		// edit into a parser_config change in the dataset's history. Rebuild only
+		// when the parse selection moves, or when the submitted config is not a
+		// verbatim copy of the stored one.
+		parseSelectionChanged := parserIDProvided && parserID != lockedKB.ParserID
+		// C3 (T26/V5): an explicit, non-empty version that differs from the
+		// currently pinned version is a version switch even when the pipeline
+		// canvas is unchanged. Such a switch must reset the component params to
+		// the new version defaults (below), not only a pipeline_id change.
+		versionChanged := false
+		if req.PipelineVersionID != nil && strings.TrimSpace(*req.PipelineVersionID) != "" {
+			if lockedKB.PipelineVersionID == nil || strings.TrimSpace(*req.PipelineVersionID) != strings.TrimSpace(*lockedKB.PipelineVersionID) {
+				versionChanged = true
+			}
+		}
+		parseSelectionChanged = parseSelectionChanged || pipelineChanged || versionChanged
+		parserConfigSubmitted := req.ParserConfig != nil && len(req.ParserConfig) > 0 &&
+			(parseSelectionChanged || !datasetJSONEqual(req.ParserConfig, lockedKB.ParserConfig))
+
+		if parserConfigSubmitted {
 			// Resolve the effective mode/IDs once. sel is the request selection
 			// (nil when the whole selection block was omitted); current is the
 			// persisted selection. Resolve applies PATCH semantics: an omitted
@@ -295,14 +372,39 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 				return resolveErr
 			}
 			isPipeline, effParserID, effPipelineID := eff.Effective()
-			dslJSON, dslErr := service.LoadPipelineDSL(ctx, isPipeline, effParserID, effPipelineID)
+			// Thread the effective pipeline version (design §5): use the §5 fallback
+			// requestedVersion (explicit pin when supplied, else the persisted
+			// pinned version) so a parser_config-only PATCH (B1) rebuilds from the
+			// pinned DSL rather than the canvas latest. The binding block below
+			// re-resolves the same value (and surfaces any ownership error); a load
+			// failure here is best-effort for parser_config rebuild only.
+			effVersionID, _ := resolvePipelineVersionID(ctx, tx, effPipelineID, requestedVersion)
+			dslJSON, dslErr := service.LoadPipelineDSL(ctx, isPipeline, effParserID, effPipelineID, effVersionID)
 			if dslErr != nil {
 				common.Warn("failed to load pipeline DSL for building parser_config",
 					zap.String("parserID", effParserID), zap.Error(dslErr))
 			}
 			if dslJSON != nil {
-				parserConfig := pipelinepkg.BuildParserConfig(dslJSON, map[string]interface{}(req.ParserConfig))
-				updates["parser_config"] = preserveDatasetParserConfigState(parserConfig, lockedKB.ParserConfig, req.ParserConfig)
+				parserConfig, buildErr := pipelinepkg.BuildParserConfig(dslJSON, map[string]interface{}(req.ParserConfig))
+				if buildErr != nil {
+					txCode = common.CodeDataError
+					return buildErr
+				}
+				rebuilt := preserveDatasetParserConfigState(parserConfig, lockedKB.ParserConfig, req.ParserConfig)
+				// The rebuild lands on the state the dataset already holds when the
+				// submission described the same settings in another shape: the form
+				// re-serialises the whole parser_config on every save, and its round
+				// trip drops retired params and fills in the current defaults. Only a
+				// rebuilt state that differs from the stored one is a change, so a
+				// save that edits something else cannot rewrite - and version - the
+				// parsing settings the user never touched.
+				//
+				// The comparison is against the current state, not the history: a
+				// configuration that also appears in an older version and differs
+				// from the head is still a change, and is recorded as one.
+				if !datasetJSONEqual(rebuilt, lockedKB.ParserConfig) {
+					updates["parser_config"] = rebuilt
+				}
 			}
 		}
 		if pagerankRequested && requestedPagerank != lockedKB.Pagerank {
@@ -319,7 +421,7 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 		}
 		if parserIDProvided && parserID != lockedKB.ParserID {
 			if _, ok := updates["parser_config"]; !ok {
-				if resolved, cpErr := service.ResolveComponentParamsDefaults(ctx, parserID, nil); cpErr != nil {
+				if resolved, cpErr := service.ResolveComponentParamsDefaults(ctx, parserID, nil, nil); cpErr != nil {
 					common.Warn("failed to resolve component params defaults on parser_id switch",
 						zap.String("parserID", parserID), zap.Error(cpErr))
 				} else if resolved != nil {
@@ -333,17 +435,61 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 			}
 		}
 
-		pipelineChanged := pipelineID != nil && (lockedKB.PipelineID == nil || *pipelineID != *lockedKB.PipelineID)
-		if _, ok := updates["parser_config"]; pipelineChanged && !ok {
-			cfgParserID := lockedKB.ParserID
-			if parserIDProvided {
-				cfgParserID = parserID
+		// pipelineChanged and versionChanged were computed with the parser_config
+		// decision above: both are "the parse selection moved" signals.
+		// Design C5/G3: an empty pipeline_version_id in Pipeline mode is REJECTED
+		// (no longer silently cleared or auto-backfilled to the canvas latest).
+		// The Save fails with ErrPipelineVersionEmpty so the UI can show the red
+		// Missing badge and the "mission version info" error. BuiltIn mode (no canvas
+		// bound) is exempt and may carry an empty version.
+		isEffPipeline := canvasCtx != nil && strings.TrimSpace(*canvasCtx) != ""
+		if req.PipelineVersionID != nil {
+			if strings.TrimSpace(*req.PipelineVersionID) != "" {
+				bound, perr := resolvePipelineVersionID(ctx, tx, canvasCtx, req.PipelineVersionID)
+				if perr != nil {
+					txCode = common.CodeBadRequest
+					return perr
+				}
+				updates["pipeline_version_id"] = bound
+			} else if isEffPipeline {
+				// Explicit empty version in Pipeline mode: reject (do not clear the
+				// pin). Only BuiltIn-mode explicit empties are allowed to clear.
+				txCode = common.CodeBadRequest
+				return service.ErrPipelineVersionEmpty
+			} else {
+				// BuiltIn mode explicit empty: clear the pin (no canvas to pin to).
+				updates["pipeline_version_id"] = nil
 			}
-			if cpDefaults, cpErr := service.ResolveComponentParamsDefaults(ctx, cfgParserID, pipelineID); cpErr != nil {
-				common.Warn("failed to resolve component params defaults on pipeline change",
-					zap.String("parserID", cfgParserID), zap.Error(cpErr))
-			} else if cpDefaults != nil {
-				updates["parser_config"] = preserveDatasetParserConfigState(cpDefaults, lockedKB.ParserConfig, req.ParserConfig)
+		} else if pipelineChanged && pipelineID != nil && strings.TrimSpace(*pipelineID) != "" {
+			// Switching to a Pipeline canvas without an explicit version is a
+			// missing-version Save (design C5/G3): reject rather than silently
+			// locking the new canvas's latest version.
+			txCode = common.CodeBadRequest
+			return service.ErrPipelineVersionEmpty
+		}
+		// C3 / A3: a pipeline (canvas) switch or a version switch resets
+		// parser_config to the new DSL defaults — but only when the request
+		// carried no parser_config of its own. A submitted config has already
+		// been reconciled against the new version's DSL by BuildParserConfig
+		// above (unknown operators dropped, missing params defaulted), and the
+		// settings form itself resets to the new defaults on a switch before
+		// the user edits — so a submitted config is authoritative and must not
+		// be discarded.
+		if pipelineChanged || versionChanged {
+			if _, submitted := updates["parser_config"]; !submitted {
+				cfgParserID := lockedKB.ParserID
+				if parserIDProvided {
+					cfgParserID = parserID
+				}
+				effVersionID, _ := resolvePipelineVersionID(ctx, tx, canvasCtx, requestedVersion)
+				cpDefaults, cpErr := service.ResolveComponentParamsDefaults(ctx, cfgParserID, canvasCtx, effVersionID)
+				if cpErr != nil {
+					common.Warn("failed to resolve component params defaults on pipeline/version change",
+						zap.String("parserID", cfgParserID), zap.Error(cpErr))
+				}
+				if cpErr == nil {
+					updates["parser_config"] = cpDefaults
+				}
 			}
 		}
 
@@ -353,14 +499,31 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 		}
 		if effectiveParserConfig != nil {
 			llmID := ""
-			if ownerTenant, tenantErr := d.tenantDAO.GetByID(ctx, tx, lockedKB.TenantID); tenantErr == nil && ownerTenant != nil {
-				llmID = ownerTenant.LLMID
+			var membership entity.UserTenant
+			if tenantErr := tx.Where("user_id = ? AND tenant_id = ? AND status = ?", userID, lockedKB.TenantID, entity.TenantMembershipStatusJoined).Take(&membership).Error; tenantErr == nil {
+				llmID = membership.LLMID
+				if membership.TenantLLMID != nil && strings.TrimSpace(*membership.TenantLLMID) != "" {
+					llmID = strings.TrimSpace(*membership.TenantLLMID)
+				}
 			}
 			effectiveParserConfig = service.ApplyComponentScopedParserConfig(
 				effectiveParserConfig,
 				llmID,
 			)
-			updates["parser_config"] = effectiveParserConfig
+			// Scoping the config rewrites the submitted shape a second time: it
+			// replaces every Extractor's metadata with the dataset-level one and
+			// drops the legacy flat keys. A state that differed from the stored one
+			// before this step can therefore land back on it here, and a state
+			// copied from the stored config (the embedding-only path above) starts
+			// out equal. Compare once more and leave the column alone when the
+			// result is the state it already holds: an unchanged configuration must
+			// not be rewritten, because the write is also the only thing a version
+			// could record for a save the user made elsewhere on the form.
+			if datasetJSONEqual(effectiveParserConfig, lockedKB.ParserConfig) {
+				delete(updates, "parser_config")
+			} else {
+				updates["parser_config"] = effectiveParserConfig
+			}
 		}
 
 		if len(updates) > 0 {
@@ -374,11 +537,21 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 					return errors.New("dataset name already exists")
 				}
 				txCode = common.CodeServerError
-				return errors.New("dataset update error. (database error)")
+				return fmt.Errorf("dataset update error. (database error): %w", err)
 			}
 		}
 
+		// A relink overwrites the bindings the version writer has to record as
+		// the state this change replaced, so read them first. Only a request that
+		// touches the bindings needs it; any other change leaves the table alone,
+		// and the writer reads it there.
+		var previousBindings []entity.JSONMap
 		if connectorsProvided {
+			previousBindings, err = d.datasetConfigBindingsEE(ctx, tx, lockedKB)
+			if err != nil {
+				txCode = common.CodeServerError
+				return errors.New("database operation failed")
+			}
 			scheduledTaskIDs, err = d.connectorDAO.LinkDatasetConnectorsTx(ctx, tx, lockedKB.ID, lockedKB.TenantID, connectorLinks)
 			if err != nil {
 				if dao.IsConnectorNotAccessibleErr(err) {
@@ -386,20 +559,32 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 					return err
 				}
 				txCode = common.CodeServerError
-				return errors.New("database operation failed")
+				return fmt.Errorf("database operation failed: %w", err)
 			}
 		}
 
 		updatedKB = &entity.Knowledgebase{}
 		if err = tx.Where("id = ? AND status = ?", lockedKB.ID, string(entity.StatusValid)).First(updatedKB).Error; err != nil {
 			txCode = common.CodeDataError
-			return errors.New("dataset updated failed")
+			return fmt.Errorf("dataset updated failed: %w", err)
+		}
+
+		// Version the change: the row the transaction locked is the state it
+		// started from (version 0 is seeded from it when the dataset has no
+		// history yet) and updatedKB is the state it produced. A failure fails the
+		// whole update, because a committed configuration change without a version
+		// would be invisible to the history.
+		if len(updates) > 0 || connectorsProvided {
+			if _, versionErr := d.recordDatasetConfigVersionTxEE(ctx, tx, lockedKB, updatedKB, previousBindings, entity.DatasetVersionKindDatasetConfig, userID, 0); versionErr != nil {
+				txCode = common.CodeServerError
+				return versionErr
+			}
 		}
 
 		linkedConnectors, err = d.connectorDAO.ListByDatasetIDTx(ctx, tx, lockedKB.ID)
 		if err != nil {
 			txCode = common.CodeServerError
-			return errors.New("database operation failed")
+			return fmt.Errorf("database operation failed: %w", err)
 		}
 
 		return nil
@@ -418,9 +603,70 @@ func (d *DatasetService) UpdateDataset(ctx context.Context, datasetID, userID st
 		}
 	}
 
-	data := datasetToMap(updatedKB)
+	data := datasetToMap(ctx, updatedKB)
 	data["connectors"] = datasetConnectorsOrEmpty(linkedConnectors)
 	return data, common.CodeSuccess, nil
+}
+
+// renameDatasetFolder updates an existing dataset folder in the caller's
+// transaction. Datasets without a folder do not create one during a rename.
+func renameDatasetFolder(ctx context.Context, tx *gorm.DB, kb *entity.Knowledgebase, newName string) (common.ErrorCode, error) {
+	var root entity.File
+	err := tx.WithContext(ctx).
+		Where("tenant_id = ? AND parent_id = id AND type = ?", kb.TenantID, "folder").
+		Take(&root).Error
+	if dao.IsNotFoundErr(err) {
+		return common.CodeSuccess, nil
+	}
+	if err != nil {
+		return common.CodeServerError, err
+	}
+
+	var kbRoot entity.File
+	err = tx.WithContext(ctx).
+		Where("tenant_id = ? AND parent_id = ? AND name = ?",
+			kb.TenantID, root.ID, dao.DatasetFolderName).
+		Take(&kbRoot).Error
+	if dao.IsNotFoundErr(err) {
+		return common.CodeSuccess, nil
+	}
+	if err != nil {
+		return common.CodeServerError, err
+	}
+	if kbRoot.Type != "folder" {
+		return common.CodeDataError, errors.New("Knowledgebase root is not a folder")
+	}
+	fileDAO := dao.NewFileDAO()
+
+	entries := func() *gorm.DB {
+		return tx.WithContext(ctx).Model(&entity.File{}).
+			Where("tenant_id = ? AND parent_id = ?", kb.TenantID, kbRoot.ID)
+	}
+	var original entity.File
+	// Uploads reuse entries by tenant, parent and name, regardless of source.
+	err = entries().Where("name = ?", kb.Name).
+		Take(&original).Error
+	if err != nil && !dao.IsNotFoundErr(err) {
+		return common.CodeServerError, err
+	}
+	if original.ID != "" && original.Type != "folder" {
+		return common.CodeDataError, errors.New("Dataset path is not a folder")
+	}
+
+	exists, err := fileDAO.NameExists(ctx, tx, newName, kbRoot.ID, kb.TenantID, original.ID)
+	if err != nil {
+		return common.CodeServerError, err
+	}
+	if exists {
+		return common.CodeDataError, fmt.Errorf("Dataset folder name '%s' already exists", newName)
+	}
+	if original.ID == "" {
+		return common.CodeSuccess, nil
+	}
+	if err = entries().Where("id = ? AND type = ?", original.ID, "folder").Update("name", newName).Error; err != nil {
+		return common.CodeServerError, err
+	}
+	return common.CodeSuccess, nil
 }
 
 func (d *DatasetService) updateDatasetPagerankChunks(ctx context.Context, update datasetPagerankUpdate) error {
@@ -463,7 +709,7 @@ func publishDatasetSyncerTasks(taskIDs []string) {
 	}
 }
 
-func (d *DatasetService) lockAccessibleDatasetForUpdate(ctx context.Context, tx *gorm.DB, datasetID, userID string) (*entity.Knowledgebase, common.ErrorCode, error) {
+func (d *DatasetService) lockAccessibleDatasetForUpdate(ctx context.Context, tx *gorm.DB, datasetID string) (*entity.Knowledgebase, common.ErrorCode, error) {
 	var kb entity.Knowledgebase
 	err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 		Where("id = ? AND status = ?", datasetID, string(entity.StatusValid)).
@@ -473,12 +719,11 @@ func (d *DatasetService) lockAccessibleDatasetForUpdate(ctx context.Context, tx 
 			code, permissionErr := permissionresponse.NormalizeHidden(permission.ErrResourceNotFound)
 			return nil, code, permissionErr
 		}
-		return nil, common.CodeServerError, errors.New("database operation failed")
+		return nil, common.CodeServerError, fmt.Errorf("database operation failed: %w", err)
 	}
 
 	err = permission.NewLockingDatabaseChecker(tx).CheckResource(
 		ctx,
-		permission.Subject{UserID: userID},
 		permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID},
 		permission.OperationUpdate,
 	)

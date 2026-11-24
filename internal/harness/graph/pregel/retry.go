@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"ragflow/internal/common"
 	"ragflow/internal/harness/graph/errors"
 	"ragflow/internal/harness/graph/types"
 )
@@ -145,7 +146,7 @@ var RetryPredicates = struct {
 			"504", // Gateway Timeout
 		}
 		for _, kw := range networkKeywords {
-			if contains(errMsg, kw) {
+			if common.ContainsFold(errMsg, kw) {
 				return true
 			}
 		}
@@ -166,41 +167,12 @@ var RetryPredicates = struct {
 			"429", // Too Many Requests
 		}
 		for _, kw := range tempKeywords {
-			if contains(errMsg, kw) {
+			if common.ContainsFold(errMsg, kw) {
 				return true
 			}
 		}
 		return false
 	},
-}
-
-// contains checks if a string contains a substring (case-insensitive).
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) &&
-		(s == substr ||
-			len(s) > len(substr) &&
-				(s[0:len(substr)] == substr ||
-					containsIgnoreCase(s, substr)))
-}
-
-// containsIgnoreCase performs case-insensitive substring check.
-func containsIgnoreCase(s, substr string) bool {
-	s = toLower(s)
-	substr = toLower(substr)
-	return len(s) >= len(substr) && s[:len(substr)] == substr
-}
-
-// toLower converts a string to lowercase.
-func toLower(s string) string {
-	result := make([]byte, len(s))
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c >= 'A' && c <= 'Z' {
-			c += 'a' - 'A'
-		}
-		result[i] = c
-	}
-	return string(result)
 }
 
 // RetryConfig provides configuration for retry behavior.

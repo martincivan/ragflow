@@ -66,6 +66,84 @@ func TestCanvasState_MarshalUnmarshalJSON(t *testing.T) {
 	}
 }
 
+func TestCanvasState_RestoreKeepsExactLargeIntegerToolIDs(t *testing.T) {
+	t.Parallel()
+
+	// The Querit tool returns JSON numbers, including IDs larger than int64.
+	// After an interrupt, downstream nodes must see the same numeric IDs.
+	const largeID = json.Number("11099848653006015581")
+	const negativeID = json.Number("-9007199254740993")
+	src := NewCanvasState("run-1", "session-1")
+	src.SetVar("search_0", "result", map[string]any{
+		"records": []any{map[string]any{"id": largeID}, map[string]any{"id": negativeID}},
+		"count":   2,
+		"score":   0.25,
+	})
+	wire, err := json.Marshal(src)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var dst CanvasState
+	if err := json.Unmarshal(wire, &dst); err != nil {
+		t.Fatal(err)
+	}
+	result, err := dst.GetVar("search_0@result")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := result.(map[string]any)
+	records := got["records"].([]any)
+	for i, want := range []json.Number{largeID, negativeID} {
+		if id := records[i].(map[string]any)["id"]; id != want {
+			t.Errorf("record %d ID = %v (%T), want %s (json.Number)", i, id, id, want)
+		}
+	}
+	if got["count"] != float64(2) || got["score"] != float64(0.25) {
+		t.Errorf("ordinary restored numbers changed type or value: count=%v (%T), score=%v (%T)",
+			got["count"], got["count"], got["score"], got["score"])
+	}
+}
+
+func TestCanvasState_RestoreNumberTypesAtSafeIntegerBoundary(t *testing.T) {
+	t.Parallel()
+
+	var state CanvasState
+	// Raw JSON also covers old checkpoint payloads and both typed slice fields.
+	const wire = `{"history":[{"values":[9007199254740991,-9007199254740991,9007199254740992,-9007199254740992]}],"memory":[{"values":[1.25,1e3]}]}`
+	if err := json.Unmarshal([]byte(wire), &state); err != nil {
+		t.Fatal(err)
+	}
+	checks := []struct {
+		got  []any
+		want []any
+	}{
+		{state.History[0]["values"].([]any), []any{float64(9007199254740991), float64(-9007199254740991), json.Number("9007199254740992"), json.Number("-9007199254740992")}},
+		{state.Memory[0]["values"].([]any), []any{float64(1.25), float64(1000)}},
+	}
+	for _, check := range checks {
+		for i, want := range check.want {
+			if got := check.got[i]; got != want {
+				t.Errorf("value %d = %v (%T), want %v (%T)", i, got, got, want, want)
+			}
+		}
+	}
+}
+
+func TestCanvasState_RestoreRejectsInvalidPayloadWithoutChangingState(t *testing.T) {
+	t.Parallel()
+
+	for _, wire := range []string{`{"run_id":"new","env":{"overflow":1e400}}`, `{"run_id":"new"} {}`} {
+		state := NewCanvasState("old", "session")
+		state.SetEnv("kept", "value")
+		if err := state.UnmarshalJSON([]byte(wire)); err == nil {
+			t.Fatalf("UnmarshalJSON accepted %s", wire)
+		}
+		if state.RunID != "old" || state.Env["kept"] != "value" {
+			t.Fatalf("invalid checkpoint changed state: run=%q, env=%#v", state.RunID, state.Env)
+		}
+	}
+}
+
 func TestCanvasState_UnmarshalInitializesMutableState(t *testing.T) {
 	t.Parallel()
 
@@ -419,6 +497,79 @@ func TestCanvasState_SetRetrievalReferencesMergesCalls(t *testing.T) {
 	}
 	if _, ok := docAggs[""]; ok {
 		t.Error("doc_aggs retained an empty document name")
+	}
+}
+
+// TestCanvasState_SetRetrievalReferencesKeepsSameTitleDifferentIDs covers two
+// search hits that share a title but point at different URLs. Keying doc_aggs
+// by document name would drop the second source; the chunk and its doc_agg must
+// both survive so the citation card can resolve the document.
+func TestCanvasState_SetRetrievalReferencesKeepsSameTitleDifferentIDs(t *testing.T) {
+	t.Parallel()
+
+	state := NewCanvasState("run-1", "task-1")
+	state.SetRetrievalReferences(
+		[]map[string]any{{"id": "chunk-1", "document_id": "doc-1"}},
+		[]map[string]any{{"doc_name": "Same Title", "doc_id": "doc-1", "url": "https://a.example", "count": 1}},
+	)
+	state.SetRetrievalReferences(
+		[]map[string]any{{"id": "chunk-2", "document_id": "doc-2"}},
+		[]map[string]any{{"doc_name": "Same Title", "doc_id": "doc-2", "url": "https://b.example", "count": 1}},
+	)
+	// A repeated id keeps the first aggregate, preserving the previous
+	// first-writer-wins behavior.
+	state.SetRetrievalReferences(nil, []map[string]any{
+		{"doc_name": "Same Title", "doc_id": "doc-1", "url": "https://duplicate.example", "count": 9},
+	})
+
+	docAggs := state.GetRetrievalDocAggs()
+	if len(docAggs) != 2 {
+		t.Fatalf("doc_aggs length = %d, want 2", len(docAggs))
+	}
+	if got := docAggs["doc-1"]["url"]; got != "https://a.example" {
+		t.Errorf("doc-1 url = %v, want the first aggregate", got)
+	}
+	if got := docAggs["doc-2"]["url"]; got != "https://b.example" {
+		t.Errorf("doc-2 url = %v, want the second aggregate", got)
+	}
+
+	reference := state.GetRetrievalReference()
+	list, _ := reference["doc_aggs"].([]any)
+	if len(list) != 2 {
+		t.Fatalf("reference doc_aggs length = %d, want 2", len(list))
+	}
+	// Same document name sorts by document id, so doc-1 precedes doc-2.
+	for i, want := range []string{"doc-1", "doc-2"} {
+		agg, _ := list[i].(map[string]any)
+		if got := agg["doc_id"]; got != want {
+			t.Errorf("doc_aggs[%d].doc_id = %v, want %s", i, got, want)
+		}
+	}
+}
+
+// TestCanvasState_SetRetrievalReferencesDedupesLegacyCheckpointKeys covers a
+// checkpoint restored from the previous storage scheme, where doc_aggs were
+// keyed by document name. Merging by the aggregate's fields must not append a
+// second copy of the same document.
+func TestCanvasState_SetRetrievalReferencesDedupesLegacyCheckpointKeys(t *testing.T) {
+	t.Parallel()
+
+	state := NewCanvasState("run-1", "task-1")
+	state.Retrieval["doc_aggs"] = map[string]any{
+		"Same Title": map[string]any{
+			"doc_name": "Same Title",
+			"doc_id":   "doc-1",
+			"url":      "https://a.example",
+		},
+	}
+	state.SetRetrievalReferences(nil, []map[string]any{
+		{"doc_name": "Same Title", "doc_id": "doc-1", "url": "https://duplicate.example"},
+	})
+
+	reference := state.GetRetrievalReference()
+	list, _ := reference["doc_aggs"].([]any)
+	if len(list) != 1 {
+		t.Fatalf("reference doc_aggs length = %d, want 1 after legacy merge", len(list))
 	}
 }
 

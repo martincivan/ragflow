@@ -28,24 +28,36 @@ import (
 	"fmt"
 	"strings"
 
-	"ragflow/internal/common"
+	agentruntime "ragflow/internal/agent/runtime"
 	"ragflow/internal/ingestion/component/progress"
 	"ragflow/internal/ingestion/component/schema"
 	"ragflow/internal/parser/parser"
 	"ragflow/internal/utility"
-
-	"go.uber.org/zap"
 )
 
 type parserSetupConfigurer interface {
 	ConfigureFromSetup(setup map[string]any)
 }
 
+// resolveParserFamily maps an already-selected parser type to its setup key.
+// A type name must not be reinterpreted as another filename extension.
 func resolveParserFamily(fileType utility.FileType) string {
-	if family := pythonFamilyName(string(fileType)); family != "" {
-		return family
+	switch fileType {
+	case utility.FileTypePPT, utility.FileTypePPTX:
+		return "slides"
+	case utility.FileTypeXLS, utility.FileTypeXLSX, utility.FileTypeCSV:
+		return "spreadsheet"
+	case utility.FileTypeMarkdown:
+		return "markdown"
+	case utility.FileTypeTXT:
+		return "text&code"
+	case utility.FileTypeVISUAL:
+		return "image"
+	case utility.FileTypeAURAL:
+		return "audio"
+	default:
+		return string(fileType)
 	}
-	return string(fileType)
 }
 
 func configureParserFromSetups(p any, fileType utility.FileType, setups map[string]schema.ParserSetup) {
@@ -61,12 +73,12 @@ func configureParserFromSetups(p any, fileType utility.FileType, setups map[stri
 	cfg.ConfigureFromSetup(map[string]any(setup))
 }
 
-// dispatchParse resolves the parser for the given fileType and invokes
-// its structured ParseWithResult contract.
+// dispatchParse configures the selected parser and invokes its structured
+// ParseWithResult contract using the effective file type.
 //
 // The function NEVER returns a partial result. On error the result
-// is the zero value (OutputFormat == "" + Err != nil). Callers can
-// detect the success/failure boundary on the OutputFormat alone.
+// is the zero value (Err != nil, no JSON and no File). Callers detect the
+// success/failure boundary with ParseResult.Produced().
 //
 // fileType may be utility.FileTypeOTHER when the upstream did not
 // supply a filename; the dispatch then takes text-page mode
@@ -75,9 +87,9 @@ func configureParserFromSetups(p any, fileType utility.FileType, setups map[stri
 // `parse_method` is captured from setups so callers can tell the
 // difference between "explicit OCR" and "default DeepDOC" without
 // re-reading setups. lib_type is no longer threaded through: the
-// Python dispatcher picks a single backend per family and the Go
+// dispatcher picks a single backend per family and the Go
 // constructors mirror that.
-func dispatchParse(ctx context.Context, fileType utility.FileType, filename string, data []byte, setups map[string]schema.ParserSetup, window progress.Window) parser.ParseResult {
+func dispatchParse(ctx context.Context, p parser.ParseResultProducer, fileType utility.FileType, filename string, data []byte, setups map[string]schema.ParserSetup, window progress.Window) parser.ParseResult {
 	if fileType == utility.FileTypeOTHER {
 		// Unknown / unset family. The component treats the bytes
 		// as text pages; splitIntoPages handles it. We return no
@@ -92,12 +104,15 @@ func dispatchParse(ctx context.Context, fileType utility.FileType, filename stri
 		}
 	}
 
-	p, err := parser.GetParser(fileType)
-	if err != nil {
-		return parser.ParseResult{Err: fmt.Errorf("parser: resolve %q: %w", fileType, err)}
-	}
 	configureParserFromSetups(p, fileType, setups)
 	attachPDFPageProgress(ctx, p, window)
+	var finishParserIO func()
+	if method := strings.ToLower(strings.TrimSpace(parseMethod)); method != "" && method != "deepdoc" && method != "plain_text" {
+		finishParserIO = agentruntime.TrackIO(ctx, "Parser", "remote parser", "backend="+method)
+	} else {
+		finishParserIO = func() {}
+	}
+	defer finishParserIO()
 
 	res := p.ParseWithResult(ctx, filename, data)
 	if res.Err != nil {
@@ -115,8 +130,12 @@ func dispatchParse(ctx context.Context, fileType utility.FileType, filename stri
 }
 
 // pdfPageProgressSupported reports whether the configured parser setup produces
-// in-flight page progress events (via DeepDOC OnPageDone). Remote engines
-// (MinerU, PaddleOCR, Docling, etc.) and non-PDF families do not report page progress.
+// in-flight page progress events (via DeepDOC OnPageDone). The in-process
+// "deepdoc"/default method and externally registered DeepDoc analyzer backends
+// all run the per-page worker loop and fire the callback; whole-document engines
+// (MinerU, PaddleOCR, Docling, ...) and non-PDF families do not. The decision is
+// delegated to the parser package so the set of page-reporting backends has a
+// single source of truth and this shared file never hard-codes method names.
 func pdfPageProgressSupported(fileType utility.FileType, setups map[string]schema.ParserSetup) bool {
 	if fileType != utility.FileTypePDF {
 		return false
@@ -124,15 +143,10 @@ func pdfPageProgressSupported(fileType utility.FileType, setups map[string]schem
 	var method string
 	if setup, ok := setups[resolveParserFamily(fileType)]; ok {
 		if s, ok := setup["parse_method"].(string); ok {
-			method = strings.ToLower(strings.TrimSpace(s))
+			method = s
 		}
 	}
-	switch method {
-	case "", "deepdoc":
-		return true
-	default:
-		return false
-	}
+	return parser.ReportsPageProgress(method)
 }
 
 // attachPDFPageProgress wires the DeepDOC page callback so a long PDF
@@ -142,7 +156,13 @@ func pdfPageProgressSupported(fileType utility.FileType, setups map[string]schem
 // the fraction stays at zero.
 func attachPDFPageProgress(ctx context.Context, p parser.ParseResultProducer, window progress.Window) {
 	pdfParser, ok := p.(*parser.PDFParser)
-	if !ok || window.Span <= 0 {
+	if !ok {
+		return
+	}
+	pdfParser.OnModelCall = func(callCtx context.Context, operation string) func() {
+		return agentruntime.TrackIO(callCtx, "DeepDOC", operation, "file_type=pdf")
+	}
+	if window.Span <= 0 {
 		return
 	}
 	pdfParser.OnPageDone = func(done, total int) {
@@ -150,6 +170,9 @@ func attachPDFPageProgress(ctx context.Context, p parser.ParseResultProducer, wi
 			return
 		}
 		window.Report(ctx, float64(done)/float64(total))
+		// Report the discrete page position alongside the fraction so the
+		// ingestion log can answer "which page of how many" (finding ③).
+		agentruntime.ReportProgressDetail(ctx, "page", uint32(done), uint32(total))
 	}
 }
 
@@ -162,13 +185,15 @@ func attachPDFPageProgress(ctx context.Context, p parser.ParseResultProducer, wi
 //
 //  1. inputs["file_type"] — explicit family hint from the upstream
 //     File component. We accept either the extension ("md", "docx")
-//     or the python family name ("markdown"); both are normalized
-//     to the extension form via the pythonFamilyName / familyToExt
-//     lookup tables below.
-//  2. inputs["name"] — the resolved source filename.
-//  3. inputs["file"].name — fallback for callers that only supply a
-//     file descriptor.
-//  4. utility.FileTypeOTHER — text-page mode.
+//
+// or the family name ("markdown"); both are normalized
+//
+//	   to the extension form via utility.GetFileType / familyToExt
+//	   lookup tables below.
+//	2. inputs["name"] — the resolved source filename.
+//	3. inputs["file"].name — fallback for callers that only supply a
+//	   file descriptor.
+//	4. utility.FileTypeOTHER — text-page mode.
 //
 // The function never errors; unknown / absent filenames degrade to
 // FileTypeOTHER so the component's raw-text branch picks them up.
@@ -190,10 +215,10 @@ func fileTypeFromInputs(inputs map[string]any) utility.FileType {
 		if ft := utility.GetFileType("x." + lower); ft != utility.FileTypeOTHER {
 			return ft
 		}
-		// Family-name lookup catches python-side family identifiers
+		// Family-name lookup catches family identifiers
 		// ("slides", "spreadsheet", "text&code") that aren't valid
 		// file extensions.
-		if ft := familyToExt(pythonFamilyName(lower)); ft != utility.FileTypeOTHER {
+		if ft := familyToExt(lower); ft != utility.FileTypeOTHER {
 			return ft
 		}
 	}
@@ -208,9 +233,8 @@ func fileTypeFromInputs(inputs map[string]any) utility.FileType {
 	return utility.FileTypeOTHER
 }
 
-// familyToExt maps the python family name back to the utility
-// extension form. Returns FileTypeOTHER for families whose parser
-// isn't yet wired (audio, video, image, email, epub, …).
+// familyToExt maps a setup family hint to its parser type. Unknown hints
+// return FileTypeOTHER.
 func familyToExt(family string) utility.FileType {
 	switch family {
 	case "pdf":
@@ -219,7 +243,7 @@ func familyToExt(family string) utility.FileType {
 		return utility.FileTypeDOC
 	case "docx":
 		return utility.FileTypeDOCX
-	case "slides":
+	case "slides", "pages":
 		return utility.FileTypePPTX
 	case "spreadsheet":
 		return utility.FileTypeXLSX
@@ -239,7 +263,7 @@ func familyToExt(family string) utility.FileType {
 		return utility.FileTypeVIDEO
 	case "email":
 		return utility.FileTypeEMAIL
-	case "audio":
+	case "audio", "aural":
 		return utility.FileTypeAURAL
 	case "picture", "image", "visual":
 		return utility.FileTypeVISUAL
@@ -247,58 +271,21 @@ func familyToExt(family string) utility.FileType {
 	return utility.FileTypeOTHER
 }
 
-// pythonFamilyName normalises a free-form file-type hint to the
-// Python family identifier used by ParserComponent setups.
-// Returns "" when the hint is unknown.
-func pythonFamilyName(raw string) string {
-	switch raw {
-	case "pdf":
-		return "pdf"
-	case "doc":
-		return "doc"
-	case "docx":
-		return "docx"
-	case "ppt", "pptx", "slides":
-		return "slides"
-	case "xls", "xlsx", "spreadsheet":
-		return "spreadsheet"
-	case "csv":
-		return "spreadsheet"
-	case "html", "htm":
-		return "html"
-	case "md", "markdown", "mdx":
-		return "markdown"
-	case "epub":
-		return "epub"
-	case "json", "jsonl", "ldjson":
-		return "json"
-	case "text&code", "txt", "py", "js", "java", "c", "cpp", "h", "php",
-		"go", "ts", "sh", "cs", "kt", "sql":
-		return "text&code"
-	case "mp4", "avi", "mkv", "mov", "webm", "flv",
-		"mpeg", "mpg", "wmv", "3gp", "3gpp", "video":
-		return "video"
-	case "eml", "msg", "email":
-		return "email"
-	case "da", "wave", "wav", "mp3", "aac", "flac", "ogg",
-		"aiff", "au", "midi", "wma", "ape", "alac", "wv", "opus", "aural":
-		return "audio"
-	case "visual", "picture", "image",
-		"png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif",
-		"webp", "svg", "ico", "avif", "heic", "apng":
-		return "image"
-	}
-	return ""
-}
-
 // ParserFileFamily normalises a free-form file-type/extension hint to the
-// python-side family identifier used as the key into a Parser component's
+// family identifier used as the key into a Parser component's
 // setups (e.g. "pdf", "docx", "slides", "text&code"). It is the exported
 // entry point for callers outside this package (e.g. the ingestion task
 // executor that injects the debug page cap into override_params) that need
 // to build the canonical ParserConfig[cpnID][family]["pages"] shape.
 func ParserFileFamily(ext string) string {
-	return pythonFamilyName(ext)
+	fileType := utility.GetFileType("file." + ext)
+	if fileType == utility.FileTypeOTHER {
+		fileType = familyToExt(ext)
+	}
+	if fileType == utility.FileTypeOTHER {
+		return ""
+	}
+	return resolveParserFamily(fileType)
 }
 
 // buildParserOutputs assembles the runtime output map from the
@@ -318,7 +305,7 @@ func buildParserOutputs(ctx context.Context, dispatched parser.ParseResult, name
 	if lang != "" {
 		out["lang"] = lang
 	}
-	if dispatched.Err == nil && dispatched.OutputFormat != "" {
+	if dispatched.Produced() {
 		out["output_format"] = "json"
 		// Emit the parser's typed []DocItem directly. The chunker consumes
 		// it via schema.ChunkDocsFromDocItem (no ToMap round-trip); other
@@ -354,21 +341,7 @@ func normalizeParserJSON(ctx context.Context, filename string, dispatched parser
 	if len(dispatched.JSON) > 0 {
 		return dispatched.JSON
 	}
-	if dispatched.Markdown != "" {
-		return parseMarkdownToJSONItems(ctx, filename, dispatched.Markdown)
-	}
-	if dispatched.Text != "" {
-		return []parser.DocItem{parser.NewTextJSONItem(dispatched.Text)}
-	}
 	return []parser.DocItem{}
-}
-
-func warnParserNormalizationFallback(filename, source string, err error) {
-	common.Warn("parser normalization fell back to text",
-		zap.String("filename", filename),
-		zap.String("normalized_from", source),
-		zap.Error(err),
-	)
 }
 
 func parserInputName(inputs map[string]any, docID string) string {

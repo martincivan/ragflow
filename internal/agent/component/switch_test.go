@@ -178,6 +178,121 @@ func TestSwitch_LegacyEndCpnIDsFallback(t *testing.T) {
 	}
 }
 
+// TestSwitch_LegacyEndCpnIDsMultiTargetFallback pins #22314: the
+// "ELSE"/"Other" branch (end_cpn_ids) fans out to every configured
+// target. The matched-condition path returns every "to" target, and
+// the scheduler side (makeSwitchBranchCondition) fires every
+// whitelisted entry of a multi-element _next list.
+func TestSwitch_LegacyEndCpnIDsMultiTargetFallback(t *testing.T) {
+	s, _ := NewSwitchComponent(nil)
+	state := canvas.NewCanvasState("run-else-multi", "task-else-multi")
+	state.Sys["query"] = "nothing matches"
+	ctx := withStateForTest(t.Context(), state)
+
+	inputs := map[string]any{
+		"conditions": []any{
+			map[string]any{
+				"logical_operator": "and",
+				"items": []any{
+					map[string]any{"cpn_id": "sys.query", "operator": "contains", "value": "X"},
+				},
+				"to": []any{"Message:1"},
+			},
+		},
+		"end_cpn_ids": []any{"Retrieval:A", "Retrieval:B"},
+	}
+	out, err := s.Invoke(ctx, nil, inputs)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	targets := nextTargets(out)
+	if len(targets) != 2 || targets[0] != "Retrieval:A" || targets[1] != "Retrieval:B" {
+		t.Errorf("_next: got %v, want [\"Retrieval:A\", \"Retrieval:B\"] (the ELSE branch must route to every end_cpn_ids entry, in order)", targets)
+	}
+}
+
+// TestSwitch_DefaultParamWinsOverEndCpnIDs pins the precedence between
+// the two no-match sources: an explicit "default" cpn_id (v1 DSL) beats
+// the legacy end_cpn_ids list and stays a single target.
+func TestSwitch_DefaultParamWinsOverEndCpnIDs(t *testing.T) {
+	s, _ := NewSwitchComponent(nil)
+	state := canvas.NewCanvasState("run-else-precedence", "task-else-precedence")
+	state.Sys["query"] = "nothing matches"
+	ctx := withStateForTest(t.Context(), state)
+
+	inputs := map[string]any{
+		"conditions": []any{
+			map[string]any{
+				"logical_operator": "and",
+				"items": []any{
+					map[string]any{"cpn_id": "sys.query", "operator": "contains", "value": "X"},
+				},
+				"to": []any{"Message:1"},
+			},
+		},
+		"default":     "explicit_default",
+		"end_cpn_ids": []any{"Retrieval:A", "Retrieval:B"},
+	}
+	out, err := s.Invoke(ctx, nil, inputs)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	targets := nextTargets(out)
+	if len(targets) != 1 || targets[0] != "explicit_default" {
+		t.Errorf("_next: got %v, want [\"explicit_default\"] (explicit default must take precedence over end_cpn_ids)", targets)
+	}
+}
+
+// TestSwitch_LegacyEndCpnIDsStringSliceAndEmptyFallback covers the two
+// remaining shapes of switchDefaultTargets: a []string end_cpn_ids
+// (typed-DSL form) routes to every entry, and a fully-empty
+// configuration keeps the legacy single-empty-string _next shape so
+// the scheduler still sees "no successor" (makeSwitchBranchCondition
+// skips empty entries).
+func TestSwitch_LegacyEndCpnIDsStringSliceAndEmptyFallback(t *testing.T) {
+	state := canvas.NewCanvasState("run-else-shapes", "task-else-shapes")
+	state.Sys["x"] = "no"
+	ctx := withStateForTest(t.Context(), state)
+	conditions := []any{
+		map[string]any{
+			"op": "and",
+			"clauses": []any{
+				map[string]any{"left": "{{sys.x}}", "op": "==", "right": "yes"},
+			},
+		},
+	}
+
+	t.Run("string slice routes to every entry", func(t *testing.T) {
+		s, _ := NewSwitchComponent(map[string]any{
+			"conditions":  conditions,
+			"end_cpn_ids": []string{"Retrieval:A", "Retrieval:B"},
+		})
+		out, err := s.Invoke(ctx, nil, nil)
+		if err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		targets := nextTargets(out)
+		if len(targets) != 2 || targets[0] != "Retrieval:A" || targets[1] != "Retrieval:B" {
+			t.Errorf("_next: got %v, want [\"Retrieval:A\", \"Retrieval:B\"]", targets)
+		}
+	})
+
+	t.Run("all-empty entries keep the legacy no-successor shape", func(t *testing.T) {
+		s, _ := NewSwitchComponent(map[string]any{
+			"conditions":  conditions,
+			"end_cpn_ids": []any{"", ""},
+		})
+		out, err := s.Invoke(ctx, nil, nil)
+		if err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		raw, ok := out["_next"].([]any)
+		if !ok || len(raw) != 1 || raw[0] != "" {
+			t.Errorf("_next: got %v, want [\"\"] (legacy empty shape)", out["_next"])
+		}
+	})
+}
+
 // TestSwitch_ContainsAndEmpty covers two operators that are easy to
 // regress: "contains" (substring match) and "empty" (nil/empty test).
 func TestSwitch_ContainsAndEmpty(t *testing.T) {
@@ -532,6 +647,97 @@ func TestSwitch_LegacyEmptyItemsFallsThrough(t *testing.T) {
 	}
 }
 
+// TestSwitch_LegacyIncompleteItemFallsThrough covers the row the
+// front end's "Add" button creates: it appends `{operator}` and nothing
+// else, so `cpn_id` and `value` are absent until the user fills them in.
+// Python skips such an item (`if not item["cpn_id"]: continue`), leaving
+// the group with no clause, which cannot match. Go appended the clause
+// anyway, and "" compared against "" satisfies contains, "=" and empty,
+// so the run was routed to a branch whose condition was never configured.
+func TestSwitch_LegacyIncompleteItemFallsThrough(t *testing.T) {
+	cases := []struct {
+		name  string
+		item  map[string]any
+		state func(*canvas.CanvasState)
+	}{
+		{
+			name: "contains without value",
+			item: map[string]any{"operator": "contains"},
+		},
+		{
+			name: "equals an empty value",
+			item: map[string]any{"operator": "=", "value": ""},
+		},
+		{
+			name: "empty operator",
+			item: map[string]any{"operator": "empty"},
+		},
+		{
+			name: "not empty operator",
+			item: map[string]any{"operator": "not empty"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _ := NewSwitchComponent(nil)
+			state := canvas.NewCanvasState("run-legacy-incomplete", "task-1")
+			ctx := withStateForTest(t.Context(), state)
+
+			inputs := map[string]any{
+				"conditions": []any{
+					map[string]any{
+						"logical_operator": "and",
+						"items":            []any{tc.item},
+						"to":               []any{"WRONG_TARGET"},
+					},
+				},
+				"default": "DEFAULT",
+			}
+			out, err := s.Invoke(ctx, nil, inputs)
+			if err != nil {
+				t.Fatalf("Invoke: %v", err)
+			}
+			targets := nextTargets(out)
+			if len(targets) != 1 || targets[0] != "DEFAULT" {
+				t.Errorf("an item with no operand reference must not match, got _next = %v, want [\"DEFAULT\"]", targets)
+			}
+		})
+	}
+}
+
+// TestSwitch_IncompleteItemDoesNotDisableSiblingClauses pins that skipping an
+// incomplete row leaves a sibling, fully configured clause in force — the skip
+// must not short-circuit the whole group.
+func TestSwitch_IncompleteItemDoesNotDisableSiblingClauses(t *testing.T) {
+	s, _ := NewSwitchComponent(nil)
+	state := canvas.NewCanvasState("run-legacy-mixed", "task-1")
+	state.Sys["greeting"] = "hello world"
+	ctx := withStateForTest(t.Context(), state)
+
+	inputs := map[string]any{
+		"conditions": []any{
+			map[string]any{
+				"logical_operator": "and",
+				"items": []any{
+					map[string]any{"operator": "contains"},
+					map[string]any{"cpn_id": "sys.greeting", "operator": "contains", "value": "hello"},
+				},
+				"to": []any{"CORRECT_TARGET"},
+			},
+		},
+		"default": "DEFAULT",
+	}
+	out, err := s.Invoke(ctx, nil, inputs)
+	if err != nil {
+		t.Fatalf("Invoke: %v", err)
+	}
+	targets := nextTargets(out)
+	if len(targets) != 1 || targets[0] != "CORRECT_TARGET" {
+		t.Errorf("skipping the incomplete item must leave the real clause in force, got _next = %v", targets)
+	}
+}
+
 // TestSwitch_SatisfiedAndConditionStillRoutes is the negative
 // control: a genuinely satisfied "and" condition MUST still match
 // after the fix. Without this guard, a refactor that breaks the
@@ -570,5 +776,103 @@ func TestSwitch_SatisfiedAndConditionStillRoutes(t *testing.T) {
 	}
 	if !found {
 		t.Errorf("satisfied and-condition must route to CORRECT_TARGET, got %v", targets)
+	}
+}
+
+// TestSwitch_NumericOperatorUnparseableOperandFallsThrough pins #19416: the
+// comparison value comes straight from the condition config and defaults to
+// "" (check() only requires a branch target), so a numeric variable compared
+// with an empty or non-numeric value must be a non-match that falls through
+// to the default — not an error that aborts the canvas run. The == case is
+// already safe via equalFoldValues; the ordered operators are the fix.
+func TestSwitch_NumericOperatorUnparseableOperandFallsThrough(t *testing.T) {
+	cases := []struct {
+		name  string
+		op    string
+		value any
+	}{
+		{name: "empty value", op: ">", value: ""},
+		{name: "text value", op: ">", value: "abc"},
+		{name: "less than empty", op: "<", value: ""},
+		{name: "gte text", op: ">=", value: "high"},
+		{name: "lte nil", op: "<=", value: nil},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, _ := NewSwitchComponent(nil)
+			state := canvas.NewCanvasState("run-num", "task-num")
+			state.Sys["score"] = 5
+			ctx := withStateForTest(t.Context(), state)
+
+			inputs := map[string]any{
+				"conditions": []any{
+					map[string]any{
+						"op": "and",
+						"clauses": []any{
+							map[string]any{"left": "{{sys.score}}", "op": c.op, "right": c.value},
+						},
+						"to": "numeric_target",
+					},
+				},
+				"default": "fallback",
+			}
+			out, err := s.Invoke(ctx, nil, inputs)
+			if err != nil {
+				t.Fatalf("Invoke must not fail on an unparseable comparison value: %v", err)
+			}
+			targets := nextTargets(out)
+			if len(targets) != 1 || targets[0] != "fallback" {
+				t.Errorf("unparseable operand must fall through to the default, got %v", targets)
+			}
+		})
+	}
+}
+
+// TestSwitch_NumericOperatorsStillCompare verifies the ordered operators
+// keep working when both operands parse, so the fall-through change cannot
+// regress the matching path.
+func TestSwitch_NumericOperatorsStillCompare(t *testing.T) {
+	cases := []struct {
+		name  string
+		op    string
+		right any
+		want  bool
+	}{
+		{name: "5 > 3", op: ">", right: 3, want: true},
+		{name: "5 > 9", op: ">", right: 9, want: false},
+		{name: "5 < 9", op: "<", right: 9, want: true},
+		{name: "5 >= 5", op: ">=", right: 5, want: true},
+		{name: "5 <= 4", op: "<=", right: 4, want: false},
+		{name: "numeric string right", op: ">", right: "4", want: true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s, _ := NewSwitchComponent(nil)
+			state := canvas.NewCanvasState("run-num2", "task-num2")
+			state.Sys["score"] = 5
+			ctx := withStateForTest(t.Context(), state)
+
+			inputs := map[string]any{
+				"conditions": []any{
+					map[string]any{
+						"op": "and",
+						"clauses": []any{
+							map[string]any{"left": "{{sys.score}}", "op": c.op, "right": c.right},
+						},
+						"to": "numeric_target",
+					},
+				},
+				"default": "fallback",
+			}
+			out, err := s.Invoke(ctx, nil, inputs)
+			if err != nil {
+				t.Fatalf("Invoke: %v", err)
+			}
+			targets := nextTargets(out)
+			matched := len(targets) == 1 && targets[0] == "numeric_target"
+			if matched != c.want {
+				t.Errorf("5 %s %v: routed %v, want match=%v", c.op, c.right, targets, c.want)
+			}
+		})
 	}
 }

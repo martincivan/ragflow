@@ -3,6 +3,8 @@ import crypto from 'node:crypto';
 import os from 'node:os';
 import path from 'node:path';
 import { mkdir } from 'node:fs/promises';
+import { isAuthorized } from './auth.js';
+import { decodeSessionKey, resolveSessionDir } from './session-path.js';
 
 import makeWASocket, {
   Browsers,
@@ -16,6 +18,9 @@ const PORT = Number.parseInt(process.env.WHATSAPP_GATEWAY_PORT || '3005', 10);
 const HOST = process.env.WHATSAPP_GATEWAY_HOST || '127.0.0.1';
 const AUTH_TOKEN = String(process.env.WHATSAPP_GATEWAY_TOKEN || '').trim();
 const WS_MAGIC = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
+const RETRY_DELAYS = [5, 10, 20, 60, 180, 600, 1800, 3600, 21600, 86400].map(
+  (seconds) => seconds * 1000,
+);
 const DATA_DIR =
   process.env.WHATSAPP_GATEWAY_DATA_DIR ||
   path.join(os.homedir(), '.ragflow', 'whatsapp-gateway');
@@ -97,18 +102,10 @@ function sendWsText(socket, payload) {
   socket.write(buildWsFrame(JSON.stringify(payload)));
 }
 
-function isAuthorized(req) {
-  if (!AUTH_TOKEN) {
-    return true;
-  }
-  const auth = String(req.headers.authorization || '').trim();
-  return auth === `Bearer ${AUTH_TOKEN}`;
-}
-
 class WhatsAppSession {
   constructor(sessionKey) {
     this.sessionKey = sessionKey;
-    this.sessionDir = path.join(DATA_DIR, sessionKey);
+    this.sessionDir = resolveSessionDir(DATA_DIR, sessionKey);
     this.status = 'stopped';
     this.lastError = '';
     this.qrDataUrl = '';
@@ -125,6 +122,7 @@ class WhatsAppSession {
     this.starting = null;
     this.stopping = false;
     this.restartTimer = null;
+    this.retryAttempts = 0;
     this.subscribers = new Set();
   }
 
@@ -246,6 +244,7 @@ class WhatsAppSession {
     }
 
     if (update.connection === 'open') {
+      this.retryAttempts = 0;
       this.status = 'connected';
       this.lastError = '';
       this.connectedAt = now();
@@ -271,12 +270,30 @@ class WhatsAppSession {
       this.broadcast({ type: 'snapshot', data: this.snapshot() });
 
       if (!this.stopping && !loggedOut) {
-        clearTimeout(this.restartTimer);
-        this.restartTimer = setTimeout(() => {
-          void this.start();
-        }, 3000);
+        this._scheduleRestart();
       }
     }
+  }
+
+  _scheduleRestart() {
+    if (this.stopping) {
+      return;
+    }
+    clearTimeout(this.restartTimer);
+    this.restartTimer = setTimeout(() => {
+      this.restartTimer = null;
+      void this.start().catch((error) => {
+        if (this.stopping) {
+          return;
+        }
+        this.status = 'error';
+        this.lastError = error.message || String(error);
+        this.lastSnapshotAt = now();
+        this.broadcast({ type: 'snapshot', data: this.snapshot() });
+        this._scheduleRestart();
+      });
+    }, RETRY_DELAYS[this.retryAttempts]);
+    this.retryAttempts = Math.min(this.retryAttempts + 1, RETRY_DELAYS.length - 1);
   }
 
   async _handleMessagesUpsert(update) {
@@ -343,6 +360,7 @@ class WhatsAppSession {
 
   async stop() {
     this.stopping = true;
+    this.retryAttempts = 0;
     clearTimeout(this.restartTimer);
     this.restartTimer = null;
     const sock = this.sock;
@@ -430,11 +448,14 @@ const server = http.createServer(async (req, res) => {
       return sendError(res, 404, 'not found');
     }
 
-    if (!isAuthorized(req)) {
+    if (!isAuthorized(req, AUTH_TOKEN)) {
       return sendError(res, 401, 'unauthorized');
     }
 
-    const sessionKey = decodeURIComponent(parts[1]);
+    const sessionKey = decodeSessionKey(parts[1]);
+    if (sessionKey === null) {
+      return sendError(res, 400, 'invalid session key');
+    }
 
     if (req.method === 'POST' && parts.length === 3 && parts[2] === 'start') {
       const session = getSession(sessionKey);
@@ -488,11 +509,15 @@ server.on('upgrade', (req, socket) => {
       socket.destroy();
       return;
     }
-    if (!isAuthorized(req)) {
+    if (!isAuthorized(req, AUTH_TOKEN)) {
       socket.destroy();
       return;
     }
-    const sessionKey = decodeURIComponent(parts[1]);
+    const sessionKey = decodeSessionKey(parts[1]);
+    if (sessionKey === null) {
+      socket.destroy();
+      return;
+    }
     const key = req.headers['sec-websocket-key'];
     if (!key) {
       socket.destroy();

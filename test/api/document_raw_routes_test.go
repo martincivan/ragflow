@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"image"
 	"image/color"
 	"image/png"
@@ -144,7 +145,7 @@ func TestRESTDocumentDownloadIntegrity(t *testing.T) {
 			t.Fatalf("document metadata missing uploaded ID %q", id)
 		}
 		missing := restCall(t, TestConfig, http.MethodGet, "/documents/"+TestConfig.InvalidID, nil, nil)
-		if missing.Status != http.StatusNotFound || missing.JSON["error"] != "document not found" {
+		if missing.Status != http.StatusOK || missing.JSON["code"] != float64(404) || missing.JSON["message"] != "document not found" {
 			t.Fatalf("missing document metadata contract=%d %v", missing.Status, missing.JSON)
 		}
 		for _, token := range []string{"", TestConfig.InvalidAPIKey} {
@@ -174,7 +175,7 @@ func TestRESTPrivateDocumentRawRoutes(t *testing.T) {
 			}
 			result := rawRESTCall(t, TestConfig, http.MethodGet, path, nil, "")
 			restCode(t, result, http.StatusOK, 102)
-			if result.JSON["message"] != "Image not found." {
+			if result.JSON["message"] != "Image not found: document image not found" {
 				t.Fatalf("missing image message=%v", result.JSON["message"])
 			}
 		})
@@ -195,7 +196,7 @@ func TestRESTDocumentRawImagesRequireIndexedOwnership(t *testing.T) {
 	} {
 		result := rawRESTCall(t, TestConfig, http.MethodGet, path, nil, "")
 		restCode(t, result, http.StatusOK, 102)
-		if result.JSON["message"] != "Image not found." {
+		if result.JSON["message"] != "Image not found: document image not found" {
 			t.Fatalf("unindexed image message=%v", result.JSON["message"])
 		}
 	}
@@ -216,9 +217,14 @@ func TestRESTDocumentIndexedImageIntegrity(t *testing.T) {
 		"image_base64": base64.StdEncoding.EncodeToString(file.Content),
 	}, nil))["data"])
 	chunk := object(t, data["chunk"])
+	// An image ID names its object storage key: "<dataset id>-<chunk id>-<content
+	// hash>". The key is content addressed so a later picture never overwrites the
+	// object an older chunk version still refers to (see chunkImageObjectKey).
+	sum := sha256.Sum256(file.Content)
+	wantImageID := datasetID + "-" + chunk["id"].(string) + "-" + hex.EncodeToString(sum[:8])
 	imageID, ok := chunk["image_id"].(string)
-	if !ok || imageID != datasetID+"-"+chunk["id"].(string) {
-		t.Fatalf("chunk image ID=%v", chunk["image_id"])
+	if !ok || imageID != wantImageID {
+		t.Fatalf("chunk image ID=%v want=%s", chunk["image_id"], wantImageID)
 	}
 	paths := []string{"/documents/images/" + imageID, "/documents/" + id + "/images/" + imageID}
 	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
@@ -234,7 +240,7 @@ func TestRESTDocumentIndexedImageIntegrity(t *testing.T) {
 			break
 		}
 		restCode(t, result, http.StatusOK, 102)
-		if result.JSON["message"] != "Image not found." {
+		if result.JSON["message"] != "Image not found: document image not found" {
 			t.Fatalf("unexpected image response=%v", result.JSON)
 		}
 		select {
@@ -264,7 +270,7 @@ func TestRESTDocumentIndexedImageIntegrity(t *testing.T) {
 	}
 	result := rawRESTCall(t, TestConfig, http.MethodGet, "/documents/"+otherID+"/images/"+imageID, nil, "")
 	restCode(t, result, http.StatusOK, 102)
-	if result.JSON["message"] != "Image not found." {
+	if result.JSON["message"] != "Image not found: document image not found" {
 		t.Fatalf("foreign document image response=%v", result.JSON)
 	}
 }

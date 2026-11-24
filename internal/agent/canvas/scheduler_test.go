@@ -1,7 +1,24 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 // Package canvas — scheduler unit tests.
 package canvas
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -23,7 +40,7 @@ func TestBuildWorkflow_3NodeLinear(t *testing.T) {
 				Upstream:   []string{"begin_0"},
 			},
 			"message_0": {
-				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{}},
+				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{"text": "answer"}},
 				Downstream: []string{},
 				Upstream:   []string{"llm_0"},
 			},
@@ -110,7 +127,7 @@ func TestBuildWorkflow_5NodeDiamond(t *testing.T) {
 				Upstream:   []string{"a_0"},
 			},
 			"d_0": {
-				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{}},
+				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{"text": "answer"}},
 				Downstream: []string{},
 				Upstream:   []string{"b_0", "c_0"},
 			},
@@ -144,7 +161,7 @@ func TestBuildWorkflow_DuplicateUpstreamSucceeds(t *testing.T) {
 				Upstream:   []string{"begin_0"},
 			},
 			"message_0": {
-				Obj:      CanvasComponentObj{ComponentName: "Message", Params: map[string]any{}},
+				Obj:      CanvasComponentObj{ComponentName: "Message", Params: map[string]any{"text": "answer"}},
 				Upstream: []string{"categorize_0", "categorize_0"},
 			},
 		},
@@ -177,12 +194,12 @@ func TestBuildWorkflow_MultiTerminalSucceeds(t *testing.T) {
 				Upstream:   []string{"begin_0"},
 			},
 			"b_0": {
-				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{}},
+				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{"text": "answer a"}},
 				Downstream: []string{},
 				Upstream:   []string{"a_0"},
 			},
 			"c_0": {
-				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{}},
+				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{"text": "answer b"}},
 				Downstream: []string{},
 				Upstream:   []string{"a_0"},
 			},
@@ -278,7 +295,7 @@ func TestBuildWorkflow_ErrorsOnUnknownUpstream(t *testing.T) {
 				Upstream:   []string{},
 			},
 			"message_0": {
-				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{}},
+				Obj:        CanvasComponentObj{ComponentName: "Message", Params: map[string]any{"text": "answer"}},
 				Downstream: []string{},
 				Upstream:   []string{"unknown_0"}, // <-- bad
 			},
@@ -311,6 +328,45 @@ func TestBuildWorkflow_ErrorsOnSelfEdge(t *testing.T) {
 	if !strings.Contains(err.Error(), "self-edge") {
 		t.Fatalf("expected 'self-edge' in error, got: %v", err)
 	}
+}
+
+func TestNodeLifecycleSkipsSerializationWithoutEventChannel(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		meta *RunMeta
+	}{
+		{name: "no run metadata"},
+		{name: "no event channel", meta: &RunMeta{}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var ctx context.Context = t.Context()
+			if tt.meta != nil {
+				ctx = WithRunMeta(ctx, tt.meta)
+			}
+			state := NewCanvasState("run", "session")
+			input := &marshalCounter{}
+			output := &marshalCounter{}
+			nodeStartedAt(ctx, state, "tokenizer", "Tokenizer", "Tokenizer", map[string]any{"chunks": input})
+			state.SetVar("tokenizer", "chunks", output)
+			nodeFinishedNow(ctx, state, "tokenizer", "Tokenizer", "Tokenizer", nil)
+
+			if input.calls != 0 || output.calls != 0 {
+				t.Fatalf("event serialization without a channel: input=%d output=%d", input.calls, output.calls)
+			}
+			if got, err := state.GetVar("tokenizer@chunks"); err != nil || got != output {
+				t.Fatalf("tokenizer output: got %v, %v, want %v", got, err, output)
+			}
+		})
+	}
+}
+
+type marshalCounter struct {
+	calls int
+}
+
+func (c *marshalCounter) MarshalJSON() ([]byte, error) {
+	c.calls++
+	return []byte("null"), nil
 }
 
 func TestNodeLifecycleEventsSafeMarshalNonSerializableInputs(t *testing.T) {

@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 //go:build cgo
 
 package native
@@ -28,6 +44,11 @@ const (
 	recVocab    = 6625
 	recMaxBatch = 1
 )
+
+// modelFileRec is the recognition model filename. Override seam: a downstream
+// build variant assigns this at init/startup, before any inference runs. Set
+// once, never mutated during serving.
+var modelFileRec = "rec.ort"
 
 // OCRRecResult is the recognized text for one cropped line.
 type OCRRecResult struct {
@@ -116,7 +137,7 @@ func RunOCRRecBatchReal(ctx context.Context, modelDir string, imgs []*Image) ([]
 		copy(batch[i*lineStride:(i+1)*lineStride], b)
 	}
 
-	sess, release, err := getRecSession(ctx, filepath.Join(modelDir, "rec.ort"), "x",
+	sess, release, err := getRecSession(ctx, filepath.Join(modelDir, modelFileRec), "x",
 		[]int64{int64(n), 3, recH, int64(imgW)}, "softmax_11.tmp_0")
 	if err != nil {
 		return nil, err
@@ -157,7 +178,7 @@ func recognizeLine(ctx context.Context, modelDir string, img *Image, maxWhRatio 
 		resizedW = imgW
 	}
 	blob := ocrRecPreprocess(img, resizedW, imgW)
-	sess, release, err := getRecSession(ctx, filepath.Join(modelDir, "rec.ort"), "x",
+	sess, release, err := getRecSession(ctx, filepath.Join(modelDir, modelFileRec), "x",
 		[]int64{recMaxBatch, 3, recH, int64(imgW)}, "softmax_11.tmp_0")
 	if err != nil {
 		return OCRRecResult{}, err
@@ -336,17 +357,9 @@ func (s *recSession) Run(ctx context.Context, input []float32) ([]float32, error
 		return nil, err
 	}
 	defer opts.Destroy()
-	// Cancel an in-flight Run when the context is done. done closes once Run
-	// returns so the watcher exits even on the success path.
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = opts.Terminate()
-		case <-done:
-		}
-	}()
+	// Terminate an in-flight Run on cancellation, and join the watcher before
+	// opts.Destroy() runs (defers are LIFO).
+	defer watchRunOptions(ctx, opts)()
 
 	// Fresh input tensor per Run; freed right after the call. nil output →
 	// onnxruntime allocates the actual-shaped tensor.

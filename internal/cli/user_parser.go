@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package cli
 
 import (
@@ -161,11 +177,37 @@ func (p *Parser) parseAPIListCommands() (*Command, error) {
 		return p.parseAPIListAPIServers()
 	case TokenEnvs:
 		return p.parseAPIListEnvironments()
-	case TokenVars:
-		return p.parseAPIListVariables()
+	case TokenGroups:
+		return p.parseAPIListModelGroups()
+	case TokenFeatures:
+		return p.parseAPIListFeatures()
 	default:
 		return nil, fmt.Errorf("unknown LIST target: %s", p.curToken.Value)
 	}
+}
+
+// LIST GROUPS;
+func (p *Parser) parseAPIListModelGroups() (*Command, error) {
+	cmd := NewCommand("api_list_model_groups")
+	p.nextToken() // consume GROUPS
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+	return cmd, nil
+}
+
+// LIST FEATURES;
+func (p *Parser) parseAPIListFeatures() (*Command, error) {
+	cmd := NewCommand("api_list_features")
+	p.nextToken() // consume FEATURES
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+	return cmd, nil
 }
 
 func (p *Parser) parseAPIListDatasets() (*Command, error) {
@@ -593,19 +635,6 @@ func (p *Parser) parseAPIListEnvironments() (*Command, error) {
 	return cmd, nil
 }
 
-func (p *Parser) parseAPIListVariables() (*Command, error) {
-	p.nextToken() // consume Variables
-
-	cmd := NewCommand("api_list_variables")
-
-	// Semicolon is optional
-	if p.curToken.Type == TokenSemicolon {
-		p.nextToken()
-	}
-
-	return cmd, nil
-}
-
 // endregion LIST commands
 
 // region SHOW commands
@@ -619,8 +648,6 @@ func (p *Parser) parseAPIShowCommands() (*Command, error) {
 		return p.parseAPIShowKey()
 	case TokenCurrent:
 		return p.parseAPIShowCurrent()
-	case TokenVar:
-		return p.parseAPIShowVariable()
 	case TokenProvider:
 		return p.parseAPIShowProviderCommands()
 	case TokenModel:
@@ -639,6 +666,12 @@ func (p *Parser) parseAPIShowCommands() (*Command, error) {
 		return p.parseAPIShowMemory()
 	case TokenConcurrency:
 		return p.parseAPIShowConcurrency()
+	case TokenQuota:
+		return p.parseAPIShowQuota()
+	case TokenGroup:
+		return p.parseAPIShowGroup()
+	case TokenDeploy:
+		return p.parseAPIShowDeploy()
 	default:
 		return nil, fmt.Errorf("unknown SHOW target: %s", p.curToken.Value)
 	}
@@ -672,24 +705,6 @@ func (p *Parser) parseAPIShowCurrent() (*Command, error) {
 		p.nextToken()
 	}
 	return NewCommand("api_show_current"), nil
-}
-
-func (p *Parser) parseAPIShowVariable() (*Command, error) {
-	p.nextToken() // consume VAR
-	varName, err := p.parseQuotedString()
-	if err != nil {
-		return nil, err
-	}
-	p.nextToken()
-
-	cmd := NewCommand("api_show_variable")
-	cmd.Params["var_name"] = varName
-
-	// Semicolon is optional
-	if p.curToken.Type == TokenSemicolon {
-		p.nextToken()
-	}
-	return cmd, nil
 }
 
 // SHOW PROVIDER <name>;
@@ -810,8 +825,14 @@ func (p *Parser) parseAPIShowProviderModel(providerName string) (*Command, error
 }
 
 // SHOW MODEL 'model_name';
+// SHOW MODEL STATS [<time range>] ['<provider>' ['<instance>' ['<model>']]] [BY <dimension>]
 func (p *Parser) parseAPIShowModel() (*Command, error) {
 	p.nextToken() // consume MODEL
+
+	// SHOW MODEL STATS ...
+	if p.curToken.Type == TokenStats {
+		return p.parseAPIShowModelStats()
+	}
 
 	modelName, err := p.parseQuotedString()
 	if err != nil {
@@ -952,7 +973,339 @@ func (p *Parser) parseAPIShowConcurrency() (*Command, error) {
 	return cmd, nil
 }
 
+// SHOW QUOTA
+func (p *Parser) parseAPIShowQuota() (*Command, error) {
+	p.nextToken() // consume QUOTA
+	cmd := NewCommand("api_show_quota")
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	return cmd, nil
+}
+
+// SHOW MODEL STATS [<time range>]
+//
+//	['<provider>' ['<instance>' ['<model>']]]
+//	[BY <dimension>]
+//
+// Time range (optional, defaults to today when omitted):
+//
+//	FROM '<start>' TO '<end>'
+//	DAYS <n>
+//
+// Filters (optional, in order): provider, then instance, then model.
+// Dimension (optional): BY DATE | BY MODEL | BY INSTANCE | BY PROVIDER.
+//
+// Examples:
+//
+//	SHOW MODEL STATS;
+//	SHOW MODEL STATS DAYS 7;
+//	SHOW MODEL STATS FROM '2024-01-01' TO '2024-01-31';
+//	SHOW MODEL STATS DAYS 7 'openai';
+//	SHOW MODEL STATS DAYS 7 'openai' 'prod-instance' 'gpt-4o';
+//	SHOW MODEL STATS DAYS 7 BY DATE;
+//	SHOW MODEL STATS DAYS 30 'openai' 'prod' BY MODEL;
+//	SHOW MODEL STATS FROM '2024-01-01' TO '2024-01-31' 'azure' BY INSTANCE;
+func (p *Parser) parseAPIShowModelStats() (*Command, error) {
+	p.nextToken() // consume STATS
+	cmd := NewCommand("api_show_model_stats")
+
+	// Optional time range. Omitted => backend defaults to today.
+	switch p.curToken.Type {
+	case TokenDays:
+		p.nextToken() // consume DAYS
+		days, err := p.parseNumber()
+		if err != nil {
+			return nil, fmt.Errorf("expected number of days after DAYS: %w", err)
+		}
+		cmd.Params["days"] = days
+		p.nextToken() // consume the integer token
+	case TokenFrom:
+		p.nextToken() // consume FROM
+		start, err := p.parseQuotedString()
+		if err != nil {
+			return nil, fmt.Errorf("expected start date after FROM: %w", err)
+		}
+		p.nextToken() // consume start
+		if p.curToken.Type != TokenTo {
+			return nil, fmt.Errorf("expected TO after FROM start, got %s", p.curToken.Value)
+		}
+		p.nextToken() // consume TO
+		end, err := p.parseQuotedString()
+		if err != nil {
+			return nil, fmt.Errorf("expected end date after TO: %w", err)
+		}
+		p.nextToken() // consume end
+		cmd.Params["start"] = start
+		cmd.Params["end"] = end
+	case TokenSemicolon, TokenEOF:
+		// No time range; nothing to consume here.
+	}
+
+	// Optional filters: provider, then instance, then model (each a quoted string).
+	if p.curToken.Type == TokenQuotedString {
+		provider, err := p.parseQuotedString()
+		if err != nil {
+			return nil, err
+		}
+		p.nextToken() // consume provider
+		cmd.Params["provider"] = provider
+
+		if p.curToken.Type == TokenQuotedString {
+			var instance string
+			instance, err = p.parseQuotedString()
+			if err != nil {
+				return nil, err
+			}
+			p.nextToken() // consume instance
+			cmd.Params["instance"] = instance
+
+			if p.curToken.Type == TokenQuotedString {
+				var model string
+				model, err = p.parseQuotedString()
+				if err != nil {
+					return nil, err
+				}
+				p.nextToken() // consume model
+				cmd.Params["model"] = model
+			}
+		}
+	}
+
+	// Optional grouping dimension: BY DATE | BY MODEL | BY INSTANCE | BY PROVIDER.
+	if p.curToken.Type == TokenBy {
+		p.nextToken() // consume BY
+		switch {
+		case p.curToken.Type == TokenModel:
+			cmd.Params["by"] = "model"
+		case p.curToken.Type == TokenInstance:
+			cmd.Params["by"] = "instance"
+		case p.curToken.Type == TokenProvider:
+			cmd.Params["by"] = "provider"
+		case p.curToken.Type == TokenDate:
+			cmd.Params["by"] = "date"
+		default:
+			return nil, fmt.Errorf("unknown MODEL STATS dimension: %s", p.curToken.Value)
+		}
+		p.nextToken() // consume the dimension token
+	}
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	return cmd, nil
+}
+
+// SHOW GROUP ...
+func (p *Parser) parseAPIShowGroup() (*Command, error) {
+	p.nextToken() // consume GROUP
+
+	if p.curToken.Type == TokenStats {
+		return p.parseAPIShowGroupStats()
+	}
+
+	groupID, err := p.parseQuotedString()
+	if err != nil {
+		return nil, fmt.Errorf("expected group id: %w", err)
+	}
+	p.nextToken() // consume group_id
+
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+	cmd := NewCommand("api_show_model_group")
+	cmd.Params["group_id"] = groupID
+	return cmd, nil
+}
+
+// SHOW GROUP STATS [<time range>]
+//
+//	['<group>' [BY <dimension>]]
+//	[BY <dimension>]
+//
+// Time range (optional, defaults to today when omitted):
+//
+//	FROM '<start>' TO '<end>'
+//	DAYS <n>
+//
+// Optional single group filter: '<group>' (a quoted string).
+// Dimension (optional): BY DATE | BY MODEL | BY GROUP.
+//
+// Examples:
+//
+//	SHOW GROUP STATS;
+//	SHOW GROUP STATS DAYS 7;
+//	SHOW GROUP STATS FROM '2024-01-01' TO '2024-01-31';
+//	SHOW GROUP STATS DAYS 7 'rag-default';
+//	SHOW GROUP STATS DAYS 30 'rag-default' BY DATE;
+//	SHOW GROUP STATS DAYS 30 'rag-default' BY MODEL;
+//	SHOW GROUP STATS DAYS 30 BY DATE;
+//	SHOW GROUP STATS DAYS 30 BY GROUP;
+//	SHOW GROUP STATS DAYS 30 BY MODEL;
+//	SHOW GROUP STATS FROM '2024-01-01' TO '2024-01-31' BY GROUP;
+//	SHOW GROUP STATS FROM '2024-01-01' TO '2024-01-31' 'rag-default' BY DATE;
+func (p *Parser) parseAPIShowGroupStats() (*Command, error) {
+	p.nextToken() // consume STATS
+	cmd := NewCommand("api_show_group_stats")
+
+	// Optional time range. Omitted => backend defaults to today.
+	switch p.curToken.Type {
+	case TokenDays:
+		p.nextToken() // consume DAYS
+		days, err := p.parseNumber()
+		if err != nil {
+			return nil, fmt.Errorf("expected number of days after DAYS: %w", err)
+		}
+		cmd.Params["days"] = days
+		p.nextToken() // consume the integer token
+	case TokenFrom:
+		p.nextToken() // consume FROM
+		start, err := p.parseQuotedString()
+		if err != nil {
+			return nil, fmt.Errorf("expected start date after FROM: %w", err)
+		}
+		p.nextToken() // consume start
+		if p.curToken.Type != TokenTo {
+			return nil, fmt.Errorf("expected TO after FROM start, got %s", p.curToken.Value)
+		}
+		p.nextToken() // consume TO
+		end, err := p.parseQuotedString()
+		if err != nil {
+			return nil, fmt.Errorf("expected end date after TO: %w", err)
+		}
+		p.nextToken() // consume end
+		cmd.Params["start"] = start
+		cmd.Params["end"] = end
+	case TokenSemicolon, TokenEOF:
+		// No time range; nothing to consume here.
+	}
+
+	// Optional single group filter.
+	if p.curToken.Type == TokenQuotedString {
+		group, err := p.parseQuotedString()
+		if err != nil {
+			return nil, err
+		}
+		p.nextToken() // consume group
+		cmd.Params["group"] = group
+	}
+
+	// Optional grouping dimension: BY DATE | BY MODEL | BY GROUP.
+	if p.curToken.Type == TokenBy {
+		p.nextToken() // consume BY
+		switch {
+		case p.curToken.Type == TokenDate:
+			cmd.Params["by"] = "date"
+		case p.curToken.Type == TokenModel:
+			cmd.Params["by"] = "model"
+		case p.curToken.Type == TokenGroup:
+			cmd.Params["by"] = "group"
+		default:
+			return nil, fmt.Errorf("unknown GROUP STATS dimension: %s", p.curToken.Value)
+		}
+		p.nextToken() // consume the dimension token
+	}
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	return cmd, nil
+}
+
+// SHOW DEPLOY
+func (p *Parser) parseAPIShowDeploy() (*Command, error) {
+	p.nextToken() // consume DEPLOY
+	cmd := NewCommand("api_show_deploy")
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	return cmd, nil
+}
+
 // endregion SHOW commands
+
+// ADD 'model@instance@provider' GROUP 'group_id';
+// DELETE 'model@instance@provider' GROUP 'group_id';
+func (p *Parser) parseAPIAddGroupModel() (*Command, error) {
+	modelNameOrID, err := p.parseQuotedString()
+	if err != nil {
+		return nil, fmt.Errorf("expected model identifier in format 'model@instance@provider': %w", err)
+	}
+	p.nextToken() // consume model identifier
+
+	if p.curToken.Type != TokenGroup {
+		return nil, fmt.Errorf("expected GROUP after model identifier, got %s", p.curToken.Value)
+	}
+	p.nextToken() // consume GROUP
+
+	groupID, err := p.parseQuotedString()
+	if err != nil {
+		return nil, fmt.Errorf("expected group id: %w", err)
+	}
+	p.nextToken() // consume group_id
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	cmd := NewCommand("api_add_group_model")
+	if common.IsCompositeModelName(modelNameOrID) {
+		cmd.Params["composite_model_name"] = modelNameOrID
+	} else if common.IsUUID(modelNameOrID) {
+		cmd.Params["model_id"] = modelNameOrID
+	} else {
+		return nil, fmt.Errorf("invalid format of model name or ID: %s", modelNameOrID)
+	}
+	cmd.Params["group_id"] = groupID
+	return cmd, nil
+}
+
+// DELETE 'model@instance@provider' GROUP 'group_id';
+func (p *Parser) parseAPIDeleteGroupModel() (*Command, error) {
+	modelNameOrID, err := p.parseQuotedString()
+	if err != nil {
+		return nil, fmt.Errorf("expected model identifier in format 'model@instance@provider': %w", err)
+	}
+	p.nextToken() // consume model identifier
+
+	if p.curToken.Type != TokenGroup {
+		return nil, fmt.Errorf("expected GROUP after model identifier, got %s", p.curToken.Value)
+	}
+	p.nextToken() // consume GROUP
+
+	groupID, err := p.parseQuotedString()
+	if err != nil {
+		return nil, fmt.Errorf("expected group id: %w", err)
+	}
+	p.nextToken() // consume group_id
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	// Removal is scoped by group and model, so a bare model ID (which cannot be
+	// resolved without a provider/instance) is rejected at parse time.
+	if !common.IsCompositeModelName(modelNameOrID) {
+		return nil, fmt.Errorf("invalid format of model name, expected 'model@instance@provider': %s", modelNameOrID)
+	}
+
+	cmd := NewCommand("api_delete_group_model")
+	cmd.Params["composite_model_name"] = modelNameOrID
+	cmd.Params["group_id"] = groupID
+	return cmd, nil
+}
 
 // region CREATE commands
 
@@ -978,9 +1331,30 @@ func (p *Parser) parseAPICreateCommands() (*Command, error) {
 		return p.parseDevCreateMetadataStore()
 	case TokenProvider:
 		return p.parseAPICreateProviderInstance()
+	case TokenGroup:
+		return p.parseAPIModelCreateGroup()
 	default:
 		return nil, fmt.Errorf("unknown CREATE target: %s", p.curToken.Value)
 	}
+}
+
+// CREATE GROUP 'group_name';
+func (p *Parser) parseAPIModelCreateGroup() (*Command, error) {
+	p.nextToken() // consume GROUP
+	groupName, err := p.parseQuotedString()
+	if err != nil {
+		return nil, err
+	}
+	p.nextToken()
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	cmd := NewCommand("api_create_model_group")
+	cmd.Params["group_name"] = groupName
+	return cmd, nil
 }
 
 // CREATE DATASET 'abc';
@@ -1322,6 +1696,8 @@ func (p *Parser) parseAPIAddCommands() (*Command, error) {
 		return p.parseAddAPIServer()
 	case TokenAdmin:
 		return p.parseAddAdminServer()
+	case TokenQuotedString:
+		return p.parseAPIAddGroupModel()
 	default:
 		return nil, fmt.Errorf("unknown ADD target: %s", p.curToken.Value)
 	}
@@ -1734,6 +2110,10 @@ func (p *Parser) parseAPIDeleteCommands() (*Command, error) {
 		return p.parseAPIDeleteAdminServer()
 	case TokenAPI:
 		return p.parseAPIDeleteAPIServer()
+	case TokenGroup:
+		return p.parseAPIDeleteGroup()
+	case TokenQuotedString:
+		return p.parseAPIDeleteGroupModel()
 	default:
 		return nil, fmt.Errorf("unknown DELETE target: %s", p.curToken.Value)
 	}
@@ -1766,6 +2146,26 @@ func (p *Parser) parseAPIDeleteProvider() (*Command, error) {
 	if p.curToken.Type == TokenSemicolon {
 		p.nextToken()
 	}
+	return cmd, nil
+}
+
+// DELETE GROUP 'group_id';
+func (p *Parser) parseAPIDeleteGroup() (*Command, error) {
+	p.nextToken() // consume GROUP
+
+	groupID, err := p.parseQuotedString()
+	if err != nil {
+		return nil, fmt.Errorf("expected group id: %w", err)
+	}
+	p.nextToken() // consume group_id
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	cmd := NewCommand("api_delete_model_group")
+	cmd.Params["group_id"] = groupID
 	return cmd, nil
 }
 
@@ -1967,8 +2367,6 @@ func (p *Parser) parseAPISetCommands() (*Command, error) {
 	p.nextToken() // consume SET
 
 	switch p.curToken.Type {
-	case TokenVar:
-		return p.parseAPISetVariable()
 	case TokenDefault:
 		return p.parseAPISetDefault()
 	case TokenKey:
@@ -1986,32 +2384,6 @@ func (p *Parser) parseAPISetCommands() (*Command, error) {
 	default:
 		return nil, fmt.Errorf("unknown SET target: %s", p.curToken.Value)
 	}
-}
-
-func (p *Parser) parseAPISetVariable() (*Command, error) {
-	p.nextToken() // consume VAR
-
-	varName, err := p.parseQuotedString()
-	if err != nil {
-		return nil, err
-	}
-	p.nextToken()
-
-	varValue, err := p.parseVariableValue()
-	if err != nil {
-		return nil, err
-	}
-	p.nextToken()
-
-	cmd := NewCommand("api_set_variable")
-	cmd.Params["var_name"] = varName
-	cmd.Params["var_value"] = varValue
-
-	// Semicolon is optional
-	if p.curToken.Type == TokenSemicolon {
-		p.nextToken()
-	}
-	return cmd, nil
 }
 
 func (p *Parser) parseAPISetDefault() (*Command, error) {
@@ -3497,9 +3869,11 @@ func (p *Parser) parseAPICheck() (*Command, error) {
 
 	switch p.curToken.Type {
 	case TokenInstance:
-		return p.parseCheckInstanceCommand()
+		return p.parseAPICheckInstance()
 	case TokenProvider:
-		return p.parseCheckProviderByKeyCommand()
+		return p.parseAPICheckProviderByKey()
+	case TokenLicense:
+		return p.parseAPICheckLicense()
 	default:
 		return nil, fmt.Errorf("expected INSTANCE or PROVIDER after CHECK")
 	}
@@ -3572,7 +3946,7 @@ func (p *Parser) parseUserStopIngestion() (*Command, error) {
 	return cmd, nil
 }
 
-func (p *Parser) parseCheckInstanceCommand() (*Command, error) {
+func (p *Parser) parseAPICheckInstance() (*Command, error) {
 	if p.curToken.Type != TokenInstance {
 		return nil, fmt.Errorf("expected INSTANCE after CHECK")
 	}
@@ -3606,7 +3980,7 @@ func (p *Parser) parseCheckInstanceCommand() (*Command, error) {
 	return cmd, nil
 }
 
-func (p *Parser) parseCheckProviderByKeyCommand() (*Command, error) {
+func (p *Parser) parseAPICheckProviderByKey() (*Command, error) {
 	if p.curToken.Type != TokenProvider {
 		return nil, fmt.Errorf("expected PROVIDER after CHECK")
 	}
@@ -3666,6 +4040,17 @@ func (p *Parser) parseCheckProviderByKeyCommand() (*Command, error) {
 	}
 
 	return cmd, nil
+}
+
+func (p *Parser) parseAPICheckLicense() (*Command, error) {
+	p.nextToken() // consume LICENSE
+
+	// Semicolon is optional
+	if p.curToken.Type == TokenSemicolon {
+		p.nextToken()
+	}
+
+	return NewCommand("api_check_license"), nil
 }
 
 func (p *Parser) parseAPISave() (*Command, error) {

@@ -19,6 +19,7 @@ package admin
 import (
 	"context"
 	"crypto/rand"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
@@ -26,6 +27,8 @@ import (
 	"fmt"
 	"net"
 	"net/url"
+	"os"
+	"path/filepath"
 	"ragflow/internal/agent/sandbox"
 	"ragflow/internal/common"
 	"ragflow/internal/dao"
@@ -38,7 +41,9 @@ import (
 	"ragflow/internal/server"
 	servicepkg "ragflow/internal/service"
 	"ragflow/internal/storage"
+	"ragflow/internal/utility"
 	"regexp"
+	"strings"
 	"time"
 
 	"go.uber.org/zap"
@@ -47,56 +52,56 @@ import (
 
 // Service admin service layer
 type Service struct {
-	userDAO             *dao.UserDAO
-	licenseDAO          *dao.LicenseDAO
-	timeRecordDAO       *dao.TimeRecordDAO
-	systemSettingsDAO   *dao.SystemSettingsDAO
-	tenantDAO           *dao.TenantDAO
-	userTenantDAO       *dao.UserTenantDAO
-	fileDAO             *dao.FileDAO
-	documentDAO         *dao.DocumentDAO
-	taskDAO             *dao.TaskDAO
-	kbDAO               *dao.KnowledgebaseDAO
-	canvasDAO           *dao.UserCanvasDAO
-	chatDAO             *dao.ChatDAO
-	chatSessionDAO      *dao.ChatSessionDAO
-	apiTokenDAO         *dao.APITokenDAO
-	api4ConvDAO         *dao.API4ConversationDAO
-	llmDAO              *dao.LLMDAO
-	ingestionTaskDAO    *dao.IngestionTaskDAO
-	ingestionTaskLogDao *dao.IngestionTaskLogDAO
-	ingestionTaskSvc    *servicepkg.IngestionTaskService
+	userDAO              *dao.UserDAO
+	licenseDAO           *dao.LicenseDAO
+	timeRecordDAO        *dao.TimeRecordDAO
+	systemSettingsDAO    *dao.SystemSettingsDAO
+	tenantDAO            *dao.TenantDAO
+	userTenantDAO        *dao.UserTenantDAO
+	fileDAO              *dao.FileDAO
+	documentDAO          *dao.DocumentDAO
+	taskDAO              *dao.TaskDAO
+	kbDAO                *dao.KnowledgebaseDAO
+	canvasDAO            *dao.UserCanvasDAO
+	chatDAO              *dao.ChatDAO
+	chatSessionDAO       *dao.ChatSessionDAO
+	apiTokenDAO          *dao.APITokenDAO
+	api4ConvDAO          *dao.API4ConversationDAO
+	llmDAO               *dao.LLMDAO
+	ingestionTaskDAO     *dao.IngestionTaskDAO
+	ingestionTaskLogDao  *dao.IngestionTaskLogDAO
+	ingestionTaskSvc     *servicepkg.IngestionTaskService
+	modelProviderService *servicepkg.ModelProviderService
 
 	BillingProductDAO      *dao.BillingProductDAO
 	BillingSubscriptionDAO *dao.BillingSubscriptionDAO
 	MemoryDAO              *dao.MemoryDAO
 	SearchDAO              *dao.SearchDAO
-	deleteEngine           engine.DocEngine
-	deleteStorage          storage.Storage
 }
 
 // NewService create admin service
 func NewService() *Service {
 	return &Service{
-		userDAO:             dao.NewUserDAO(),
-		licenseDAO:          dao.NewLicenseDAO(),
-		timeRecordDAO:       dao.NewTimeRecordDAO(),
-		systemSettingsDAO:   dao.NewSystemSettingsDAO(),
-		tenantDAO:           dao.NewTenantDAO(),
-		userTenantDAO:       dao.NewUserTenantDAO(),
-		fileDAO:             dao.NewFileDAO(),
-		documentDAO:         dao.NewDocumentDAO(),
-		taskDAO:             dao.NewTaskDAO(),
-		kbDAO:               dao.NewKnowledgebaseDAO(),
-		canvasDAO:           dao.NewUserCanvasDAO(),
-		chatDAO:             dao.NewChatDAO(),
-		chatSessionDAO:      dao.NewChatSessionDAO(),
-		apiTokenDAO:         dao.NewAPITokenDAO(),
-		api4ConvDAO:         dao.NewAPI4ConversationDAO(),
-		llmDAO:              dao.NewLLMDAO(),
-		ingestionTaskDAO:    dao.NewIngestionTaskDAO(),
-		ingestionTaskLogDao: dao.NewIngestionTaskLogDAO(),
-		ingestionTaskSvc:    servicepkg.NewIngestionTaskService(),
+		userDAO:              dao.NewUserDAO(),
+		licenseDAO:           dao.NewLicenseDAO(),
+		timeRecordDAO:        dao.NewTimeRecordDAO(),
+		systemSettingsDAO:    dao.NewSystemSettingsDAO(),
+		tenantDAO:            dao.NewTenantDAO(),
+		userTenantDAO:        dao.NewUserTenantDAO(),
+		fileDAO:              dao.NewFileDAO(),
+		documentDAO:          dao.NewDocumentDAO(),
+		taskDAO:              dao.NewTaskDAO(),
+		kbDAO:                dao.NewKnowledgebaseDAO(),
+		canvasDAO:            dao.NewUserCanvasDAO(),
+		chatDAO:              dao.NewChatDAO(),
+		chatSessionDAO:       dao.NewChatSessionDAO(),
+		apiTokenDAO:          dao.NewAPITokenDAO(),
+		api4ConvDAO:          dao.NewAPI4ConversationDAO(),
+		llmDAO:               dao.NewLLMDAO(),
+		ingestionTaskDAO:     dao.NewIngestionTaskDAO(),
+		ingestionTaskLogDao:  dao.NewIngestionTaskLogDAO(),
+		ingestionTaskSvc:     servicepkg.NewIngestionTaskService(),
+		modelProviderService: servicepkg.NewModelProviderService(),
 
 		BillingProductDAO:      dao.NewBillingProductDAO(),
 		BillingSubscriptionDAO: dao.NewBillingSubscriptionDAO(),
@@ -113,19 +118,6 @@ func (s *Service) Logout(ctx context.Context, user interface{}) error {
 		return s.userDAO.UpdateAccessToken(ctx, dao.DB, u, invalidToken)
 	}
 	return nil
-}
-
-// ListIngestionTasks list all ingestion tasks for admin user
-func (s *Service) ListIngestionTasks(ctx context.Context) ([]map[string]interface{}, error) {
-	return s.ingestionTaskSvc.ListAllForAdmin(ctx)
-}
-
-func (s *Service) RemoveIngestionTasks(ctx context.Context, tasks []string) ([]map[string]string, error) {
-	return s.ingestionTaskSvc.RemoveMany(ctx, tasks, nil)
-}
-
-func (s *Service) StopIngestionTasks(ctx context.Context, tasks []string) ([]*entity.IngestionTask, error) {
-	return s.ingestionTaskSvc.RequestStopMany(ctx, tasks, nil)
 }
 
 // GetUserByToken get user by access token
@@ -153,36 +145,17 @@ func generateRandomHex(n int) string {
 	return hex.EncodeToString(bytes)
 }
 
-// ListUsers list all users
-func (s *Service) ListUsers(ctx context.Context, pageIndex, pageSize int, name, status, sort, orderBy string) ([]map[string]interface{}, error) {
-	users, _, err := s.userDAO.List(ctx, dao.DB, (pageIndex-1)*pageSize, pageSize, name, status, sort, orderBy)
-	if err != nil {
-		return nil, err
-	}
-
-	result := make([]map[string]interface{}, 0, len(users))
-	for _, user := range users {
-		result = append(result, map[string]interface{}{
-			"email":        user.Email,
-			"nickname":     user.Nickname,
-			"create_date":  user.CreateTime,
-			"is_active":    user.IsActive,
-			"is_superuser": user.IsSuperuser,
-		})
-	}
-	return result, nil
-}
-
 // CreateUser create a new user
 // Parameters:
 //   - username: email address of the user
 //   - password: encrypted password (base64 encoded RSA encrypted)
 //   - role: user role ("user" or "admin")
+//   - nickname: display name of the user (optional)
 //
 // Returns:
 //   - map[string]interface{}: user information without password
 //   - error: error message
-func (s *Service) CreateUser(ctx context.Context, username, password, role string) (map[string]interface{}, error) {
+func (s *Service) CreateUser(ctx context.Context, username, password, role, nickname string) (map[string]interface{}, error) {
 	emailRegex := regexp.MustCompile(`^[\w\._-]+@([\w_-]+\.)+[\w-]{2,}$`)
 	if !emailRegex.MatchString(username) {
 		return nil, fmt.Errorf("invalid email address: %s", username)
@@ -213,7 +186,7 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 		ID:              userID,
 		AccessToken:     &accessToken,
 		Email:           username,
-		Nickname:        "",
+		Nickname:        nickname,
 		Password:        &hashedPassword,
 		Status:          &status,
 		IsActive:        "1",
@@ -244,7 +217,7 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 
 	// 2. Create tenant (tenant_id = user_id)
 	// tenant name = nickname + "'s Kingdom" (same as Python)
-	tenantName := user.Nickname + "'s Kingdom"
+	tenantName := utility.TruncateRunes(user.Nickname+"'s Kingdom", common.TenantNameLimit)
 
 	// Get default model IDs from config
 	cfg := server.GetConfig()
@@ -273,18 +246,11 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 	tenant := &entity.Tenant{
 		ID:        userID,
 		Name:      &tenantName,
-		LLMID:     chatModel,
-		EmbdID:    embeddingModel,
-		ASRID:     asrModel,
-		Img2TxtID: vlmModel,
-		RerankID:  rerankModel,
-		TTSID:     ttsModel,
-		OCRID:     ocrModel,
 		ParserIDs: parserIDs,
 		Credit:    512,
 		Status:    &tenantStatus,
 	}
-	if err = tx.Create(tenant).Error; err != nil {
+	if err = dao.NewTenantDAO().Create(ctx, tx, tenant); err != nil {
 		rollbackTx()
 		return nil, fmt.Errorf("failed to create tenant: %w", err)
 	}
@@ -298,6 +264,13 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 		Role:      "owner",
 		InvitedBy: userID,
 		Status:    &userTenantStatus,
+		LLMID:     chatModel,
+		EmbdID:    embeddingModel,
+		ASRID:     asrModel,
+		Img2TxtID: vlmModel,
+		RerankID:  rerankModel,
+		TTSID:     ttsModel,
+		OCRID:     ocrModel,
 	}
 	if err = tx.Create(userTenant).Error; err != nil {
 		rollbackTx()
@@ -310,6 +283,7 @@ func (s *Service) CreateUser(ctx context.Context, username, password, role strin
 	file := &entity.File{
 		ID:        fileID,
 		ParentID:  fileID,
+		UserID:    userID,
 		TenantID:  userID,
 		CreatedBy: userID,
 		Name:      "/",
@@ -364,25 +338,14 @@ func (s *Service) GetUserDetails(ctx context.Context, username string) (map[stri
 	}, nil
 }
 
-// DeleteUserResult result of delete user operation
-type DeleteUserResult struct {
-	Username        string   `json:"username"`
-	LangfuseCount   int      `json:"langfuse_count"`
-	MetadataTable   string   `json:"metadata_table"`
-	TenantCount     int      `json:"tenant_count"`
-	UserTenantCount int      `json:"user_tenant_count"`
-	UserCount       int      `json:"user_count"`
-	DeletedDetails  []string `json:"deleted_details"`
-}
-
 // DeleteUser delete user with cascade delete of all related data
 // Parameters:
 //   - username: email address of the user to delete
 //
 // Returns:
-//   - *DeleteUserResult
+//   - *servicepkg.DeleteUserResult
 //   - error: error message
-func (s *Service) DeleteUser(ctx context.Context, username string) (*DeleteUserResult, error) {
+func (s *Service) DeleteUser(ctx context.Context, username string) (*servicepkg.DeleteUserResult, error) {
 	userList, err := s.userDAO.ListByEmail(ctx, dao.DB, username)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get user: %w", err)
@@ -407,17 +370,18 @@ func (s *Service) DeleteUser(ctx context.Context, username string) (*DeleteUserR
 		return nil, fmt.Errorf("user '%s' is admin account and cannot be deleted", username)
 	}
 
-	return s.deleteUserData(ctx, user)
+	return (servicepkg.UserDeletionService{}).Delete(ctx, user)
 }
 
 // ChangePassword change user password
 // Parameters:
+//   - actorID: ID of the administrator making the change
 //   - username: email address of the user
 //   - newPassword: new encrypted password (base64 encoded RSA encrypted)
 //
 // Returns:
 //   - error: error message
-func (s *Service) ChangePassword(ctx context.Context, username, newPassword string) error {
+func (s *Service) ChangePassword(ctx context.Context, actorID, username, newPassword string) error {
 	userList, err := s.userDAO.ListByEmail(ctx, dao.DB, username)
 	if err != nil || len(userList) == 0 {
 		return fmt.Errorf("user '%s' not found", username)
@@ -428,6 +392,10 @@ func (s *Service) ChangePassword(ctx context.Context, username, newPassword stri
 	}
 
 	user := userList[0]
+
+	if err := checkAdminPasswordChangeTarget(actorID, user.ID); err != nil {
+		return err
+	}
 
 	decryptedPassword, err := common.DecryptPassword(newPassword)
 	if err != nil {
@@ -568,7 +536,7 @@ func (s *Service) ListUserAPITokens(ctx context.Context, username string) ([]map
 	}
 
 	// 2. Get user's tenants
-	userTenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, user.ID)
+	userTenants, err := s.userTenantDAO.GetByUserIDAndRole(ctx, dao.DB, user.ID, "owner")
 	if err != nil || len(userTenants) == 0 {
 		return nil, fmt.Errorf("tenant not found")
 	}
@@ -585,6 +553,7 @@ func (s *Service) ListUserAPITokens(ctx context.Context, username string) ([]map
 	result := make([]map[string]interface{}, 0, len(tokens))
 	for _, token := range tokens {
 		result = append(result, map[string]interface{}{
+			"user_id":     token.UserID,
 			"tenant_id":   token.TenantID,
 			"token":       token.Token,
 			"beta":        token.Beta,
@@ -609,7 +578,7 @@ func (s *Service) GenerateUserAPIToken(ctx context.Context, username string) (ma
 	}
 
 	// 2. Get user's tenants
-	userTenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, user.ID)
+	userTenants, err := s.userTenantDAO.GetByUserIDAndRole(ctx, dao.DB, user.ID, "owner")
 	if err != nil || len(userTenants) == 0 {
 		return nil, fmt.Errorf("tenant not found")
 	}
@@ -622,6 +591,7 @@ func (s *Service) GenerateUserAPIToken(ctx context.Context, username string) (ma
 
 	apiToken := &entity.APIToken{
 		TenantID: tenantID,
+		UserID:   &user.ID,
 		Token:    key,
 		Beta:     &beta,
 	}
@@ -632,6 +602,7 @@ func (s *Service) GenerateUserAPIToken(ctx context.Context, username string) (ma
 	}
 
 	return map[string]interface{}{
+		"user_id":     user.ID,
 		"tenant_id":   tenantID,
 		"token":       key,
 		"beta":        beta,
@@ -651,7 +622,7 @@ func (s *Service) DeleteUserAPIToken(ctx context.Context, username, key string) 
 	}
 
 	// 2. Get user's tenants
-	userTenants, err := s.userTenantDAO.GetByUserID(ctx, dao.DB, user.ID)
+	userTenants, err := s.userTenantDAO.GetByUserIDAndRole(ctx, dao.DB, user.ID, "owner")
 	if err != nil || len(userTenants) == 0 {
 		return fmt.Errorf("tenant not found")
 	}
@@ -718,6 +689,9 @@ func (s *Service) ListServices(ctx context.Context) ([]ServiceStatus, error) {
 	case "mysql":
 		mysqlStatus := s.getMySQLStatus(ctx)
 		results = append(results, mysqlStatus)
+	case "vastbase":
+		vastbaseConfig := globalConfig.GetVastbaseMetaConfig()
+		results = append(results, s.pingDatabaseStatus(ctx, "vastbase", vastbaseConfig.Host, vastbaseConfig.Port))
 	default:
 		mysqlConfig := globalConfig.GetMySQLConfig()
 		results = append(results, newServiceStatus("database", databaseType, mysqlConfig.Host, mysqlConfig.Port, "not available", time.Now(), "not supported database type"))
@@ -730,6 +704,8 @@ func (s *Service) ListServices(ctx context.Context) ([]ServiceStatus, error) {
 		docHost, docPort = serviceEndpoint(globalConfig.GetInfinityConfig().URI, 0)
 	} else if docEngineImpl.GetType() == "elasticsearch" {
 		docHost, docPort = serviceEndpoint(globalConfig.GetElasticsearchConfig().Hosts, 0)
+	} else if docEngineImpl.GetType() == "opensearch" {
+		docHost, docPort = serviceEndpoint(globalConfig.GetOpenSearchConfig().Hosts, 0)
 	}
 	err := docEngineImpl.Ping(ctx)
 	if err == nil {
@@ -777,11 +753,12 @@ func (s *Service) ListServices(ctx context.Context) ([]ServiceStatus, error) {
 	results = append(results, s.GetEEServicesStatus(ctx)...)
 
 	serverList := GlobalServerStore.ListInfos()
+	serverList = AppendServiceList(serverList)
 	for _, serverStatus := range serverList {
 		now := time.Now()
 		serverItem := newServiceStatus(string(serverStatus.ServerType), serverStatus.ServerName, serverStatus.Host, serverStatus.Port, "", serverStatus.Timestamp, "")
 		// the difference between now and serverStatus.Timestamp is less than 5 seconds, then the server is alive
-		if now.Sub(serverStatus.Timestamp) < 45*time.Second {
+		if now.Sub(serverStatus.Timestamp) < 5*globalConfig.GetHeartbeatInterval() {
 			serverItem.Status = "alive"
 		} else {
 			serverItem.Status = "timeout"
@@ -797,46 +774,6 @@ func (s *Service) GetServicesByType(serviceType string) ([]map[string]interface{
 	return nil, errors.New("get_services_by_type: not implemented")
 }
 
-// GetServiceDetails get service details
-func (s *Service) GetServiceDetails(configDict map[string]interface{}) ([]ServiceStatus, error) {
-	//serviceType, _ := configDict["service_type"].(string)
-	//name, _ := configDict["name"].(string)
-	//ctx := context.Background()
-	//
-	//// Call detail function based on service type
-	//switch serviceType {
-	//case "meta_data":
-	//	return s.getMySQLStatus(ctx), nil
-	//case "cache":
-	//	return s.getKvrocksStatus(ctx), nil
-	//case "message_queue":
-	//	host := configDict["host"].(string)
-	//	port := configDict["port"].(int)
-	//	return s.checkNatsAlive(name, host, port)
-	//case "retrieval":
-	//	// Check the extra.retrieval_type to determine which retrieval service
-	//	if extra, ok := configDict["extra"].(map[string]interface{}); ok {
-	//		if retrievalType, ok := extra["retrieval_type"].(string); ok {
-	//			if retrievalType == "infinity" {
-	//				return s.getInfinityStatus(name)
-	//			}
-	//		}
-	//	}
-	//	return s.getESClusterStats(name)
-	//case "ragflow_server":
-	//	return s.checkRAGFlowServerAlive(name)
-	//case "file_store":
-	//	return s.checkMinioAlive(name)
-	//case "olap":
-	//	return s.checkOlapAlive(name)
-	//case "tracing":
-	//	return s.checkTracingAlive(name)
-	//default:
-	//	return nil, nil
-	//}
-	return nil, nil
-}
-
 // getMySQLStatus gets MySQL service status
 func (s *Service) getMySQLStatus(ctx context.Context) ServiceStatus {
 
@@ -850,8 +787,9 @@ func (s *Service) getMySQLStatus(ctx context.Context) ServiceStatus {
 		return newServiceStatus(serviceType, name, mysqlConfig.Host, mysqlConfig.Port, "not connected", startTime, err.Error())
 	}
 
-	// Execute SELECT 1 to check connectivity
-	err = sqlDB.PingContext(ctx)
+	// Execute SELECT 1 to check connectivity, with the same 3s cap as the
+	// non-MySQL database probe so an unreachable host cannot hold ListServices.
+	err = pingWithTimeout(ctx, sqlDB)
 	if err != nil {
 		mysqlConfig := server.GetConfig().GetMySQLConfig()
 		return newServiceStatus(serviceType, name, mysqlConfig.Host, mysqlConfig.Port, "timeout", startTime, err.Error())
@@ -859,6 +797,36 @@ func (s *Service) getMySQLStatus(ctx context.Context) ServiceStatus {
 
 	mysqlConfig := server.GetConfig().GetMySQLConfig()
 	return newServiceStatus(serviceType, name, mysqlConfig.Host, mysqlConfig.Port, "alive", startTime, "")
+}
+
+// pingWithTimeout caps a connectivity probe at 3s. The DSN allows a 30s
+// connect_timeout, so an unreachable host would otherwise stall the request.
+// A caller deadline shorter than 3s is preserved by context.WithTimeout.
+func pingWithTimeout(ctx context.Context, sqlDB *sql.DB) error {
+	pingCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	return sqlDB.PingContext(pingCtx)
+}
+
+// pingDatabaseStatus reports the SQL metadata database status for the
+// non-MySQL backends. The connectivity probe is the same SELECT 1 ping the
+// MySQL path uses; only the reported endpoint differs.
+func (s *Service) pingDatabaseStatus(ctx context.Context, name, host string, port int) ServiceStatus {
+	serviceType := "database"
+	startTime := time.Now()
+
+	sqlDB, err := dao.DB.DB()
+	if err != nil {
+		return newServiceStatus(serviceType, name, host, port, "not connected", startTime, err.Error())
+	}
+
+	// The DSN allows a 30s connect_timeout, so an unreachable host would
+	// otherwise hold ListServices for the full dial timeout.
+	if err = pingWithTimeout(ctx, sqlDB); err != nil {
+		return newServiceStatus(serviceType, name, host, port, "timeout", startTime, err.Error())
+	}
+
+	return newServiceStatus(serviceType, name, host, port, "alive", startTime, "")
 }
 
 // getKvrocksStatus gets the Kvrocks service status.
@@ -1092,6 +1060,11 @@ func (s *Service) SetVariable(ctx context.Context, varName, varValue string) err
 }
 
 func (s *Service) setVariable(ctx context.Context, db *gorm.DB, varName, varValue string) error {
+	if strings.EqualFold(varName, "api_key.max_count") {
+		if _, err := entity.ParseAPITokenLimit(varValue); err != nil {
+			return err
+		}
+	}
 	settings, err := s.systemSettingsDAO.GetByName(ctx, db, varName)
 	if err != nil {
 		return err
@@ -1099,6 +1072,11 @@ func (s *Service) setVariable(ctx context.Context, db *gorm.DB, varName, varValu
 
 	if len(settings) == 1 {
 		setting := &settings[0]
+		if strings.EqualFold(setting.Name, "api_key.max_count") {
+			if _, err := entity.ParseAPITokenLimit(varValue); err != nil {
+				return err
+			}
+		}
 		if err = entity.ValidateSystemSettingValue(*setting, varValue); err != nil {
 			return err
 		}
@@ -1187,7 +1165,7 @@ func (s *Service) ListEnvironments() ([]map[string]interface{}, error) {
 		storageImpl = "minio"
 	}
 	result = append(result, map[string]interface{}{
-		"env":   "STORAGE",
+		"env":   "STORAGE_IMPL",
 		"value": storageImpl,
 	})
 
@@ -1329,13 +1307,133 @@ func (s *Service) HandleHeartbeat(message *common.BaseMessage) (common.ErrorCode
 	return UpdateServer(message.ServerName, status)
 }
 
-// InitDefaultAdmin initialize default admin user
-// This matches Python's init_default_admin behavior
+// adminBootstrapPasswordFile is where a generated first-superuser password is
+// stored when neither DEFAULT_SUPERUSER_PASSWORD nor ADMIN_DEFAULT_PASSWORD
+// is set. docker/.env documents this path on the container logs volume.
+const adminBootstrapPasswordFile = "logs/admin_bootstrap_password.txt"
+
+// configuredSuperuserNickname returns DEFAULT_SUPERUSER_NICKNAME when it is
+// non-empty after trim, and "admin" otherwise. The unset default matches
+// Python's init_default_admin.
+func configuredSuperuserNickname() string {
+	if nickname := strings.TrimSpace(common.GetEnv(common.EnvDefaultSuperuserNickname)); nickname != "" {
+		return nickname
+	}
+	return "admin"
+}
+
+// configuredSuperuserEmail returns DEFAULT_SUPERUSER_EMAIL when it is
+// non-empty after trim, and "admin@ragflow.io" otherwise. The unset default
+// matches Python's init_default_admin.
+func configuredSuperuserEmail() string {
+	if email := strings.TrimSpace(common.GetEnv(common.EnvDefaultSuperuserEmail)); email != "" {
+		return email
+	}
+	return "admin@ragflow.io"
+}
+
+// configuredSuperuserPassword reads the password for a new superuser.
+// DEFAULT_SUPERUSER_PASSWORD is canonical. ADMIN_DEFAULT_PASSWORD is used
+// when the canonical name is empty. The boolean is false when both are empty.
+func configuredSuperuserPassword() (string, bool) {
+	if password := strings.TrimSpace(common.GetEnv(common.EnvDefaultSuperuserPassword)); password != "" {
+		return password, true
+	}
+	if password := strings.TrimSpace(common.GetEnv(common.EnvAdminDefaultPassword)); password != "" {
+		return password, true
+	}
+	return "", false
+}
+
+// superuserPasswordForNewAdmin returns the configured password, or a generated
+// password written once to adminBootstrapPasswordFile. It does not fall back
+// to a public default. A write failure refuses creation of the first superuser.
+func superuserPasswordForNewAdmin() (string, error) {
+	if password, ok := configuredSuperuserPassword(); ok {
+		return password, nil
+	}
+	password, err := bootstrapSuperuserPassword(adminBootstrapPasswordFile)
+	if err != nil {
+		return "", fmt.Errorf("refuse to create the first superuser: %w", err)
+	}
+	return password, nil
+}
+
+func bootstrapSuperuserPassword(path string) (string, error) {
+	existing, err := readBootstrapPassword(path)
+	if err != nil {
+		return "", err
+	}
+	if existing != "" {
+		return existing, nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return "", fmt.Errorf("replace empty bootstrap password file: %w", err)
+	}
+
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", fmt.Errorf("generate bootstrap password: %w", err)
+	}
+	password := hex.EncodeToString(buf)
+	if err := writeBootstrapPassword(path, password); err != nil {
+		if stored, readErr := readBootstrapPassword(path); readErr == nil && stored != "" {
+			return stored, nil
+		}
+		return "", err
+	}
+	common.Info("Wrote generated superuser password", zap.String("file", path))
+	return password, nil
+}
+
+func readBootstrapPassword(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("read bootstrap password: %w", err)
+	}
+	return strings.TrimSpace(string(data)), nil
+}
+
+func writeBootstrapPassword(path, password string) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return fmt.Errorf("create bootstrap password directory: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("write bootstrap password: %w", err)
+	}
+	remove := true
+	defer func() {
+		_ = file.Close()
+		if remove {
+			_ = os.Remove(path)
+		}
+	}()
+	if err := file.Chmod(0o600); err != nil {
+		return fmt.Errorf("restrict bootstrap password file: %w", err)
+	}
+	if _, err := file.WriteString(password + "\n"); err != nil {
+		return fmt.Errorf("write bootstrap password: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("write bootstrap password: %w", err)
+	}
+	remove = false
+	return nil
+}
+
+// InitDefaultAdmin creates the first superuser when none is active.
+// When DEFAULT_SUPERUSER_NICKNAME and DEFAULT_SUPERUSER_EMAIL are unset,
+// the nickname and email still match Python's init_default_admin
+// ("admin" and "admin@ragflow.io"). The password path does not: it uses
+// DEFAULT_SUPERUSER_PASSWORD or ADMIN_DEFAULT_PASSWORD, or a generated
+// secret, and it does not use Python's literal "admin".
 func (s *Service) InitDefaultAdmin() error {
-	// Default superuser settings (matching Python's DEFAULT_SUPERUSER_* defaults)
-	defaultNickname := "admin"
-	defaultEmail := "admin@ragflow.io"
-	defaultPassword := "admin"
+	defaultNickname := configuredSuperuserNickname()
+	defaultEmail := configuredSuperuserEmail()
 
 	// Query superusers
 	var users []*entity.User
@@ -1345,6 +1443,11 @@ func (s *Service) InitDefaultAdmin() error {
 	}
 
 	if len(users) == 0 {
+		defaultPassword, err := superuserPasswordForNewAdmin()
+		if err != nil {
+			return err
+		}
+
 		userID := common.GenerateToken()
 		accessToken := common.GenerateToken()
 		status := "1"
@@ -1417,14 +1520,13 @@ func (s *Service) InitDefaultAdmin() error {
 func (s *Service) addTenantForAdmin(userID, nickname string) error {
 	status := "1"
 	role := "owner"
-	tenantName := nickname + "'s Kingdom"
+	tenantName := utility.TruncateRunes(nickname+"'s Kingdom", common.TenantNameLimit)
 
 	tenant := &entity.Tenant{
 		ID:   userID,
 		Name: &tenantName,
 	}
-
-	if err := dao.DB.Create(tenant).Error; err != nil {
+	if err := dao.NewTenantDAO().Create(context.Background(), dao.DB, tenant); err != nil {
 		return err
 	}
 
@@ -1437,18 +1539,6 @@ func (s *Service) addTenantForAdmin(userID, nickname string) error {
 	}
 
 	return dao.DB.Create(userTenant).Error
-}
-
-// ListAllModels list all models
-func (s *Service) ListAllModels(pageIndex, pageSize int) ([]map[string]interface{}, error) {
-	models, err := dao.GetModelProviderManager().ListAllModels()
-	if err != nil {
-		return nil, err
-	}
-	if pageSize > 0 && pageIndex >= 0 && pageIndex*pageSize < len(models) {
-		return models[pageIndex*pageSize : (pageIndex+1)*pageSize], nil
-	}
-	return models, nil
 }
 
 func (s *Service) GetModelByModelName(modelName string) (*modelModule.Model, error) {

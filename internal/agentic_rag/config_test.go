@@ -183,12 +183,18 @@ func TestShippedConfigIsADirectAnswerTemplate(t *testing.T) {
 	if cfg == nil {
 		t.Fatal("shipped config failed to load")
 	}
-	if len(cfg.Templates) != 1 {
-		t.Fatalf("shipped config carries %d templates, want exactly 1 (smart-reasoning)", len(cfg.Templates))
+	// The shipped config also carries the planer-explorer-auditor engine's gate
+	// machinery (planner / plan_auditor / answer_auditor) and its producer; this
+	// test pins the DIRECT-ANSWER producer (smart-reasoning) and its contract.
+	var tmpl *Template
+	for i := range cfg.Templates {
+		if cfg.Templates[i].ID == "smart-reasoning" {
+			tmpl = &cfg.Templates[i]
+			break
+		}
 	}
-	tmpl := cfg.Templates[0]
-	if tmpl.ID != "smart-reasoning" {
-		t.Fatalf("template id = %q, want smart-reasoning", tmpl.ID)
+	if tmpl == nil {
+		t.Fatalf("shipped config is missing the smart-reasoning template")
 	}
 	// The compiled-knowledge tools (navigate_tree / navigate_structure /
 	// graph_explore) are NOT declared here: Run injects them only when the bound
@@ -208,9 +214,13 @@ func TestShippedConfigIsADirectAnswerTemplate(t *testing.T) {
 	for _, want := range []string{
 		"grep_chunks", "search_bm25_chunks", "search_semantic_chunks",
 		"list_chunks", "[ID:", "Evidence-First",
-		"If web_search is available", "at least one web keyword query",
-		"list_chunks cannot read web chunks", "corpus- or web-backed fact",
-		"Always search configured datasets", "web results supplement dataset evidence",
+		"Always search configured datasets",
+		// The shipped prompt keeps web_search available but subordinate: a
+		// web-first instruction made the agent answer from snippets without
+		// reading the corpus document it had already located.
+		"web_search", "Only when the corpus has no document covering the question",
+		"Web search supplements the corpus", "A web snippet locates a source too",
+		"corpus- or web-backed fact",
 	} {
 		if !strings.Contains(content, want) {
 			t.Errorf("prompt must mention %q", want)

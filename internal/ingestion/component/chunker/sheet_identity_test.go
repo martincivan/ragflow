@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/xuri/excelize/v2"
+
 	"ragflow/internal/agent/runtime"
 	"ragflow/internal/ingestion/task/indexdoc"
 	"ragflow/internal/parser/parser"
@@ -73,7 +74,7 @@ func TestSpreadsheetChunkersPreserveSheetIdentityThroughIndexing(t *testing.T) {
 					if err != nil {
 						t.Fatal(err)
 					}
-					out, err := comp.Invoke(t.Context(), nil, map[string]any{"name": source.name, "output_format": source.result.OutputFormat, "json": items})
+					out, err := comp.Invoke(t.Context(), nil, map[string]any{"name": source.name, "output_format": "json", "json": items})
 					if err != nil {
 						t.Fatal(err)
 					}
@@ -165,7 +166,7 @@ func TestQAChunkerSheetNameOnlyPreservesSourceRows(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	out, err := comp.Invoke(t.Context(), nil, map[string]any{"name": "rows.xlsx", "output_format": parsed.OutputFormat, "json": parsed.JSON})
+	out, err := comp.Invoke(t.Context(), nil, map[string]any{"name": "rows.xlsx", "output_format": "json", "json": parsed.JSON})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -19,28 +19,36 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"regexp"
 	"strings"
 
+	"ragflow/internal/common"
 	"ragflow/internal/entity"
 	modelModule "ragflow/internal/entity/models"
+	"ragflow/internal/permission"
 	"ragflow/internal/rag/prompts"
 )
 
 // GenerateRelatedQuestions generates related search questions for chat/searchbot endpoints.
-func GenerateRelatedQuestions(ctx context.Context, userID, question, searchID string, searchSvc *SearchService, tenantSvc *TenantService, modelFactory *ModelFactory) ([]string, error) {
+func GenerateRelatedQuestions(ctx context.Context, question, searchID string, searchSvc *SearchService, modelFactory *ModelFactory) ([]string, error) {
 	if modelFactory == nil {
 		return nil, fmt.Errorf("model factory not configured")
 	}
-	searchConfig, err := relatedQuestionsSearchConfig(ctx, userID, searchID, searchSvc)
+	searchConfig, tenantID, err := relatedQuestionsSearchConfig(ctx, searchID, searchSvc)
 	if err != nil {
 		return nil, err
 	}
-	modelID := relatedQuestionsModelID(ctx, userID, searchConfig, tenantSvc)
-	if modelID == "" {
-		return nil, fmt.Errorf("no chat model configured")
+	if tenantID == "" {
+		tenantID, err = requireCurrentTenantID(ctx)
+		if err != nil {
+			return nil, err
+		}
 	}
+	modelCtx := permission.WithTenantID(ctx, tenantID)
+	modelID, _ := searchConfig["chat_id"].(string)
 	prompt, err := (prompts.EmbeddedPromptLoader{}).Load("related_question")
 	if err != nil {
 		return nil, err
@@ -49,7 +57,15 @@ func GenerateRelatedQuestions(ctx context.Context, userID, question, searchID st
 		{Role: "system", Content: prompt},
 		{Role: "user", Content: "\nKeywords: " + question + "\nRelated search terms:\n    "},
 	}
-	chatModel, err := modelFactory.NewChatModel(ctx, ModelAccess{TenantID: userID}, modelID)
+	var chatModel *modelModule.ChatModel
+	if modelID == "" {
+		chatModel, err = modelFactory.NewDefaultChatModel(modelCtx)
+		if errors.Is(err, ErrNoDefaultModel) {
+			return nil, fmt.Errorf("no chat model configured")
+		}
+	} else {
+		chatModel, err = modelFactory.NewChatModel(modelCtx, modelID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -63,18 +79,19 @@ func GenerateRelatedQuestions(ctx context.Context, userID, question, searchID st
 	return []string{}, nil
 }
 
-func relatedQuestionsSearchConfig(ctx context.Context, userID, searchID string, searchSvc *SearchService) (map[string]interface{}, error) {
+func relatedQuestionsSearchConfig(ctx context.Context, searchID string, searchSvc *SearchService) (map[string]interface{}, string, error) {
 	if searchID == "" {
-		return map[string]interface{}{}, nil
+		return map[string]interface{}{}, "", nil
 	}
 	if searchSvc == nil {
-		return nil, fmt.Errorf("search service not configured")
+		return nil, "", fmt.Errorf("search service not configured")
 	}
-	detail, err := searchSvc.GetDetail(ctx, userID, searchID)
+	detail, err := searchSvc.GetDetail(ctx, searchID)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return relatedQuestionsSearchConfigFromDetail(detail), nil
+	tenantID, _ := detail["tenant_id"].(string)
+	return relatedQuestionsSearchConfigFromDetail(detail), strings.TrimSpace(tenantID), nil
 }
 
 func relatedQuestionsSearchConfigFromDetail(detail map[string]interface{}) map[string]interface{} {
@@ -85,18 +102,6 @@ func relatedQuestionsSearchConfigFromDetail(detail map[string]interface{}) map[s
 		return map[string]interface{}(sc)
 	}
 	return map[string]interface{}{}
-}
-
-func relatedQuestionsModelID(ctx context.Context, tenantID string, searchConfig map[string]interface{}, tenantSvc *TenantService) string {
-	modelID, _ := searchConfig["chat_id"].(string)
-	if modelID != "" || tenantSvc == nil {
-		return modelID
-	}
-	defaultModel, err := tenantSvc.GetDefaultModelName(ctx, tenantID, entity.ModelTypeChat)
-	if err == nil {
-		modelID = defaultModel
-	}
-	return modelID
 }
 
 func relatedQuestionsConfig(searchConfig map[string]interface{}) *modelModule.ChatConfig {
@@ -162,34 +167,22 @@ func relatedQuestionsConfig(searchConfig map[string]interface{}) *modelModule.Ch
 }
 
 func intFromRelatedQuestionConfig(value interface{}) (int, bool) {
-	switch v := value.(type) {
-	case int:
-		return v, true
-	case int64:
-		return int(v), true
-	case float64:
-		return int(v), true
-	case json.Number:
-		if n, err := v.Int64(); err == nil {
-			return int(n), true
-		}
+	if n, ok := value.(json.Number); ok {
+		v, err := n.Int64()
+		return int(v), err == nil
 	}
-	return 0, false
+	return common.ToIntNum(value)
 }
 
 func floatFromRelatedQuestionConfig(value interface{}) (float64, bool) {
-	switch v := value.(type) {
-	case float64:
-		return v, true
-	case float32:
-		return float64(v), true
-	case int:
-		return float64(v), true
-	case int64:
-		return float64(v), true
-	case json.Number:
-		if n, err := v.Float64(); err == nil {
-			return n, true
+	// Keep the pre-convergence contract: native numeric kinds and json.Number
+	// only. common.ToFloat also parses strings, and non-finite values must not
+	// reach the LLM request body (json.Marshal rejects them).
+	switch value.(type) {
+	case float64, float32, int, int64, json.Number:
+		f, ok := common.ToFloat(value)
+		if ok && !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return f, true
 		}
 	}
 	return 0, false

@@ -1,14 +1,39 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package dao_test
 
 import (
+	"archive/zip"
+	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
 
+	"ragflow/internal/common"
 	"ragflow/internal/dao"
 	"ragflow/internal/entity"
 	"ragflow/internal/ingestion/component"
@@ -23,6 +48,8 @@ import (
 // convert, so one run exercises every converter and every target family.
 const python027MaximalIngestionConfig = `{
 	"layout_recognize":"TCADP Parser",
+	"mineru_formula_enable":false,
+	"mineru_table_enable":true,
 	"pages":[[1,3]],
 	"table_result_type":"2",
 	"markdown_image_response_type":"2",
@@ -126,6 +153,123 @@ func TestMigratedIngestionConfigReachesRuntime(t *testing.T) {
 	})
 }
 
+// TestMigratedMinerUControlsReachRequest runs SQLite migration, stored-config
+// readback, real template cleaning and Parser invocation. Only the MinerU HTTP
+// service is a fixture; no OCR inference runs. Local HTTP requires a scoped,
+// process-wide SSRF bypass, so this test and its subtests must not run in parallel.
+func TestMigratedMinerUControlsReachRequest(t *testing.T) {
+	t.Setenv(common.EnvMineruBackend, "pipeline")
+	t.Setenv(common.EnvAllowAnyHost, "true")
+
+	var response bytes.Buffer
+	archive := zip.NewWriter(&response)
+	entry, err := archive.Create("content_list.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := entry.Write([]byte(`[{"type":"text","text":"Migrated MinerU controls reached the request."}]`)); err != nil {
+		t.Fatal(err)
+	}
+	if err := archive.Close(); err != nil {
+		t.Fatal(err)
+	}
+	registry, err := pipeline.DefaultRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	template, ok := registry.Get("general")
+	if !ok {
+		t.Fatal("general pipeline template missing")
+	}
+	dsl, err := json.Marshal(template.DSL)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, formula := range []bool{false, true} {
+		for _, table := range []bool{false, true} {
+			t.Run(fmt.Sprintf("formula=%t/table=%t", formula, table), func(t *testing.T) {
+				requests := make(chan [2]string, 1)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+					if request.URL.Path != "/file_parse" || request.Method != http.MethodPost {
+						http.NotFound(w, request)
+						return
+					}
+					if err := request.ParseMultipartForm(1 << 20); err != nil {
+						t.Errorf("parse multipart request: %v", err)
+						http.Error(w, "invalid fixture request", http.StatusBadRequest)
+						return
+					}
+					defer request.MultipartForm.RemoveAll()
+					if request.Header.Get("Authorization") != "Bearer synthetic-mineru-key" {
+						t.Error("selected instance credentials were lost")
+					}
+					select {
+					case requests <- [2]string{request.FormValue("formula_enable"), request.FormValue("table_enable")}:
+					default:
+						t.Error("unexpected repeated MinerU submission")
+					}
+					w.Header().Set("Content-Type", "application/zip")
+					_, _ = w.Write(response.Bytes())
+				}))
+				t.Cleanup(server.Close)
+				db := openIngestionRuntimeDB(t)
+				if err := db.AutoMigrate(&entity.UserTenant{}, &entity.TenantModelProvider{}, &entity.TenantModelInstance{}, &entity.TenantModel{}); err != nil {
+					t.Fatal(err)
+				}
+				extra, err := json.Marshal(map[string]string{"base_url": server.URL})
+				if err != nil {
+					t.Fatal(err)
+				}
+				for _, row := range []any{
+					&entity.TenantModelProvider{ID: "provider-mineru", UserID: "tenant", TenantID: "tenant", ProviderName: "MinerU"},
+					&entity.TenantModelInstance{ID: "instance-mineru", ProviderID: "provider-mineru", InstanceName: "default", APIKey: "synthetic-mineru-key", Status: "active", Extra: string(extra)},
+					&entity.TenantModel{ID: "model-mineru", ProviderID: "provider-mineru", InstanceID: "instance-mineru", ModelName: "MinerU-model", ModelType: int(entity.ModelTypeOCR), Status: "active"},
+				} {
+					if err := db.Create(row).Error; err != nil {
+						t.Fatal(err)
+					}
+				}
+				input := fmt.Sprintf(`{"layout_recognize":"MinerU-model@default@MinerU","mineru_formula_enable":%t,"mineru_table_enable":%t}`, formula, table)
+				insertIngestionRuntimeRow(t, db, "kb-mineru", "general", input)
+				if err := dao.MigrateIngestionParserConfigsForTest(t.Context(), db); err != nil {
+					t.Fatal(err)
+				}
+				config, err := pipeline.BuildParserConfig(dsl, migratedConfig(t, db, "kb-mineru"))
+				if err != nil {
+					t.Fatal(err)
+				}
+				effective := effectiveComponentParams(t, "general", config)
+				parser, err := component.NewParserComponent(effective["Parser:HipSignsRhyme"])
+				if err != nil {
+					t.Fatal(err)
+				}
+				ctx, cancel := context.WithTimeout(t.Context(), 20*time.Second)
+				defer cancel()
+				out, err := parser.Invoke(ctx, db, map[string]any{
+					"binary": []byte("%PDF-1.4"), "name": "synthetic.pdf", "file_type": "pdf", "tenant_id": "tenant",
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				encoded, err := json.Marshal(out)
+				if err != nil || !strings.Contains(string(encoded), "Migrated MinerU controls reached the request.") {
+					t.Fatalf("Parser output did not contain fixture text: %s, err=%v", encoded, err)
+				}
+				select {
+				case got := <-requests:
+					want := [2]string{strconv.FormatBool(formula), strconv.FormatBool(table)}
+					if got != want {
+						t.Errorf("migrated formula_enable/table_enable=%v, want %v", got, want)
+					}
+				default:
+					t.Fatal("no MinerU request received")
+				}
+			})
+		}
+	}
+}
+
 // TestMigratedParentChildMatchesWritePath asserts the migration derives
 // children_delimiters exactly as the API's own ApplyParentChildChunkerConfig
 // does for the same setting, so a migrated row and a row saved through the UI
@@ -193,7 +337,7 @@ func TestMigratedParentChildEnabledWithoutDelimiterDefaultsToNewline(t *testing.
 }
 
 // TestIngestionMigrationMatchesBuiltinTemplates pins the migration's literal
-// target table against the embedded templates by reading the node IDs and file
+// target table against its embedded templates by reading the node IDs and file
 // families out of the templates themselves: a renamed component, a dropped
 // family, or a new chunker type fails here instead of silently skipping a row or
 // thinning a family.
@@ -204,7 +348,7 @@ func TestIngestionMigrationMatchesBuiltinTemplates(t *testing.T) {
 	}
 	// targetFamilies are the only Parser families the migration can write.
 	const targetFamilies = "pdf,spreadsheet"
-	for _, ref := range append(registry.Refs(), "naive") {
+	for _, ref := range dao.IngestionMigrationParserIDsForTest() {
 		t.Run(ref, func(t *testing.T) {
 			template, ok := registry.Get(ref)
 			if !ok {
@@ -250,6 +394,11 @@ func TestIngestionMigrationMatchesBuiltinTemplates(t *testing.T) {
 					families: map[string]bool{"spreadsheet": true},
 				},
 				{
+					name:     "MinerU controls",
+					config:   `{"mineru_formula_enable":false,"mineru_table_enable":true}`,
+					families: map[string]bool{"pdf": true},
+				},
+				{
 					name:     "chunking",
 					config:   `{"chunk_token_num":256,"delimiter":"\n","overlapped_percent":0.29,"enable_children":true}`,
 					families: map[string]bool{},
@@ -268,9 +417,17 @@ func TestIngestionMigrationMatchesBuiltinTemplates(t *testing.T) {
 					}
 					// Snapshot before cleaning so mutations cannot hide a lost parameter.
 					expected := jsonNormalize(t, config)
-					cleaned := pipeline.CleanComponentParams(rawDSL, config)
-					if !reflect.DeepEqual(jsonNormalize(t, cleaned), expected) {
-						t.Fatalf("API cleaning changed migrated params: got %v; want %v", cleaned, expected)
+					cleaned, err := pipeline.BuildParserConfig(rawDSL, config)
+					if err != nil {
+						t.Fatal(err)
+					}
+					for cpnID, raw := range expected.(map[string]any) {
+						params, _ := cleaned[cpnID].(map[string]any)
+						for key, value := range raw.(map[string]any) {
+							if !reflect.DeepEqual(jsonNormalize(t, params[key]), value) {
+								t.Fatalf("API config changed migrated %s.%s: got %v; want %v", cpnID, key, params[key], value)
+							}
+						}
 					}
 
 					// Parser: exactly the template's families the config targets,
@@ -301,6 +458,14 @@ func TestIngestionMigrationMatchesBuiltinTemplates(t *testing.T) {
 					}
 					if nodeWritten {
 						assertFamiliesPreserved(t, node, templateFamilies, wantFamilies)
+					}
+					if (tc.name == "maximal" || tc.name == "MinerU controls") && wantFamilies["pdf"] {
+						pdf := node["pdf"].(map[string]any)
+						for key, want := range map[string]bool{"mineru_formula_enable": false, "mineru_table_enable": true} {
+							if got, exists := pdf[key]; !exists || got != want {
+								t.Errorf("migrated %s=%v, present=%v; want %v", key, got, exists, want)
+							}
+						}
 					}
 					// The Parser the run compiles must accept the override. The
 					// merge is applyOverrideParams': the template params with the
@@ -485,16 +650,11 @@ var overriddenFamilyKeys = map[string]bool{
 // questions (this one, "is the template's value safe to lose"; that one, "may
 // the value the migration writes differ from the template's").
 var inertFamilyKeys = map[string]string{
-	"output_format":         "normalizeParserOutputFormats forces JSON on every family",
-	"preprocess":            "the value has no Go reader; the preprocessing stage is selected by the chunker's own options",
-	"suffix":                "no Go reader; file routing uses the document's own suffix column, not the family list",
-	"vlm":                   "empty in every template; absent falls back to the family llm_id and then the tenant model, and only Markdown and audio read a family vlm at all",
-	"flatten_media_to_text": "false in every template, which is also defaultSetups()'s default",
-	"pages":                 "the only template that bakes it lists every page ([[1,100000]]), which is what an absent pages means",
-	"parse_method":          "a written pdf family always restates it; for the spreadsheet family defaultSetups() re-derives the same deepdoc engine",
-	"column_mode":           "the table template bakes auto, which is what an absent column_mode means to indexdoc's resolveTableColumnConfig",
-	"column_roles":          "the table template bakes the empty role map, which is what an absent column_roles means",
-	"column_names":          "the table template bakes the empty name list, which is what an absent column_names means",
+	"pages":        "the only template that bakes it lists every page ([[1,100000]]), which is what an absent pages means",
+	"parse_method": "a written pdf family always restates it; for the spreadsheet family defaultSetups() re-derives the same deepdoc engine",
+	"column_mode":  "the table template bakes auto, which is what an absent column_mode means to indexdoc's resolveTableColumnConfig",
+	"column_roles": "the table template bakes the empty role map, which is what an absent column_roles means",
+	"column_names": "the table template bakes the empty name list, which is what an absent column_names means",
 }
 
 // assertFamiliesPreserved checks that no template-baked key of a written family
@@ -565,7 +725,7 @@ func openIngestionRuntimeDB(t *testing.T) *gorm.DB {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = sqlDB.Close() })
-	if err := db.AutoMigrate(&entity.Knowledgebase{}, &entity.SystemSettings{}); err != nil {
+	if err := db.AutoMigrate(&entity.Knowledgebase{}, &entity.SystemSettings{}, &entity.UserTenant{}); err != nil {
 		t.Fatal(err)
 	}
 	return db
@@ -649,12 +809,14 @@ func TestMigratedExtractorConfigReachesRuntime(t *testing.T) {
 	}
 }
 
+// TestExtractorMigrationMatchesBuiltinTemplates checks historical migration
+// targets; newly registered pipelines have no flat settings to migrate.
 func TestExtractorMigrationMatchesBuiltinTemplates(t *testing.T) {
 	registry, err := pipeline.DefaultRegistry()
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, ref := range append(registry.Refs(), "naive") {
+	for _, ref := range dao.IngestionMigrationParserIDsForTest() {
 		t.Run(ref, func(t *testing.T) {
 			template, ok := registry.Get(ref)
 			if !ok {
@@ -734,7 +896,11 @@ func extractorFromMigratedConfig(t *testing.T, config map[string]any) *component
 	if err != nil {
 		t.Fatal(err)
 	}
-	cleaned := service.ApplyComponentScopedParserConfig(pipeline.BuildParserConfig(dsl, config), "tenant-llm")
+	cleaned, err := pipeline.BuildParserConfig(dsl, config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cleaned = service.ApplyComponentScopedParserConfig(cleaned, "tenant-llm")
 	c, err := component.NewExtractorComponent(cleaned["Extractor:AutoExtractDefault"].(map[string]any))
 	if err != nil {
 		t.Fatal(err)

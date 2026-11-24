@@ -12,6 +12,7 @@ import {
   AccordionTrigger,
 } from '@/components/ui/accordion';
 import { cn } from '@/lib/utils';
+import { formatTime } from '@/utils/date';
 import { isEmpty } from 'lodash';
 import { Operator } from '../constant';
 import { JsonViewer } from '../form/components/json-viewer';
@@ -33,9 +34,13 @@ type IToolIcon =
   | Operator.QueritSearch
   | Operator.KeenableSearch
   | Operator.YouComSearch
+  | Operator.PerplexitySearch
   | Operator.SofyaSearch
   | Operator.Search1APISearch
   | Operator.Search1APICrawl
+  | Operator.AnySearchSearch
+  | Operator.AnySearchDiscover
+  | Operator.AnySearchExtract
   | Operator.Wikipedia
   | Operator.YahooFinance
   | Operator.WenCai
@@ -86,7 +91,7 @@ const ToolTimelineItem = ({
           <TimelineItem
             key={'tool_' + idx}
             step={idx}
-            className="group-data-[orientation=vertical]/timeline:ms-10 group-data-[orientation=vertical]/timeline:not-last:pb-8"
+            className="min-w-0 group-data-[orientation=vertical]/timeline:ms-10 group-data-[orientation=vertical]/timeline:not-last:pb-8"
           >
             <TimelineHeader>
               <TimelineSeparator
@@ -164,16 +169,22 @@ const ToolTimelineItem = ({
                           </span>
                         )}
                         <span className="text-text-secondary text-xs">
-                          {/* 0:00*/}
+                          {tool.timestamp ? formatTime(tool.timestamp) : ''}
+                          {tool.timestamp && ' | '}
                           {tool.elapsed_time?.toString().slice(0, 6) || ''}
                           {tool.elapsed_time ? 's' : ''}
                         </span>
                         <span
                           className={cn(
-                            'border-background  -end-1 -top-1 size-2 rounded-full bg-state--success',
+                            'border-background  -end-1 -top-1 size-2 rounded-full',
+                            tool.status === 'error'
+                              ? 'bg-state--error'
+                              : 'bg-state--success',
                           )}
                         >
-                          <span className="sr-only">Online</span>
+                          <span className="sr-only">
+                            {tool.status === 'error' ? 'Error' : 'Online'}
+                          </span>
                         </span>
                       </div>
                     </AccordionTrigger>
@@ -183,6 +194,10 @@ const ToolTimelineItem = ({
                           <JsonViewer
                             data={tool.result}
                             title="content"
+                          ></JsonViewer>
+                          <JsonViewer
+                            data={tool.arguments}
+                            title="Arguments"
                           ></JsonViewer>
                         </div>
                       </AccordionContent>
@@ -199,8 +214,10 @@ const ToolTimelineItem = ({
                                   <div className="text-sm font-medium leading-none">
                                     {key}
                                   </div>
-                                  <div className="text-sm text-muted-foreground mt-1">
-                                    {val as string}
+                                  <div className="min-w-0 max-w-full whitespace-pre-wrap [overflow-wrap:anywhere] text-sm text-muted-foreground mt-1">
+                                    {typeof val === 'string'
+                                      ? val
+                                      : JSON.stringify(val)}
                                   </div>
                                 </div>
                               );

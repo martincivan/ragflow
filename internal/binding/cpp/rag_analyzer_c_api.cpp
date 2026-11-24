@@ -2,6 +2,7 @@
 
 #include "rag_analyzer_c_api.h"
 #include "rag_analyzer.h"
+#include "spm_unigram.h"
 #include "term.h"
 #include <cstring>
 #include <string>
@@ -29,7 +30,11 @@ void RAGAnalyzer_Destroy(RAGAnalyzerHandle handle) {
 int RAGAnalyzer_Load(RAGAnalyzerHandle handle) {
     if (!handle) return -1;
     RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
-    return analyzer->Load();
+    try {
+        return analyzer->Load();
+    } catch (...) {
+        return -1;
+    }
 }
 
 void RAGAnalyzer_SetFineGrained(RAGAnalyzerHandle handle, bool fine_grained) {
@@ -46,47 +51,58 @@ void RAGAnalyzer_SetEnablePosition(RAGAnalyzerHandle handle, bool enable_positio
 
 void RAGAnalyzer_SetLanguage(RAGAnalyzerHandle handle, const char* language) {
     if (!handle || !language) return;
-    RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
-    analyzer->SetLanguage(std::string(language));
+    try {
+        RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
+        analyzer->SetLanguage(std::string(language));
+    } catch (...) {
+    }
 }
 
 int RAGAnalyzer_Analyze(RAGAnalyzerHandle handle, const char* text, RAGTokenCallback callback) {
     if (!handle || !text || !callback) return -1;
 
-    RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
+    try {
+        RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
 
-    Term input;
-    input.text_ = std::string(text);
+        Term input;
+        input.text_ = std::string(text);
 
-    TermList output;
-    // Use the analyzer's internal state for fine_grained and enable_position
-    int ret = analyzer->Analyze(input, output, analyzer->fine_grained_, analyzer->enable_position_);
+        TermList output;
+        // Use the analyzer's internal state for fine_grained and enable_position
+        int ret = analyzer->Analyze(input, output, analyzer->fine_grained_, analyzer->enable_position_);
 
-    if (ret != 0) {
-        return ret;
+        if (ret != 0) {
+            return ret;
+        }
+
+        // Call callback for each token
+        for (const auto& term : output) {
+            callback(term.text_.c_str(), term.text_.length(), term.word_offset_, term.end_offset_);
+        }
+
+        return 0;
+    } catch (...) {
+        return -1;
     }
-
-    // Call callback for each token
-    for (const auto& term : output) {
-        callback(term.text_.c_str(), term.text_.length(), term.word_offset_, term.end_offset_);
-    }
-
-    return 0;
 }
 
 char* RAGAnalyzer_Tokenize(RAGAnalyzerHandle handle, const char* text) {
     if (!handle || !text) return nullptr;
 
-    RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
+    try {
+        RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
 
-    std::string result = analyzer->Tokenize(std::string(text));
+        std::string result = analyzer->Tokenize(std::string(text));
 
-    // Allocate memory for C string
-    char* c_result = static_cast<char*>(malloc(result.size() + 1));
-    if (c_result) {
-        std::memcpy(c_result, result.c_str(), result.size() + 1);
+        // Allocate memory for C string
+        char* c_result = static_cast<char*>(malloc(result.size() + 1));
+        if (c_result) {
+            std::memcpy(c_result, result.c_str(), result.size() + 1);
+        }
+        return c_result;
+    } catch (...) {
+        return nullptr;
     }
-    return c_result;
 }
 
 RAGTokenList* RAGAnalyzer_TokenizeWithPosition(RAGAnalyzerHandle handle, const char* text) {
@@ -94,19 +110,27 @@ RAGTokenList* RAGAnalyzer_TokenizeWithPosition(RAGAnalyzerHandle handle, const c
 
     RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
 
-    auto [tokens, positions] = analyzer->TokenizeWithPosition(std::string(text));
-    if (analyzer->fine_grained_) {
-        std::string joined_tokens;
-        for (size_t i = 0; i < tokens.size(); ++i) {
-            if (i > 0) joined_tokens += " ";
-            joined_tokens += tokens[i];
-        }
+    std::vector<std::string> tokens;
+    std::vector<std::pair<unsigned, unsigned>> positions;
+    try {
+        auto result = analyzer->TokenizeWithPosition(std::string(text));
+        tokens = std::move(result.first);
+        positions = std::move(result.second);
+        if (analyzer->fine_grained_) {
+            std::string joined_tokens;
+            for (size_t i = 0; i < tokens.size(); ++i) {
+                if (i > 0) joined_tokens += " ";
+                joined_tokens += tokens[i];
+            }
 
-        std::vector<std::string> fine_tokens;
-        std::vector<std::pair<unsigned, unsigned>> fine_positions;
-        analyzer->FineGrainedTokenizeWithPosition(joined_tokens, positions, fine_tokens, fine_positions);
-        tokens = std::move(fine_tokens);
-        positions = std::move(fine_positions);
+            std::vector<std::string> fine_tokens;
+            std::vector<std::pair<unsigned, unsigned>> fine_positions;
+            analyzer->FineGrainedTokenizeWithPosition(joined_tokens, positions, fine_tokens, fine_positions);
+            tokens = std::move(fine_tokens);
+            positions = std::move(fine_positions);
+        }
+    } catch (...) {
+        return nullptr;
     }
 
     RAGTokenList* token_list = static_cast<RAGTokenList*>(malloc(sizeof(RAGTokenList)));
@@ -176,49 +200,61 @@ uint32_t RAGToken_GetEndOffset(void* token) {
 char* RAGAnalyzer_FineGrainedTokenize(RAGAnalyzerHandle handle, const char* tokens) {
     if (!handle || !tokens) return nullptr;
 
-    RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
+    try {
+        RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
 
-    std::vector<std::string> result;
-    analyzer->FineGrainedTokenize(std::string(tokens), result);
+        std::vector<std::string> result;
+        analyzer->FineGrainedTokenize(std::string(tokens), result);
 
-    // Join results with space
-    std::string result_str;
-    for (size_t i = 0; i < result.size(); ++i) {
-        if (i > 0) result_str += " ";
-        result_str += result[i];
+        // Join results with space
+        std::string result_str;
+        for (size_t i = 0; i < result.size(); ++i) {
+            if (i > 0) result_str += " ";
+            result_str += result[i];
+        }
+
+        // Allocate memory for C string
+        char* c_result = static_cast<char*>(malloc(result_str.size() + 1));
+        if (c_result) {
+            std::memcpy(c_result, result_str.c_str(), result_str.size() + 1);
+        }
+        return c_result;
+    } catch (...) {
+        return nullptr;
     }
-
-    // Allocate memory for C string
-    char* c_result = static_cast<char*>(malloc(result_str.size() + 1));
-    if (c_result) {
-        std::memcpy(c_result, result_str.c_str(), result_str.size() + 1);
-    }
-    return c_result;
 }
 
 int32_t RAGAnalyzer_GetTermFreq(RAGAnalyzerHandle handle, const char* term) {
     if (!handle || !term) return 0;
 
-    RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
-    return analyzer->Freq(term);
+    try {
+        RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
+        return analyzer->Freq(term);
+    } catch (...) {
+        return 0;
+    }
 }
 
 char* RAGAnalyzer_GetTermTag(RAGAnalyzerHandle handle, const char* term) {
     if (!handle || !term) return nullptr;
 
-    RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
-    std::string tag_result = analyzer->Tag(term);
+    try {
+        RAGAnalyzer* analyzer = static_cast<RAGAnalyzer*>(handle);
+        std::string tag_result = analyzer->Tag(term);
 
-    if (tag_result.empty()) {
+        if (tag_result.empty()) {
+            return nullptr;
+        }
+
+        // Allocate memory for C string
+        char* c_result = static_cast<char*>(malloc(tag_result.size() + 1));
+        if (c_result) {
+            std::memcpy(c_result, tag_result.c_str(), tag_result.size() + 1);
+        }
+        return c_result;
+    } catch (...) {
         return nullptr;
     }
-
-    // Allocate memory for C string
-    char* c_result = static_cast<char*>(malloc(tag_result.size() + 1));
-    if (c_result) {
-        std::memcpy(c_result, tag_result.c_str(), tag_result.size() + 1);
-    }
-    return c_result;
 }
 
 RAGAnalyzerHandle RAGAnalyzer_Copy(RAGAnalyzerHandle handle) {
@@ -230,6 +266,77 @@ RAGAnalyzerHandle RAGAnalyzer_Copy(RAGAnalyzerHandle handle) {
     } catch (...) {
         return nullptr;
     }
+}
+
+SPMVocabHandle SPM_Vocab_Create(const char* const* keys,
+                                const uint32_t* key_lens,
+                                const int32_t* ids,
+                                uint32_t num_keys,
+                                const float* scores,
+                                uint32_t num_scores,
+                                float unk_score,
+                                int32_t unk_id,
+                                const int32_t* byte_by_value,
+                                bool byte_fallback) {
+    if (!keys || !key_lens || !ids || !scores || num_keys == 0 || num_scores == 0) {
+        return nullptr;
+    }
+    try {
+        std::vector<std::string> key_vec;
+        key_vec.reserve(num_keys);
+        std::vector<int32_t> id_vec;
+        id_vec.reserve(num_keys);
+        for (uint32_t i = 0; i < num_keys; ++i) {
+            key_vec.emplace_back(keys[i], key_lens[i]);
+            id_vec.push_back(ids[i]);
+        }
+        std::vector<float> score_vec(scores, scores + num_scores);
+
+        auto* vocab = new ragflow::SPMVocab();
+        if (vocab->Build(std::move(key_vec), std::move(id_vec), score_vec, unk_score, unk_id,
+                         byte_by_value, byte_fallback) != 0) {
+            delete vocab;
+            return nullptr;
+        }
+        return static_cast<SPMVocabHandle>(vocab);
+    } catch (...) {
+        return nullptr;
+    }
+}
+
+void SPM_Vocab_Destroy(SPMVocabHandle handle) {
+    if (handle) {
+        delete static_cast<ragflow::SPMVocab*>(handle);
+    }
+}
+
+int SPM_Vocab_Viterbi(SPMVocabHandle handle,
+                      const char* text,
+                      uint32_t len,
+                      int32_t* out_ids,
+                      uint32_t out_ids_capacity,
+                      int32_t* out_count) {
+    if (!handle || !out_count) return -1;
+    try {
+        auto* vocab = static_cast<ragflow::SPMVocab*>(handle);
+        if (out_ids == nullptr) {
+            *out_count = static_cast<int32_t>(vocab->Count(text, len));
+            return 0;
+        }
+        return vocab->TokenIDs(text, len, out_ids, out_ids_capacity, out_count);
+    } catch (...) {
+        return -1;
+    }
+}
+
+uint64_t SPM_Vocab_ArrayBytes(SPMVocabHandle handle) {
+    if (!handle) return 0;
+    return static_cast<ragflow::SPMVocab*>(handle)->ArrayBytes();
+}
+
+uint64_t SPM_Vocab_ScoresBytes(SPMVocabHandle handle) {
+    if (!handle) return 0;
+    return static_cast<ragflow::SPMVocab*>(handle)->ScoresBytes();
 }
 
 } // extern "C"

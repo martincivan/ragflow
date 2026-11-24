@@ -37,7 +37,7 @@ const searchSemanticChunksToolDescription = `Pure-semantic search: ranks chunks 
 
 Use it when you can describe what you need but do NOT know how the corpus words it — and trigger it on a COUNT rather than on a feeling: once three lexical queries (grep_chunks / search_bm25_chunks) have gone at the same clue without leaving you a candidate you can test against another clue, run one probe here. This holds especially when the question asks for a NAME you have not guessed yet: guessing more names inside the same vocabulary is exactly what this tool exists to interrupt. Unlike search_chunks, this tool does not fuse your words into the ranking, and — decisively — it does NOT restrict the result set to chunks containing your terms: a hit may share no literal word with your query. That is what makes it the bridge across a wording gap, and it is also why it cannot help you find an exact literal: for an ID, a code, a quoted phrase, a spelling variant or a proper noun you already know, use grep_chunks or search_bm25_chunks instead.
 
-Write each query as a DESCRIPTION of the thing you are looking for, in the corpus's own subject matter — as if explaining it to a person who knows the domain. Describe what it IS and what is true about it, not the question's abstract wording: for a question phrased "a family business ... a hallmark award from a global brand in the 1990s", query "an Italian family restaurant in Lombardy awarded three Michelin stars in 1996" — and if that comes back off-target, change the CATEGORY you describe (restaurant -> hotel -> winery -> food producer), because the wording gap may be an ontology gap rather than a synonym gap.
+Write each query as a DESCRIPTION of the thing you are looking for, in the corpus's own subject matter — as if explaining it to a person who knows the domain. Describe what it IS and what is true about it, not the question's abstract wording: for a question phrased as abstract clues about an unnamed entity, query the entity the way the corpus would describe it ("a long-running family firm recognised by a national trade body in the 1980s") — and if that comes back off-target, change the CATEGORY you describe (firm -> hotel -> winery -> publisher), because the wording gap may be an ontology gap rather than a synonym gap.
 
 Accepts 1-5 queries. Output is the same <search_results> XML as the other locate tools; because a semantic hit usually shares no literal term with the query, its <match_snippet> is normally the chunk's own opening, marked match="none". Judge relevance from that text and deep-read with list_chunks before relying on it.`
 
@@ -46,7 +46,13 @@ Accepts 1-5 queries. Output is the same <search_results> XML as the other locate
 // is that the keyword leg cannot be dialled back in, so the field would only
 // invite the caller to rebuild search_chunks by hand.
 type searchSemanticChunksArgs struct {
-	Queries             []string `json:"queries"`
+	Queries []string `json:"queries"`
+	// Intent is what THIS call is trying to find, in the caller's own words.
+	// The filter judges a hit against THIS rather than against the overall
+	// question alone, because a necessary middle step of a multi-hop run is
+	// often irrelevant to the final question while being exactly what the step
+	// needed. Optional: omitted means the filter falls back to the question.
+	Intent              string   `json:"intent,omitempty"`
 	DatasetIDs          []string `json:"dataset_ids,omitempty"`
 	DocScope            []string `json:"doc_scope,omitempty"`
 	TopN                int      `json:"top_n,omitempty"`
@@ -103,9 +109,13 @@ func (k *SearchSemanticChunksTool) Info(_ context.Context) (*schema.ToolInfo, er
       "description": "Minimum vector similarity (0.0-1.0) for a chunk to be returned; higher is stricter (fewer, more relevant results). Default 0.2.",
       "minimum": 0,
       "maximum": 1
+    },
+    "intent": {
+      "type": "string",
+      "description": "REQUIRED: what information THIS call needs, in one sentence, e.g. the first name of Sarah Polk's mother, needed to build the final name. Each returned passage is kept or dropped by whether it serves this stated need, so name the fact you are looking for - not the search terms, and not 'relevant information'."
     }
   },
-  "required": ["queries"]
+  "required": ["queries", "intent"]
 }`
 	s := &jsonschema.Schema{}
 	if err := json.Unmarshal([]byte(schemaJSON), s); err != nil {
@@ -129,6 +139,10 @@ func (k *SearchSemanticChunksTool) invokableRun(ctx context.Context, argumentsIn
 	if err := json.Unmarshal([]byte(argumentsInJSON), &args); err != nil {
 		return "", fmt.Errorf("%s: parse arguments: %w", searchSemanticChunksToolName, err)
 	}
+
+	// Published for the decision filter: it judges each passage against this
+	// stated need, which is narrower than the overall question.
+	ctx = withIntent(ctx, args.Intent)
 	return runLocateSearch(ctx, locateSearchSpec{
 		tool:                searchSemanticChunksToolName,
 		queries:             args.Queries,

@@ -37,7 +37,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"ragflow/internal/common"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -289,7 +291,14 @@ func (l *ListOperationsComponent) Invoke(ctx context.Context, db *gorm.DB, _ map
 		if raw == nil {
 			items = []any{}
 		} else {
-			return nil, fmt.Errorf("ListOperations: input is not a list (got %T)", raw)
+			rv := reflect.ValueOf(raw)
+			if rv.Kind() != reflect.Slice && rv.Kind() != reflect.Array {
+				return nil, fmt.Errorf("ListOperations: input is not a list (got %T)", raw)
+			}
+			items = make([]any, rv.Len())
+			for i := range items {
+				items[i] = rv.Index(i).Interface()
+			}
 		}
 	}
 	// A typed nil []any satisfies the assertion above (ok=true, items=nil)
@@ -622,6 +631,14 @@ func lessKey(a, b any) bool {
 // lessScalar compares two scalar (or non-tuple) values. Numbers are
 // compared numerically; everything else via fmt.Sprintf.
 func lessScalar(a, b any) bool {
+	_, aExact := a.(json.Number)
+	_, bExact := b.(json.Number)
+	if aExact || bExact {
+		ar, br := exactSortNumber(a), exactSortNumber(b)
+		if ar != nil && br != nil {
+			return ar.Cmp(br) < 0
+		}
+	}
 	af, aok := toFloat64OK(a)
 	bf, bok := toFloat64OK(b)
 	if aok && bok {
@@ -630,18 +647,31 @@ func lessScalar(a, b any) bool {
 	return fmt.Sprintf("%v", a) < fmt.Sprintf("%v", b)
 }
 
+// exactSortNumber keeps preserved IDs distinct while comparing them with
+// ordinary numeric values. It does not rewrite the list elements.
+func exactSortNumber(value any) *big.Rat {
+	switch number := value.(type) {
+	case json.Number:
+		return runtime.ExactNumberRatio(number)
+	}
+	// Match the existing ordinary-number comparator, including native ints,
+	// so mixing a precise number with ordinary pairs keeps a consistent order.
+	number, ok := toFloat64OK(value)
+	if !ok {
+		return nil
+	}
+	return runtime.ExactNumberRatio(number)
+}
+
 // toFloat64OK is a number-without-bool helper.
 func toFloat64OK(v any) (float64, bool) {
-	if _, isBool := v.(bool); isBool {
-		return 0, false
-	}
-	switch x := v.(type) {
-	case int:
-		return float64(x), true
-	case int64:
-		return float64(x), true
-	case float64:
-		return x, true
+	// Keep the original narrow contract: only native numeric kinds are values;
+	// strings (and every other type) must fall back to lessScalar's lexical
+	// comparison. common.ToFloat parses numeric strings, so delegate only for
+	// the types this helper accepted before the convergence.
+	switch v.(type) {
+	case int, int64, float64:
+		return common.ToFloat(v)
 	}
 	return 0, false
 }

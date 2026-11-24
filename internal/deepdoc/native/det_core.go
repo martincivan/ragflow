@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 //go:build cgo
 
 package native
@@ -24,7 +40,6 @@ import (
 const (
 	detLimitSideLen  = 960
 	detThresh        = 0.3
-	detBoxThresh     = 0.5
 	detMaxCandidates = 1000
 	detUnclipRatio   = 1.5
 	detMinSize       = 3
@@ -32,6 +47,18 @@ const (
 	detMean0, detMean1, detMean2 = 0.485, 0.456, 0.406
 	detStd0, detStd1, detStd2    = 0.229, 0.224, 0.225
 )
+
+// detBoxThresh is the detection box confidence threshold. It is a package-level
+// variable (not a constant) so a downstream build variant can override it.
+// Override seam: a downstream build variant assigns this at init/startup,
+// before any inference runs. It is set once and never mutated during serving,
+// so concurrent inference stays race-free.
+var detBoxThresh float32 = 0.5
+
+// modelFileDet is the detection model filename. Override seam: a downstream
+// build variant assigns this at init/startup, before any inference runs. Set
+// once, never mutated during serving.
+var modelFileDet = "det.ort"
 
 // DetBox is one detected text region as a 4-point quad in original-image
 // coordinates, clockwise from top-left.
@@ -97,7 +124,7 @@ func getDetSession(ctx context.Context, modelPath string, rh, rw int64) (*sessio
 // extraction uses the pure-Go connected-components backend.
 func RunDet(ctx context.Context, modelDir string, img *Image) (DetResult, error) {
 	blob, rh, rw, sh, sw := detPreprocess(img)
-	sess, release, e := getDetSession(ctx, filepath.Join(modelDir, "det.ort"), int64(rh), int64(rw))
+	sess, release, e := getDetSession(ctx, filepath.Join(modelDir, modelFileDet), int64(rh), int64(rw))
 	if e != nil {
 		return DetResult{}, e
 	}

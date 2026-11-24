@@ -39,7 +39,6 @@ const (
 	defaultTelegramAPIBaseURL = "https://api.telegram.org"
 	telegramPollTimeout       = 30 * time.Second
 	telegramHTTPTimeout       = 40 * time.Second
-	telegramReconnectDelay    = 3 * time.Second
 )
 
 type telegramAccount struct {
@@ -114,7 +113,7 @@ func newTelegramChannel(account telegramAccount) *telegramChannel {
 	}
 	return &telegramChannel{
 		account: account,
-		client:  &http.Client{Timeout: telegramHTTPTimeout},
+		client:  newSafeChannelHTTPClient(telegramHTTPTimeout, channelURLPolicy{exactHosts: []string{"api.telegram.org"}}),
 	}
 }
 
@@ -203,8 +202,7 @@ func (c *telegramChannel) Stop(ctx context.Context) error {
 func (c *telegramChannel) Send(ctx context.Context, msg core.OutgoingMessage) error {
 	chatID, err := strconv.ParseInt(strings.TrimSpace(msg.ChatID), 10, 64)
 	if err != nil {
-		common.Warn("telegram: invalid chat_id", zap.String("account_id", c.account.AccountID), zap.String("chat_id", msg.ChatID), zap.Error(err))
-		return nil
+		return fmt.Errorf("telegram: invalid chat_id: %w", err)
 	}
 
 	payload := map[string]any{
@@ -219,14 +217,12 @@ func (c *telegramChannel) Send(ctx context.Context, msg core.OutgoingMessage) er
 			}
 		}
 	}
-	if err := c.callAPI(ctx, "sendMessage", payload, nil); err != nil {
-		common.Error("telegram: send failed", err, zap.String("account_id", c.account.AccountID))
-	}
-	return nil
+	return c.callAPI(ctx, "sendMessage", payload, nil)
 }
 
 // run drops queued updates and consumes Telegram updates until stopped.
 func (c *telegramChannel) run(ctx context.Context) {
+	attempts := 0
 	for ctx.Err() == nil {
 		err := c.callAPI(ctx, "deleteWebhook", map[string]any{
 			"drop_pending_updates": true,
@@ -235,7 +231,8 @@ func (c *telegramChannel) run(ctx context.Context) {
 			break
 		}
 		common.Error("telegram: failed to start polling", err, zap.String("account_id", c.account.AccountID))
-		if !waitForTelegramRetry(ctx) {
+		attempts++
+		if !waitForContext(ctx, channelRetryDelay(attempts)) {
 			return
 		}
 	}
@@ -243,6 +240,7 @@ func (c *telegramChannel) run(ctx context.Context) {
 		return
 	}
 
+	attempts = 0
 	for ctx.Err() == nil {
 		updates, err := c.getUpdates(ctx)
 		if err != nil {
@@ -250,11 +248,13 @@ func (c *telegramChannel) run(ctx context.Context) {
 				return
 			}
 			common.Error("telegram: polling failed", err, zap.String("account_id", c.account.AccountID))
-			if !waitForTelegramRetry(ctx) {
+			attempts++
+			if !waitForContext(ctx, channelRetryDelay(attempts)) {
 				return
 			}
 			continue
 		}
+		attempts = 0
 		for _, update := range updates {
 			if update.UpdateID >= c.offset {
 				c.offset = update.UpdateID + 1
@@ -384,7 +384,7 @@ func (c *telegramChannel) callAPI(ctx context.Context, method string, params map
 		return err
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		return fmt.Errorf("Telegram API %s returned status %d: %s", method, resp.StatusCode, string(body))
+		return fmt.Errorf("Telegram API %s returned status %d: %.200s", method, resp.StatusCode, body)
 	}
 
 	var response telegramAPIResponse
@@ -392,7 +392,7 @@ func (c *telegramChannel) callAPI(ctx context.Context, method string, params map
 		return fmt.Errorf("Telegram API %s returned invalid JSON: %w", method, err)
 	}
 	if !response.OK {
-		return fmt.Errorf("Telegram API %s failed: %s", method, response.Description)
+		return fmt.Errorf("Telegram API %s failed: %.200s", method, response.Description)
 	}
 	if out != nil && len(response.Result) > 0 {
 		if err := json.Unmarshal(response.Result, out); err != nil {
@@ -400,15 +400,4 @@ func (c *telegramChannel) callAPI(ctx context.Context, method string, params map
 		}
 	}
 	return nil
-}
-
-func waitForTelegramRetry(ctx context.Context) bool {
-	timer := time.NewTimer(telegramReconnectDelay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }

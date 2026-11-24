@@ -1,4 +1,5 @@
-import { FileType, FileTypeSuffixMap } from '@/constants/file';
+import { FileType } from '@/constants/file';
+import { extraExtractorParams } from '@/ee/pages/agent/extractor-params-private';
 import {
   DSL,
   DSLComponents,
@@ -7,6 +8,7 @@ import {
   ICategorizeForm,
   ICategorizeItem,
   ICategorizeItemResult,
+  ISwitchForm,
   RAGFlowNodeType,
 } from '@/interfaces/database/agent';
 import { buildSelectOptions } from '@/utils/component-util';
@@ -33,10 +35,15 @@ import {
   NoDebugOperatorsList,
   NodeHandleId,
   Operator,
+  SwitchElseTo,
   TitleChunkerMethod,
   TypesWithArray,
   WebhookSecurityAuthType,
 } from './constant';
+import {
+  ScoredSwitchEscalateHandleId,
+  showsScoredSwitchEscalateHandle,
+} from './scored-switch';
 import { BeginFormSchemaType } from './form/begin-form/schema';
 import { DataOperationsFormSchemaType } from './form/data-operations-form';
 import { ExtractorFormSchemaType } from './form/extractor-form';
@@ -135,6 +142,10 @@ function buildAgentTools(edges: Edge[], nodes: Node[], nodeId: string) {
   };
 }
 
+export const generateSwitchHandleText = (idx: number) => {
+  return `Case ${idx + 1}`;
+};
+
 function filterTargetsBySourceHandleId(edges: Edge[], handleId: string) {
   return edges.filter((x) => x.sourceHandle === handleId).map((x) => x.target);
 }
@@ -160,6 +171,43 @@ function buildCategorize(edges: Edge[], nodes: Node[], nodeId: string) {
     }, {});
 
     params.category_description = nextCategoryDescription;
+  }
+  return omit(params, 'items');
+}
+
+function buildScoredSwitch(edges: Edge[], nodes: Node[], nodeId: string) {
+  const node = nodes.find((x) => x.id === nodeId);
+  const params = { ...(node?.data.form ?? {}) } as Record<string, any>;
+  if (node && node.data.label === Operator.ScoredSwitch) {
+    const subEdges = edges.filter((x) => x.source === nodeId);
+    const items = (params.items || []) as Array<{
+      name: string;
+      description?: string;
+      uuid: string;
+    }>;
+    const escalateEnabled = showsScoredSwitchEscalateHandle(
+      params.escalate_enabled,
+      params.field_mode,
+    );
+    params.escalate_enabled = escalateEnabled;
+    params.options = items.map((item) => ({
+      name: item.name,
+      description: item.description,
+      uuid: item.uuid,
+      to: filterTargetsBySourceHandleId(subEdges, item.uuid),
+    }));
+    params.escalate_to = escalateEnabled
+      ? filterTargetsBySourceHandleId(subEdges, ScoredSwitchEscalateHandleId)
+      : [];
+    params.field_to =
+      params.field_mode === true
+        ? filterTargetsBySourceHandleId(subEdges, NodeHandleId.End)
+        : [];
+    if (Array.isArray(params.tasks)) {
+      params.tasks = params.tasks.map((task: Record<string, unknown>) =>
+        omit(task, '_key'),
+      );
+    }
   }
   return omit(params, 'items');
 }
@@ -204,6 +252,14 @@ function transformObjectArrayToPureArray(
     : [];
 }
 
+/**
+ * Serializes parser form values into per-file-family API parameters.
+ * Normalizes global vision settings while preserving explicit PDF MinerU
+ * controls (including false) and the independent image OCR switch/model ID.
+ *
+ * @param params - Parser form values, including setups and global vision options.
+ * @returns File-family parameters alongside normalized global vision settings.
+ */
 export function transformParserParams(params: ParserFormSchemaType) {
   // Save global vision options from the normalized form alongside the
   // per-family setups, including nodes whose form has not been opened.
@@ -214,22 +270,25 @@ export function transformParserParams(params: ParserFormSchemaType) {
     if (cur.fileFormat) {
       let filteredSetup: Partial<
         Omit<ParserFormSchemaType['setups'][0], 'pages'> & {
-          suffix: string[];
-        } & {
           two_column_check: boolean;
           enable_multi_column: boolean;
           pages: number[][];
         }
-      > = {
-        output_format: cur.output_format,
-        suffix: FileTypeSuffixMap[cur.fileFormat as FileType],
-      };
+      > = {};
 
       switch (cur.fileFormat) {
         case FileType.PDF:
           filteredSetup = {
             ...filteredSetup,
             parse_method: cur.parse_method,
+            mineru_parse_method: cur.mineru_parse_method,
+            mineru_lang: cur.mineru_lang,
+            mineru_formula_enable: cur.mineru_formula_enable,
+            mineru_table_enable: cur.mineru_table_enable,
+            unlimited_ocr_crop_mode: cur.unlimited_ocr_crop_mode,
+            unlimited_ocr_no_repeat_ngram_size:
+              cur.unlimited_ocr_no_repeat_ngram_size,
+            unlimited_ocr_page_guard: cur.unlimited_ocr_page_guard,
             lang: cur.lang,
             enable_multi_column: cur.enable_multi_column,
             remove_toc: cur.remove_toc,
@@ -271,6 +330,7 @@ export function transformParserParams(params: ParserFormSchemaType) {
           filteredSetup = {
             ...filteredSetup,
             ocr_enabled: cur.ocr_enabled,
+            ocr_model_id: cur.ocr_model_id,
           };
           break;
         case FileType.Email:
@@ -378,13 +438,17 @@ export function transformTokenChunkerParams(
     // while merging everything into a single chunk, but zeroing them here
     // wiped the user's settings on every save (they reloaded as 0 / ["\n"]).
     overlapped_percent: Number(rest.overlapped_percent) / 100,
-    delimiters: transformObjectArrayToPureArray(rest.delimiters, 'value'),
+    delimiters: rest.delimiters.map(
+      ({ value }: { value?: string }) => value ?? '',
+    ),
     table_context_size: imageTableContextWindow,
     image_context_size: imageTableContextWindow,
 
     // Unset children delimiters if this option is not enabled
     children_delimiters: rest.enable_children
-      ? transformObjectArrayToPureArray(rest.children_delimiters, 'value')
+      ? rest.children_delimiters.map(
+          ({ value }: { value?: string }) => value ?? '',
+        )
       : [],
   };
 }
@@ -422,6 +486,7 @@ export function transformGeneralChunkerParams(
   return result;
 }
 
+// Resolve active heading settings and preserve independent media-context budgets.
 export function transformTitleChunkerParams(
   params: TitleChunkerFormSchemaType,
 ) {
@@ -466,6 +531,8 @@ export function transformTitleChunkerParams(
     hierarchy: Number(hierarchyValue || 0),
     include_heading_content: Boolean(params.include_heading_content),
     root_chunk_as_heading: Boolean(params.root_chunk_as_heading),
+    table_context_size: Number(params.table_context_size ?? 0),
+    image_context_size: Number(params.image_context_size ?? 0),
     ...(chunkTokenCap === undefined || chunkTokenCap === null
       ? {}
       : { chunk_token_cap: Number(chunkTokenCap) }),
@@ -585,6 +652,10 @@ export function transformExtractorParams(
       metadata: metadataList,
       built_in_metadata: builtInMetadataList,
     },
+    // Sub-tasks the shared form has no control for ride through the overlay:
+    // a copied canvas must keep them or the Tokenizer's configured field
+    // goes stale.
+    ...extraExtractorParams(raw),
   };
 }
 
@@ -719,6 +790,31 @@ export const buildDslComponentsByGraph = (
         case Operator.Categorize:
           params = buildCategorize(edges, nodes, id);
           break;
+        case Operator.ScoredSwitch:
+          params = buildScoredSwitch(edges, nodes, id);
+          break;
+
+        case Operator.Switch: {
+          const switchParams = params as ISwitchForm;
+          const branchEdges = edges.filter((edge) => edge.source === id);
+          params = {
+            ...switchParams,
+            conditions: (switchParams.conditions ?? []).map(
+              (condition, index) => ({
+                ...condition,
+                to: filterTargetsBySourceHandleId(
+                  branchEdges,
+                  generateSwitchHandleText(index),
+                ),
+              }),
+            ),
+            [SwitchElseTo]: filterTargetsBySourceHandleId(
+              branchEdges,
+              SwitchElseTo,
+            ),
+          };
+          break;
+        }
 
         case Operator.Parser:
           params = transformParserParams(params);
@@ -756,6 +852,20 @@ export const buildDslComponentsByGraph = (
           break;
         case Operator.Begin:
           params = transformBeginParams(params);
+          break;
+        case Operator.UserFillUp:
+          if (Array.isArray(params.inputs)) {
+            params = {
+              ...params,
+              inputs: params.inputs.reduce(
+                (inputs, { key, ...value }) => {
+                  inputs[key] = value;
+                  return inputs;
+                },
+                {} as Record<string, Omit<BeginQuery, 'key'>>,
+              ),
+            };
+          }
           break;
         default:
           break;
@@ -880,10 +990,6 @@ export const getOperatorIndex = (handleTitle: string) => {
   return handleTitle.split(' ').at(-1);
 };
 
-export const generateSwitchHandleText = (idx: number) => {
-  return `Case ${idx + 1}`;
-};
-
 export const getNodeDragHandle = (nodeType?: string) => {
   return nodeType === Operator.Note ? '.note-drag-handle' : undefined;
 };
@@ -955,6 +1061,15 @@ export const duplicateNodeForm = (nodeData?: RAGFlowNodeType['data']) => {
       };
       return pre;
     }, {});
+  }
+  if (nodeData?.label === Operator.ScoredSwitch) {
+    form.escalate_to = [];
+    if (Array.isArray(form.options)) {
+      form.options = form.options.map((option: Record<string, any>) => ({
+        ...option,
+        to: [],
+      }));
+    }
   }
 
   return {
@@ -1046,12 +1161,13 @@ export function convertToObjectArray<T extends string | number | boolean>(
 }
 
 /**
- * Message (回复消息) components keep their texts in form.content (string[]).
- * The backend rejects the component at canvas run time unless at least one
- * entry is a non-blank string, so missing/non-array/blank-only content all
- * count as empty here as well.
+ * Message accepts text/content strings or content arrays; every entry must
+ * be a non-blank string to match backend execution validation.
  */
 export function isEmptyMessageContent(content?: unknown): boolean {
+  if (typeof content === 'string') {
+    return content.trim() === '';
+  }
   return (
     !Array.isArray(content) ||
     content.length === 0 ||

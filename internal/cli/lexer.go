@@ -367,6 +367,12 @@ func (l *Lexer) lookupIdent(ident string) Token {
 		return Token{Type: TokenGet, Value: ident}
 	case "SEARCH":
 		return Token{Type: TokenSearch, Value: ident}
+	case "FIND":
+		return Token{Type: TokenFind, Value: ident}
+	case "WS":
+		return Token{Type: TokenWS, Value: ident}
+	case "NEW":
+		return Token{Type: TokenNew, Value: ident}
 	case "AGENT":
 		return Token{Type: TokenAgent, Value: ident}
 	case "CORES":
@@ -569,6 +575,18 @@ func (l *Lexer) lookupIdent(ident string) Token {
 		return Token{Type: TokenFatal, Value: ident}
 	case "PANIC":
 		return Token{Type: TokenPanic, Value: ident}
+	case "GROUP":
+		return Token{Type: TokenGroup, Value: ident}
+	case "GROUPS":
+		return Token{Type: TokenGroups, Value: ident}
+	case "FEATURES":
+		return Token{Type: TokenFeatures, Value: ident}
+	case "DEPLOY":
+		return Token{Type: TokenDeploy, Value: ident}
+	case "BY":
+		return Token{Type: TokenBy, Value: ident}
+	case "DATE":
+		return Token{Type: TokenDate, Value: ident}
 	case "PARAM":
 		return Token{Type: TokenParam, Value: ident}
 	case "PLAY":

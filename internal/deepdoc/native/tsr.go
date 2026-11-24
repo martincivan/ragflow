@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 //go:build cgo
 
 package native
@@ -19,6 +35,11 @@ import (
 
 const tsrInputSize = 640
 const tsrCandidates = 8400
+
+// modelFileTsr is the table-structure recognition model filename. Override
+// seam: a downstream build variant assigns this at init/startup, before any
+// inference runs. Set once, never mutated during serving.
+var modelFileTsr = "tsr.ort"
 
 // tsrLabels mirrors TableStructureRecognizer.labels (also tsr_adapter.TSR_CLASS_MAP keys).
 var tsrLabels = []string{
@@ -44,7 +65,7 @@ type TSRResult struct {
 // RunTSR runs table-structure recognition on a cropped table image.
 func RunTSR(ctx context.Context, modelDir string, img *Image) (TSRResult, error) {
 	blob, sf := tsrPreprocess(img)
-	sess, release, err := getModelSession(ctx, filepath.Join(modelDir, "tsr.ort"), "images",
+	sess, release, err := getModelSession(ctx, filepath.Join(modelDir, modelFileTsr), "images",
 		[]int64{1, 3, tsrInputSize, tsrInputSize}, "output0")
 	if err != nil {
 		return TSRResult{}, err
@@ -275,10 +296,10 @@ func (r TSRResult) ClampBoxes() []TSRBox {
 	w, h := float32(r.W), float32(r.H)
 	out := make([]TSRBox, len(r.Boxes))
 	for i, b := range r.Boxes {
-		b.X0 = minf(maxf(b.X0, 0), w)
-		b.X1 = minf(maxf(b.X1, 0), w)
-		b.Top = minf(maxf(b.Top, 0), h)
-		b.Bottom = minf(maxf(b.Bottom, 0), h)
+		b.X0 = clampCoord(b.X0, w)
+		b.X1 = clampCoord(b.X1, w)
+		b.Top = clampCoord(b.Top, h)
+		b.Bottom = clampCoord(b.Bottom, h)
 		out[i] = b
 	}
 	return out

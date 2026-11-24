@@ -5,10 +5,9 @@ import (
 	"testing"
 )
 
-// TestRemoveContentsTable mirrors the Python remove_contents_table
-// (rag/nlp/__init__.py:937-965). It locates a TOC heading
-// (contents/目录/目次/...), drops it, then drops the following
-// entries that share a common prefix with the first TOC entry.
+// TestRemoveContentsTable covers the plain-text rules that HTML, DOC and DOCX
+// share. It locates a TOC heading (contents/目录/目次/...), drops it, then drops
+// the following entries that share a common prefix with the first TOC entry.
 func TestRemoveContentsTable(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -40,6 +39,22 @@ func TestRemoveContentsTable(t *testing.T) {
 				{"text": "前言"},
 				{"text": "第二章 方法"},
 				{"text": "正文开始"},
+			},
+		},
+		{
+			name: "multi-word Table of Contents heading + first TOC entry removed",
+			items: []map[string]any{
+				{"text": "Intro"},
+				{"text": "Table of  Contents"},
+				{"text": "Chapter 1 Overview"},
+				{"text": "Chapter 2 Method"},
+				{"text": "Body starts"},
+			},
+			eng: true,
+			want: []map[string]any{
+				{"text": "Intro"},
+				{"text": "Chapter 2 Method"},
+				{"text": "Body starts"},
 			},
 		},
 		{
@@ -161,5 +176,19 @@ func TestRemoveTOCWordEnglishDetection(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Errorf("English TOC detection: got %v, want %v", got, want)
+	}
+}
+
+// TestRemoveContentsTableKeepsMarkup pins that the HTML/DOC/DOCX contract is unchanged:
+// markup markers are part of the text there, so a marked heading is not a TOC.
+func TestRemoveContentsTableKeepsMarkup(t *testing.T) {
+	items := []map[string]any{
+		{"text": "# 目录"},
+		{"text": "* 第一章 概述"},
+		{"text": "正文"},
+	}
+	got := removeContentsTable(items, false)
+	if !reflect.DeepEqual(got, items) {
+		t.Errorf("got %v, want unchanged %v", got, items)
 	}
 }

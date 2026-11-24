@@ -1,8 +1,25 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package tool
 
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -32,6 +49,9 @@ func (f *navRoutingFake) Search(_ context.Context, _, _ string, query string, _ 
 	f.scopes = append(f.scopes, append([]string(nil), docScope...))
 	f.mu.Unlock()
 	return f.hits, nil
+}
+func (f *navRoutingFake) EncodeQueryVector(context.Context, string, string) []float64 {
+	return nil
 }
 func (f *navRoutingFake) ListClusters(context.Context, string, string, string, int, int) ([]nav.NavNode, int64, error) {
 	return f.clusters, int64(len(f.clusters)), nil
@@ -204,6 +224,33 @@ func TestDatasetNavigation_DocScopeFiltersClusterFallback(t *testing.T) {
 	}
 }
 
+// TestDatasetNavigation_RecallFallbackDisablesDenseFallback pins the agentic
+// half of the split on the content-recall tier: when the nav tree routes
+// nothing the tool recalls by chunk content, and the model reads those chunks
+// as evidence, so no dense-only rescue there either.
+func TestDatasetNavigation_RecallFallbackDisablesDenseFallback(t *testing.T) {
+	fake := &navRoutingFake{}
+	prevNav := nav.GetNavService()
+	nav.SetNavService(fake)
+	defer func() { nav.SetNavService(prevNav) }()
+
+	prevSvc := GetRetrievalService()
+	svc := &capturingRetrievalService{}
+	SetRetrievalService(svc)
+	defer func() { SetRetrievalService(prevSvc) }()
+
+	tool := NewDatasetNavigationByTree()
+	if _, err := tool.InvokableRun(navTestContext(t), `{"topic":"X","dataset_ids":["kb1"]}`); err != nil {
+		t.Fatalf("InvokableRun: %v", err)
+	}
+	if svc.req.Query == "" {
+		t.Fatal("content-recall tier was not exercised: the tool never reached the retrieval service")
+	}
+	if svc.req.AllowDenseFallback == nil || *svc.req.AllowDenseFallback {
+		t.Fatal("dataset navigation is agentic and must disable the dense fallback")
+	}
+}
+
 // TestDatasetNavigation_BlankRequestScopeFallsBackToDefaults pins that a blank
 // request value cannot DISABLE the configured default scope: [" "] has a
 // non-zero length, so it suppressed the default and then compacted to an empty
@@ -229,6 +276,42 @@ func TestDatasetNavigation_BlankRequestScopeFallsBackToDefaults(t *testing.T) {
 	}
 	if docs := decodeNavDocs(t, out); len(docs) != 1 || docs[0] != "d1" {
 		t.Errorf("docs = %v, want only the in-scope d1 (a blank request value must not disable the default scope)", docs)
+	}
+}
+
+// TestDatasetNavigation_MaxDocsCannotExceedCap pins the ceiling on the
+// doc-count budget: the model's argument JSON is not schema-validated, so a
+// max_docs above the cap must be clamped down to it, while a smaller value still
+// narrows the result.
+func TestDatasetNavigation_MaxDocsCannotExceedCap(t *testing.T) {
+	hits := make([]nav.NavHit, 0, 20)
+	for i := 0; i < 20; i++ {
+		hits = append(hits, nav.NavHit{Type: nav.TypeNavDoc, DocID: fmt.Sprintf("d%02d", i)})
+	}
+	cases := []struct {
+		name string
+		args string
+		want int
+	}{
+		{"above the cap", `{"topic":"X","dataset_ids":["kb1"],"max_docs":5000}`, datasetNavigationDefaultMaxDocs},
+		{"below the cap", `{"topic":"X","dataset_ids":["kb1"],"max_docs":2}`, 2},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fake := &navRoutingFake{hits: hits}
+			prev := nav.GetNavService()
+			nav.SetNavService(fake)
+			defer func() { nav.SetNavService(prev) }()
+
+			tool := NewDatasetNavigationByTree()
+			out, err := tool.InvokableRun(navTestContext(t), tc.args)
+			if err != nil {
+				t.Fatalf("InvokableRun: %v", err)
+			}
+			if docs := decodeNavDocs(t, out); len(docs) != tc.want {
+				t.Errorf("docs = %d, want %d", len(docs), tc.want)
+			}
+		})
 	}
 }
 

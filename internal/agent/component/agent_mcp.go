@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package component
 
 import (
@@ -11,11 +27,13 @@ import (
 
 	einotool "github.com/cloudwego/eino/components/tool"
 	"gorm.io/gorm"
+
 	"ragflow/internal/agent/runtime"
 	agenttool "ragflow/internal/agent/tool"
 	"ragflow/internal/dao"
+	mcpclient "ragflow/internal/mcp/client"
 	"ragflow/internal/permission"
-	"ragflow/internal/utility"
+	servercfg "ragflow/internal/server"
 )
 
 // buildAgentMCPTools binds the saved tool selection to servers the canvas can use.
@@ -25,8 +43,8 @@ func buildAgentMCPTools(ctx context.Context, db *gorm.DB, raw any, timeout time.
 		return nil, nil
 	}
 	var selections []struct {
-		ID    string                  `json:"mcp_id"`
-		Tools map[string]utility.Tool `json:"tools"`
+		ID    string                    `json:"mcp_id"`
+		Tools map[string]mcpclient.Tool `json:"tools"`
 	}
 	data, err := json.Marshal(raw)
 	if err != nil {
@@ -45,16 +63,27 @@ func buildAgentMCPTools(ctx context.Context, db *gorm.DB, raw any, timeout time.
 		if err != nil || state == nil || db == nil {
 			return nil, fmt.Errorf("MCP server %q: missing runtime tenant or database", selection.ID)
 		}
-		userID, _ := state.Sys["user_id"].(string)
-		canvasID, _ := state.Sys["canvas_id"].(string)
+		userID, _ := state.GetSysString("user_id")
+		canvasID, _ := state.GetSysString("canvas_id")
 		if strings.TrimSpace(userID) == "" || strings.TrimSpace(canvasID) == "" {
 			return nil, fmt.Errorf("MCP server %q: missing runtime user or canvas", selection.ID)
 		}
-		tenantID, _ := state.Sys["tenant_id"].(string)
+		tenantID, _ := state.GetSysString("tenant_id")
+		tenantID = strings.TrimSpace(tenantID)
+		contextUserID := permission.UserIDFromContext(ctx)
+		contextTenantID := permission.TenantIDFromContext(ctx)
+		if contextUserID != "" && contextUserID != userID {
+			return nil, permission.ErrIdentityMismatch
+		}
+		if contextTenantID != "" && tenantID != "" && contextTenantID != tenantID {
+			return nil, permission.ErrIdentityMismatch
+		}
+		if contextUserID == "" || contextTenantID == "" {
+			ctx = permission.WithIdentity(ctx, userID, tenantID)
+		}
 		checker := permission.NewDatabaseChecker(db)
 		err = checker.CheckDependency(
 			ctx,
-			permission.Subject{UserID: userID, TenantID: tenantID},
 			permission.ResourceRef{Kind: permission.ResourceKindCanvas, ID: canvasID},
 			permission.ResourceRef{Kind: permission.ResourceKindMCPServer, ID: selection.ID},
 			permission.OperationRun,
@@ -82,11 +111,13 @@ func buildAgentMCPTools(ctx context.Context, db *gorm.DB, raw any, timeout time.
 		for key, value := range server.Variables {
 			variables[key] = fmt.Sprint(value)
 		}
+		allowPrivateHosts := servercfg.MCPAllowPrivateHosts()
 		for _, name := range slices.Sorted(maps.Keys(selection.Tools)) {
 			descriptor := selection.Tools[name]
 			descriptor.Name = name
-			adapter := agenttool.NewMCPToolAdapterWithOptions(descriptor, utility.CallOptions{
+			adapter := agenttool.NewMCPToolAdapterWithOptions(descriptor, mcpclient.CallOptions{
 				URL: server.URL, ServerType: server.ServerType, Headers: headers, Variables: variables, Timeout: timeout,
+				AllowPrivateHosts: allowPrivateHosts,
 			})
 			adapter.SetVisibleName(fmt.Sprintf("%s_%d", name, toolIndex))
 			toolIndex++

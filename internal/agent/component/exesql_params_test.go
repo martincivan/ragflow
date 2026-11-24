@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package component
 
 import (
@@ -56,7 +72,7 @@ func TestValidateDynamicEntriesExeSQL(t *testing.T) {
 		"port":        3306,
 		"max_records": 1024,
 	}))
-	if err := ValidateDynamicEntries(templateScaffold); err != nil {
+	if err := ValidateDraftDynamicEntries(templateScaffold); err != nil {
 		t.Fatalf("unconfigured ExeSQL scaffold rejected: %v", err)
 	}
 
@@ -68,7 +84,7 @@ func TestValidateDynamicEntriesExeSQL(t *testing.T) {
 		{
 			"scaffold with only host filled",
 			componentDSL("ExeSQL", map[string]any{"db_type": "mysql", "database": "", "username": "", "host": "10.0.0.5", "password": ""}),
-			"[ExeSQL] Database name does not support empty value",
+			"Database name does not support empty value",
 		},
 		{
 			"unsupported db_type",
@@ -83,27 +99,27 @@ func TestValidateDynamicEntriesExeSQL(t *testing.T) {
 		{
 			"empty database",
 			componentDSL("ExeSQL", map[string]any{"db_type": "mysql", "database": "", "username": "u", "host": "h", "password": "p"}),
-			"[ExeSQL] Database name does not support empty value",
+			"Database name does not support empty value",
 		},
 		{
 			"missing database",
 			componentDSL("ExeSQL", map[string]any{"db_type": "mysql", "username": "u", "host": "h", "password": "p"}),
-			"[ExeSQL] Database name does not support empty value",
+			"Database name does not support empty value",
 		},
 		{
 			"empty username",
 			componentDSL("ExeSQL", map[string]any{"db_type": "mysql", "database": "d", "username": "", "host": "h", "password": "p"}),
-			"[ExeSQL] database username does not support empty value",
+			"database username does not support empty value",
 		},
 		{
 			"empty host",
 			componentDSL("ExeSQL", map[string]any{"db_type": "mysql", "database": "d", "username": "u", "host": " ", "password": "p"}),
-			"[ExeSQL] IP Address does not support empty value",
+			"IP Address does not support empty value",
 		},
 		{
 			"missing password",
 			componentDSL("ExeSQL", map[string]any{"db_type": "mysql", "database": "d", "username": "u", "host": "h"}),
-			"[ExeSQL] Database password does not support empty value",
+			"Database password does not support empty value",
 		},
 		{
 			"zero port",

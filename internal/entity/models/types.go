@@ -7,9 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"ragflow/internal/common"
 	"ragflow/internal/tokenizer"
+	"ragflow/internal/utility"
 )
 
 const defaultMaxRerankTokens = 8196
@@ -124,19 +126,58 @@ type TTSResponse struct {
 	MediaType string `json:"media_type,omitempty"`
 }
 
+// OCRPage retains the source image dimensions and reading-order blocks.
+// Index is the zero-based source PDF page index, including blank pages.
+// A Normalized page gives block boxes as fractions (0-1) of the page instead
+// of source-image pixels, and leaves Width and Height zero.
+type OCRPage struct {
+	Index      int        `json:"index"`
+	Width      float64    `json:"width"`
+	Height     float64    `json:"height"`
+	Normalized bool       `json:"normalized,omitempty"`
+	Blocks     []OCRBlock `json:"blocks"`
+}
+
+// OCRBlock carries a layout region in source-image pixels, or in page
+// fractions on a Normalized page. BBox is [left, top, right, bottom]; an
+// absent box is unlocated. Drivers normalize provider coordinates to this
+// rectangle before returning blocks.
+type OCRBlock struct {
+	Text  string    `json:"text"`
+	Label string    `json:"label,omitempty"`
+	BBox  []float64 `json:"bbox,omitempty"`
+}
+
+// OCRBlockBody is the part of a block's text that the PDF projection
+// (parser.OCRPDFResult) indexes: the text without image markup, trimmed. The
+// projection drops a block whose body is empty unless it is a media region
+// with a usable position.
+func OCRBlockBody(text string) string {
+	return strings.TrimSpace(utility.StripMarkdownImages(text))
+}
+
 type OCRFileResponse struct {
+	// Text is empty (but non-nil) when the response carries only media regions.
 	Text *string `json:"text"`
+	// Pages is optional structured output for internal parsing; nil means unavailable.
+	Pages []OCRPage `json:"-"`
+	// Warnings reports partial failures internally; the public response stays text-only.
+	Warnings []string `json:"-"`
 }
 
 type ListModelResponse struct {
-	Name          string         `json:"name"`
-	ContextLength *int           `json:"context_length"`
-	MaxOutput     *int           `json:"max_output"`
-	ModelTypes    []string       `json:"model_types"`
-	Thinking      *ModelThinking `json:"thinking"`
-	MaxDimension  *int           `json:"max_dimension"`  // used by embedding models
-	MaxBatchSize  *int           `json:"max_batch_size"` // used by embedding models
-	Dimensions    []int          `json:"dimensions"`
+	Name          string   `json:"name"`
+	ContextLength *int     `json:"context_length"`
+	MaxOutput     *int     `json:"max_output"`
+	ModelTypes    []string `json:"model_types"`
+	// ModelTypesInferred reports that ModelTypes was guessed from the model
+	// name rather than declared by the provider, so a catalog entry may
+	// override it when listings are merged.
+	ModelTypesInferred bool           `json:"-"`
+	Thinking           *ModelThinking `json:"thinking"`
+	MaxDimension       *int           `json:"max_dimension"`  // used by embedding models
+	MaxBatchSize       *int           `json:"max_batch_size"` // used by embedding models
+	Dimensions         []int          `json:"dimensions"`
 }
 
 type ParseFileResponse struct {
@@ -162,11 +203,19 @@ type Question interface {
 }
 
 type Noul struct {
-	Instructions any
-	Criteria     *NoulCriteria
+	Instructions any           `json:"instructions"`
+	Criteria     *NoulCriteria `json:"criteria,omitempty"`
 }
 
 func (Noul) isQuestion() {}
+
+func (q Noul) MarshalJSON() ([]byte, error) {
+	type question Noul
+	return json.Marshal(struct {
+		Type string `json:"type"`
+		question
+	}{Type: "noul", question: question(q)})
+}
 
 type NoulCriteria struct {
 	True  any `json:"true,omitzero"`
@@ -195,15 +244,33 @@ func (Box) isQuestion() {}
 
 type DecideRequest struct {
 	State     any                 `json:"state"`
-	Questions map[string]Question `json:"question"`
+	Questions map[string]Question `json:"questions"`
+}
+
+// MaxDecisionQuestions is the System One endpoint's per-request question limit.
+const MaxDecisionQuestions = 16
+
+type DecisionAnswer struct {
+	Type string   `json:"type"`
+	Noul *float64 `json:"noul"`
 }
 
 type DecideResponse struct {
+	ID string `json:"id"`
+	// RequestID is the same identifier under the name Nace uses for it.
+	RequestID string                    `json:"request_id,omitempty"`
+	Answers   map[string]DecisionAnswer `json:"answers"`
+	Usage     struct {
+		InputTokens  int `json:"input_tokens"`
+		OutputTokens int `json:"output_tokens"`
+	} `json:"usage"`
 }
 
 type ModelListItem struct {
 	ID            string `json:"id"`
 	ContextLength *int   `json:"context_length"`
+	ContextWindow *int   `json:"context_window"`
+	MaxTokens     *int   `json:"max_tokens"`
 	Object        string `json:"object"`
 	OwnedBy       string `json:"owned_by"`
 }
@@ -215,14 +282,17 @@ type ModelList struct {
 
 // URLSuffix represents the URL suffixes for different API endpoints
 type URLSuffix struct {
-	Chat          string `json:"chat"`
-	AsyncChat     string `json:"async_chat"`
-	AsyncResult   string `json:"async_result"`
-	Embedding     string `json:"embedding"`
-	Rerank        string `json:"rerank"`
-	TTS           string `json:"tts"`
-	ASR           string `json:"asr"`
-	OCR           string `json:"ocr"`
+	Chat        string `json:"chat"`
+	AsyncChat   string `json:"async_chat"`
+	AsyncResult string `json:"async_result"`
+	Embedding   string `json:"embedding"`
+	Rerank      string `json:"rerank"`
+	TTS         string `json:"tts"`
+	ASR         string `json:"asr"`
+	OCR         string `json:"ocr"`
+	// Decision is the TypeSafe System One path: a separate endpoint from chat
+	// because it takes one request carrying many questions, not a message list.
+	Decision      string `json:"decision"`
 	DocumentParse string `json:"doc_parse"`
 	Models        string `json:"models"`
 	Balance       string `json:"balance"`
@@ -233,17 +303,24 @@ type URLSuffix struct {
 }
 
 type ChatConfig struct {
-	Stream          *bool
-	Vision          *bool
-	Thinking        *bool
-	MaxTokens       *int
-	Temperature     *float64
-	TopP            *float64
-	DoSample        *bool
-	Stop            *[]string
-	ModelClass      *string
-	Effort          *string
-	Verbosity       *string
+	Stream           *bool
+	Vision           *bool
+	Thinking         *bool
+	MaxTokens        *int
+	Temperature      *float64
+	TopP             *float64
+	PresencePenalty  *float64
+	FrequencyPenalty *float64
+	DoSample         *bool
+	Stop             *[]string
+	ModelClass       *string
+	Effort           *string
+	Verbosity        *string
+	// JSONMode asks an OpenAI-compatible provider for a JSON object reply
+	// (`response_format: {"type": "json_object"}`). Knowledge compilation sets
+	// it so a prose reply does not fail JSON parsing. nil leaves the request
+	// without response_format, as the provider default.
+	JSONMode        *bool
 	Tools           interface{}               `json:"tools,omitempty"`
 	ToolChoice      *string                   `json:"tool_choice,omitempty"`
 	ToolChoiceValue any                       `json:"-"`
@@ -303,17 +380,49 @@ type TTSConfig struct {
 }
 
 type OCRConfig struct {
-	Algorithm string
 	// Pages restricts OCR to these 1-indexed inclusive [from, to] ranges, the
 	// parser setup's "pages" shape. Empty means the whole document. Drivers
 	// whose backend cannot select pages ignore it.
 	Pages [][]int
+	// Timeout bounds the whole OCR call. Zero keeps the driver default.
+	// Drivers without a configurable deadline ignore it.
+	Timeout time.Duration
 }
 
 type ParseFileConfig struct {
-	ParseMethod string `json:"parse_method"`
-	Backend     string `json:"backend"`
-	ServerURL   string `json:"server_url"`
+	ParseMethod       string `json:"parse_method"`
+	Backend           string `json:"backend"`
+	ServerURL         string `json:"server_url"`
+	CropMode          string `json:"crop_mode,omitempty"`
+	NoRepeatNgramSize int    `json:"no_repeat_ngram_size,omitempty"`
+	PageGuard         *bool  `json:"page_guard,omitempty"`
+}
+
+// usageTemplateResolver, when set, resolves the usage record a typed model
+// forwards to its driver for one call: it clones the model info's
+// construction-time template for nil-usage call sites, and tops up the
+// model-group identity on caller-provided records. Enterprise editions
+// install the resolver at startup; the community build leaves it nil.
+var usageTemplateResolver func(info *ModelInfo, usage *common.ModelUsage) *common.ModelUsage
+
+// usageFor resolves the usage record for one call and stamps the call start
+// time on it. The community build forwards usage untouched.
+//
+// Every typed model entry point (chat, stream, embed, rerank) funnels through
+// here exactly once, at the start of the call, so this is the one place that
+// can guarantee a usage row carries the time the call was made even when the
+// call site forgot to set StartAt (nil usage falling back to a template clone,
+// or an explicit record built without a timestamp). A non-zero StartAt set by
+// the caller is kept untouched.
+func usageFor(info *ModelInfo, usage *common.ModelUsage) *common.ModelUsage {
+	if usageTemplateResolver == nil {
+		return usage
+	}
+	resolved := usageTemplateResolver(info, usage)
+	if resolved != nil && resolved.StartAt.IsZero() {
+		resolved.StartAt = time.Now()
+	}
+	return resolved
 }
 
 // EmbeddingModel wraps a ModelDriver with embedding-specific configuration
@@ -322,7 +431,7 @@ type EmbeddingModel struct {
 	ModelName    *string
 	APIConfig    *APIConfig
 	MaxTokens    int  // Max input tokens for the embedding model, used for text truncation
-	MaxBatchSize *int // Max texts per Embed request; nil means "resolve from provider capability at use site"
+	MaxBatchSize *int // Max texts per driver request; Embed resolves nil from the provider capability
 	info         *ModelInfo
 }
 
@@ -354,7 +463,7 @@ func (m *EmbeddingModel) Info() *ModelInfo {
 	return cloneModelInfo(m.info)
 }
 
-// ResolveBatchSize returns the safe maximum texts per Embed request. The
+// ResolveBatchSize returns the safe maximum texts per driver request. The
 // effective limit cannot exceed either the model's declared maximum or the
 // provider/runtime batch capability; these values can differ (for example, a
 // provider model config can declare max_batch_size=32 while its driver only
@@ -544,6 +653,7 @@ func (r *RerankModel) Rerank(ctx context.Context, request RerankRequest, rerankC
 	if r == nil || r.ModelDriver == nil {
 		return nil, errors.New("rerank model: driver is nil")
 	}
+	modelUsage = usageFor(r.info, modelUsage)
 	maxTokens := r.MaxTokens
 	if maxTokens <= 0 {
 		maxTokens = defaultMaxRerankTokens
@@ -785,7 +895,7 @@ func (m *ChatModel) ChatWithMessages(ctx context.Context, messages []Message, co
 	if m.ModelName != nil {
 		modelName = *m.ModelName
 	}
-	return m.ModelDriver.ChatWithMessages(ctx, modelName, messages, m.APIConfig, config, usage)
+	return m.ModelDriver.ChatWithMessages(ctx, modelName, messages, m.APIConfig, config, usageFor(m.info, usage))
 }
 
 // ChatStreamlyWithSender streams chat deltas through sender.
@@ -801,12 +911,15 @@ func (m *ChatModel) ChatStreamlyWithSender(ctx context.Context, messages []Messa
 	if m.ModelName != nil {
 		modelName = *m.ModelName
 	}
-	return m.ModelDriver.ChatStreamlyWithSender(ctx, modelName, messages, m.APIConfig, config, usage, sender)
+	return m.ModelDriver.ChatStreamlyWithSender(ctx, modelName, messages, m.APIConfig, config, usageFor(m.info, usage), sender)
 }
 
 func (m *ChatModel) withDefaults(config *ChatConfig) *ChatConfig {
 	if config == nil {
 		config = &ChatConfig{}
+	}
+	if config.Thinking == nil {
+		config.Thinking = new(false)
 	}
 	if m.info == nil {
 		return config
@@ -814,10 +927,6 @@ func (m *ChatModel) withDefaults(config *ChatConfig) *ChatConfig {
 	if config.ModelClass == nil && m.info.ModelClass != "" {
 		modelClass := m.info.ModelClass
 		config.ModelClass = &modelClass
-	}
-	if config.Thinking == nil && m.info.Thinking != nil {
-		thinking := m.info.Thinking.DefaultValue
-		config.Thinking = &thinking
 	}
 	return config
 }
@@ -874,11 +983,21 @@ func (cm *ChatModel) SetTerminalTools(names ...string) {
 // credentials. ContextLength is the input/context window; MaxOutput is the
 // provider's maximum generated-token budget.
 type ModelInfo struct {
-	ID            string
-	Name          string
-	ProviderName  string
-	InstanceID    string
-	InstanceName  string
+	ID           string
+	Name         string
+	ProviderName string
+	InstanceID   string
+	InstanceName string
+	// GroupID and GroupName carry the model group a gp-<group_id> reference
+	// resolved through. They stay empty for references that point at a single
+	// model, so usage records tell group-mediated calls from direct ones.
+	GroupID string
+	// UsageTemplate carries the construction-time usage identity (tenant, user,
+	// provider, instance, model, group) installed by the model factory; the
+	// typed models clone it whenever a call site passes nil usage. Enterprise
+	// editions only; the community build never installs one.
+	UsageTemplate *common.ModelUsage `json:"-"`
+	GroupName     string
 	ModelTypes    []string
 	ContextLength int
 	MaxOutput     int

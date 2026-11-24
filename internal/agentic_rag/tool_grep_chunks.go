@@ -25,6 +25,7 @@ package agentic_rag
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"regexp"
@@ -60,7 +61,13 @@ Use this to locate candidate chunks by exact identifiers, error codes, product n
 
 // grepChunksArgs is the JSON the model sends into InvokableRun.
 type grepChunksArgs struct {
-	Query      string   `json:"query"`
+	Query string `json:"query"`
+	// Intent is what THIS call is trying to find, in the caller's own words.
+	// The filter judges a hit against THIS rather than against the overall
+	// question alone, because a necessary middle step of a multi-hop run is
+	// often irrelevant to the final question while being exactly what the step
+	// needed. Optional: omitted means the filter falls back to the question.
+	Intent     string   `json:"intent,omitempty"`
 	DatasetIDs []string `json:"dataset_ids,omitempty"`
 	DocScope   []string `json:"doc_scope,omitempty"`
 }
@@ -72,17 +79,16 @@ const grepChunksMaxResults = 30
 
 // GrepChunksTool regex-matches chunk content via GrepService. It is stateless:
 // no per-session seen-chunk tracking (memory is intentionally not ported). The
-// tenant and dataset scope are injected at construction from the session, so the
-// tool never needs a canvas runtime.
+// dataset scope is injected at construction from the session, so the tool never
+// needs a canvas runtime; the indexes it reads are resolved from those datasets.
 type GrepChunksTool struct {
-	tenantID   string
 	datasetIDs []string
 }
 
-// NewGrepChunksTool returns a GrepChunksTool scoped to the given tenant and
-// datasets, implementing eino's runtime.InvokableTool.
-func NewGrepChunksTool(tenantID string, datasetIDs []string) *GrepChunksTool {
-	return &GrepChunksTool{tenantID: tenantID, datasetIDs: datasetIDs}
+// NewGrepChunksTool returns a GrepChunksTool scoped to the given datasets,
+// implementing eino's runtime.InvokableTool.
+func NewGrepChunksTool(datasetIDs []string) *GrepChunksTool {
+	return &GrepChunksTool{datasetIDs: datasetIDs}
 }
 
 // Info returns the tool's metadata for the chat model. The parameter schema is
@@ -108,9 +114,13 @@ func (g *GrepChunksTool) Info(_ context.Context) (*schema.ToolInfo, error) {
       "description": "Optional document ids to restrict the search to (at most 10).",
       "items": { "type": "string" },
       "maxItems": 10
+    },
+    "intent": {
+      "type": "string",
+      "description": "REQUIRED: what information THIS call needs, in one sentence, e.g. the first name of Sarah Polk's mother, needed to build the final name. Each returned passage is kept or dropped by whether it serves this stated need, so name the fact you are looking for - not the search terms, and not 'relevant information'."
     }
   },
-  "required": ["query"]
+  "required": ["query", "intent"]
 }`
 	s := &jsonschema.Schema{}
 	if err := json.Unmarshal([]byte(schemaJSON), s); err != nil {
@@ -134,6 +144,10 @@ func (g *GrepChunksTool) invokableRun(ctx context.Context, argumentsInJSON strin
 	if err := json.Unmarshal([]byte(argumentsInJSON), &args); err != nil {
 		return "", fmt.Errorf("grep_chunks: parse arguments: %w", err)
 	}
+
+	// Published for the decision filter: it judges each passage against this
+	// stated need, which is narrower than the overall question.
+	ctx = withIntent(ctx, args.Intent)
 
 	query := strings.TrimSpace(args.Query)
 	if query == "" {
@@ -164,18 +178,19 @@ func (g *GrepChunksTool) invokableRun(ctx context.Context, argumentsInJSON strin
 	}
 
 	svc := runtime.GetGrepService()
-	tenantID := g.tenantID
 	req := runtime.GrepRequest{
 		Pattern:      query,
 		DatasetIDs:   datasetIDs,
 		DocScope:     docScope,
 		Sort:         grepChunksSortFields, // order by doc_id, page_num_int, chunk_order_int
 		SelectFields: grepChunksSelectFields,
-		TenantID:     tenantID,
 	}
 	chunks, err := svc.Grep(ctx, req)
 	degradedNotice := ""
 	if err != nil {
+		if errors.Is(err, runtime.ErrCorpusScopeUnresolved) {
+			return "", fmt.Errorf("grep_chunks: %w", err)
+		}
 		// The engine refused the pattern (unsupported construct or a blown
 		// automaton budget). Recover rather than dead-end the turn: sanitize
 		// and retry, then fall back to a lexical prefilter — the regexp filter

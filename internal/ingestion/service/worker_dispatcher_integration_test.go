@@ -22,6 +22,7 @@ import (
 	"context"
 	"encoding/json"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -38,10 +39,20 @@ import (
 
 func setupRealNatsCluster(t *testing.T) (host string, port int) {
 	t.Helper()
+	// JetStream can still write consumer state while the store is being removed,
+	// which surfaced as "directory not empty" from t.TempDir's cleanup and
+	// failed the test after it had passed. Own the directory and retry the
+	// removal instead.
+	storeDir, err := os.MkdirTemp("", "ragflow-nats-store-")
+	if err != nil {
+		t.Fatalf("create JetStream store dir: %v", err)
+	}
+	// Registered before the server cleanup so it runs after it.
+	t.Cleanup(func() { removeStoreDir(t, storeDir) })
 	opts := &server.Options{
 		Port:      -1,
 		JetStream: true,
-		StoreDir:  t.TempDir(),
+		StoreDir:  storeDir,
 		NoLog:     true,
 		NoSigs:    true,
 	}
@@ -52,6 +63,7 @@ func setupRealNatsCluster(t *testing.T) (host string, port int) {
 	ns.Start()
 	if !ns.ReadyForConnections(10 * time.Second) {
 		ns.Shutdown()
+		ns.WaitForShutdown()
 		t.Fatal("embedded NATS server did not become ready within 10s")
 	}
 	t.Cleanup(func() {
@@ -60,6 +72,18 @@ func setupRealNatsCluster(t *testing.T) (host string, port int) {
 	})
 	addr := ns.Addr().(*net.TCPAddr)
 	return "127.0.0.1", addr.Port
+}
+
+func removeStoreDir(t *testing.T, dir string) {
+	t.Helper()
+	var err error
+	for attempt := 0; attempt < 20; attempt++ {
+		if err = os.RemoveAll(dir); err == nil {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Errorf("remove JetStream store dir %s: %v", dir, err)
 }
 
 // TestIntegration_MultiInstanceSharedConsumerNoOverExecution verifies TaskRP.md §6.2:
@@ -122,23 +146,26 @@ func TestIntegration_MultiInstanceSharedConsumerNoOverExecution(t *testing.T) {
 		return nil
 	}
 
-	ingestor1 := newUnitIngestor("instance-1", 2, []string{"pdf"})
-	ingestor1.runDocumentTask = runner
-
-	ingestor2 := newUnitIngestor("instance-2", 2, []string{"pdf"})
-	ingestor2.runDocumentTask = runner
-
-	// Point global MQ engine to engine1 then start ingestor1, then engine2 and start ingestor2
+	// Point the global MQ engine to engine1 then construct ingestor1, then to
+	// engine2 and construct ingestor2. newUnitIngestor snapshots the global MQ
+	// engine at construction time and Start reads the injected deps.MQ, so the
+	// engine must be set on the global before each ingestor is built (not after).
 	previousEngine := engine.GetMessageQueueEngine()
 	t.Cleanup(func() { engine.SetMessageQueueEngine(previousEngine) })
 
 	engine.SetMessageQueueEngine(engine1)
+	ingestor1 := newUnitIngestor("instance-1", 2)
+	ingestor1.runDocumentTask = runner
+
+	engine.SetMessageQueueEngine(engine2)
+	ingestor2 := newUnitIngestor("instance-2", 2)
+	ingestor2.runDocumentTask = runner
+
 	if err := ingestor1.Start(); err != nil {
 		t.Fatalf("ingestor1.Start: %v", err)
 	}
 	t.Cleanup(func() { ingestor1.Stop(context.Background()) })
 
-	engine.SetMessageQueueEngine(engine2)
 	if err := ingestor2.Start(); err != nil {
 		t.Fatalf("ingestor2.Start: %v", err)
 	}
@@ -202,7 +229,13 @@ func TestIntegration_SlowTaskHeartbeatPreventsPrematureRedelivery(t *testing.T) 
 		t.Fatalf("schedule task %s: %v", taskID, err)
 	}
 
-	ingestor := newUnitIngestor("slow-task-ingestor", 1, []string{"pdf"})
+	// Set the global MQ engine before constructing the ingestor: newUnitIngestor
+	// snapshots the global at construction and Start reads the injected deps.MQ.
+	previousEngine := engine.GetMessageQueueEngine()
+	engine.SetMessageQueueEngine(mq)
+	t.Cleanup(func() { engine.SetMessageQueueEngine(previousEngine) })
+
+	ingestor := newUnitIngestor("slow-task-ingestor", 1)
 	ingestor.heartbeatInterval = 1 * time.Second // comfortably below BackOff[0] = 5s
 
 	taskExecutionStarted := make(chan struct{})
@@ -219,10 +252,6 @@ func TestIntegration_SlowTaskHeartbeatPreventsPrematureRedelivery(t *testing.T) 
 			return ctx.Err()
 		}
 	}
-
-	previousEngine := engine.GetMessageQueueEngine()
-	engine.SetMessageQueueEngine(mq)
-	t.Cleanup(func() { engine.SetMessageQueueEngine(previousEngine) })
 
 	if err := ingestor.Start(); err != nil {
 		t.Fatalf("ingestor.Start: %v", err)
@@ -316,7 +345,7 @@ func TestIntegration_ShutdownRedeliveryRecovery(t *testing.T) {
 		}
 	}
 
-	ingestor1 := newUnitIngestor("shutdown-ingestor-1", 2, []string{"pdf"})
+	ingestor1 := newUnitIngestor("shutdown-ingestor-1", 2)
 	ingestor1.heartbeatInterval = 500 * time.Millisecond
 
 	taskBStarted := make(chan struct{})
@@ -416,7 +445,7 @@ func TestIntegration_ShutdownRedeliveryRecovery(t *testing.T) {
 
 	// Ingestor1 timed out and cancelled taskB, calling stopActiveLeases().
 	// Now start ingestor2 to recover un-acked tasks from the shared consumer.
-	ingestor2 := newUnitIngestor("recovery-ingestor-2", 2, []string{"pdf"})
+	ingestor2 := newUnitIngestor("recovery-ingestor-2", 2)
 	ingestor2.heartbeatInterval = 500 * time.Millisecond
 
 	var (

@@ -65,10 +65,8 @@ const PROVIDER_ICONS: Record<string, React.ElementType> = {
   e2b: LucideZap,
   tenki: LucideCloudLightning,
   ucloud_agent_sandbox: LucideCloud,
+  kosa8: LucideCloudLightning,
 };
-
-// Local executes code on the host process without isolation; hide it from selection.
-const HiddenProviders = ['local'];
 
 const SandboxKeys = {
   providers: () => ['admin/listSandboxProviders'] as const,
@@ -103,8 +101,6 @@ function AdminSandboxSettings() {
   const { data: providers = [], isLoading: providersLoading } = useQuery({
     queryKey: SandboxKeys.providers(),
     queryFn: async () => (await listSandboxProviders()).data.data,
-    select: (data) =>
-      data.filter((provider) => !HiddenProviders.includes(provider.id)),
   });
 
   // Fetch current config

@@ -72,7 +72,7 @@ var expectedWordPieceHashes = map[string]string{
 const wordPieceAssetPinKey = "BAAI/bge-large-en-v1.5/vocab.txt"
 
 var bertWordPieceAssetNames = []string{
-	"ragflow_deps/huggingface.co/BAAI/bge-large-en-v1.5/vocab.txt",
+	"deps/huggingface.co/BAAI/bge-large-en-v1.5/vocab.txt",
 	"vocab.txt",
 	"bert_wordpiece_vocab.txt",
 }
@@ -346,23 +346,7 @@ func (m *wordPieceModel) encode(text string, wantIDs bool) (int, []int32) {
 
 // trimToLimit returns the longest rune prefix with at most limit tokens.
 func (m *wordPieceModel) trimToLimit(text string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-	if m.countTokens(text) <= limit {
-		return text
-	}
-	runes := []rune(text)
-	lo, hi := 0, len(runes)
-	for lo < hi {
-		mid := (lo + hi + 1) / 2
-		if m.countTokens(string(runes[:mid])) <= limit {
-			lo = mid
-		} else {
-			hi = mid - 1
-		}
-	}
-	return string(runes[:lo])
+	return trimToRuneLimitByCount(text, limit, m.countTokens)
 }
 
 type wordPieceCounter struct {

@@ -43,7 +43,6 @@ const (
 	defaultQQBotBaseURL  = "https://api.sgroup.qq.com"
 	defaultQQBotTokenURL = "https://bots.qq.com/app/getAppAccessToken"
 	qqBotRequestTimeout  = 60 * time.Second
-	qqBotReconnectDelay  = 3 * time.Second
 	qqBotIntents         = (1 << 30) | (1 << 12) | (1 << 25) | (1 << 26)
 )
 
@@ -58,7 +57,6 @@ type qqBotAccount struct {
 type qqBotChannel struct {
 	account qqBotAccount
 	client  *http.Client
-	dialer  *websocket.Dialer
 
 	mu        sync.Mutex
 	writeMu   sync.Mutex
@@ -67,6 +65,8 @@ type qqBotChannel struct {
 	done      chan struct{}
 	sessionID string
 	sequence  *int64
+
+	retryAttempts int
 }
 
 type qqBotGatewayPayload struct {
@@ -89,8 +89,7 @@ func newQQBotChannel(account qqBotAccount) *qqBotChannel {
 	}
 	return &qqBotChannel{
 		account: account,
-		client:  &http.Client{Timeout: qqBotRequestTimeout},
-		dialer:  websocket.DefaultDialer,
+		client:  newSafeChannelHTTPClient(qqBotRequestTimeout, channelURLPolicy{exactHosts: []string{"api.sgroup.qq.com", "bots.qq.com"}}),
 	}
 }
 
@@ -201,6 +200,9 @@ func (c *qqBotChannel) Send(ctx context.Context, msg core.OutgoingMessage) error
 }
 
 func (c *qqBotChannel) run(ctx context.Context) {
+	c.mu.Lock()
+	c.retryAttempts = 0
+	c.mu.Unlock()
 	for ctx.Err() == nil {
 		token, err := c.getAccessToken(ctx)
 		if err == nil {
@@ -210,17 +212,26 @@ func (c *qqBotChannel) run(ctx context.Context) {
 				err = c.runGatewaySession(ctx, gatewayURL, token)
 			}
 		}
-		if err != nil && ctx.Err() == nil {
-			common.Error("qqbot: gateway loop error", err, zap.String("account_id", c.account.AccountID))
+		if ctx.Err() != nil {
+			return
 		}
-		if !waitForContext(ctx, qqBotReconnectDelay) {
+		c.mu.Lock()
+		c.retryAttempts++
+		delay := channelRetryDelay(c.retryAttempts)
+		c.mu.Unlock()
+		if err != nil {
+			common.Error("qqbot: gateway loop error", err, zap.String("account_id", c.account.AccountID), zap.Duration("retry_delay", delay))
+		}
+		if !waitForContext(ctx, delay) {
 			return
 		}
 	}
 }
 
 func (c *qqBotChannel) runGatewaySession(ctx context.Context, gatewayURL string, token string) error {
-	conn, _, err := c.dialer.DialContext(ctx, gatewayURL, nil)
+	conn, _, err := dialSafeChannelWebSocket(ctx, gatewayURL, nil, qqBotRequestTimeout, channelURLPolicy{
+		hostSuffixes: []string{"qq.com"},
+	})
 	if err != nil {
 		return err
 	}
@@ -279,9 +290,6 @@ func (c *qqBotChannel) runGatewaySession(ctx context.Context, gatewayURL string,
 			_ = json.Unmarshal(payload.Data, &canResume)
 			if !canResume {
 				c.clearSession()
-				if !waitForContext(ctx, qqBotReconnectDelay) {
-					return ctx.Err()
-				}
 			}
 			return fmt.Errorf("invalid gateway session (can_resume=%t)", canResume)
 		case 0:
@@ -353,10 +361,14 @@ func (c *qqBotChannel) handleDispatch(ctx context.Context, eventType string, dat
 	if eventType == "READY" {
 		c.mu.Lock()
 		c.sessionID = anyToString(raw["session_id"])
+		c.retryAttempts = 0
 		c.mu.Unlock()
 		return nil
 	}
 	if eventType == "RESUMED" {
+		c.mu.Lock()
+		c.retryAttempts = 0
+		c.mu.Unlock()
 		return nil
 	}
 	incoming := c.normalizeIncomingEvent(eventType, raw)
@@ -497,12 +509,12 @@ func (c *qqBotChannel) requestJSON(
 		return err
 	}
 	defer resp.Body.Close()
-	payload, err := io.ReadAll(resp.Body)
+	payload, err := io.ReadAll(io.LimitReader(resp.Body, 1024*1024))
 	if err != nil {
 		return err
 	}
 	if resp.StatusCode >= http.StatusBadRequest {
-		return fmt.Errorf("status: %d, response: %s", resp.StatusCode, payload)
+		return fmt.Errorf("status: %d, response: %.200s", resp.StatusCode, payload)
 	}
 	if len(bytes.TrimSpace(payload)) == 0 {
 		return nil
@@ -577,15 +589,4 @@ func anyToString(value any) string {
 		return ""
 	}
 	return fmt.Sprint(value)
-}
-
-func waitForContext(ctx context.Context, delay time.Duration) bool {
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-ctx.Done():
-		return false
-	case <-timer.C:
-		return true
-	}
 }

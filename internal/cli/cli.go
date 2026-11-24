@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"ragflow/internal/common"
 
@@ -66,17 +67,19 @@ const (
 type CommandLineMode string
 
 const (
+	CommandMode      CommandLineMode = "command"
 	APIMode          CommandLineMode = "api"
 	AdminMode        CommandLineMode = "admin"
-	IngestorMode     CommandLineMode = "ingestor"  // If we want to access ingestor
-	CollectorMode    CommandLineMode = "collector" // If we want to access collector
+	IngestorMode     CommandLineMode = "ingestor" // If we want to access ingestor
+	SyncerMode       CommandLineMode = "syncer"   // If we want to access syncer
+	ChatterMode      CommandLineMode = "chatter"  // If we want to access chatter
 	DefaultAPIServer                 = "default"
 )
 
 type CommandLineConfig struct {
 	CLIMode           CommandLineMode
 	AdminClientConfig *AdminModeConfig
-	APIClientConfig   APIModeConfig
+	APIClientConfig   *APIModeConfig
 	ShowHelp          bool
 	Verbose           bool
 	Interactive       bool
@@ -106,17 +109,82 @@ func (c *CommandLineConfig) Print() {
 	}
 }
 
+func ReadAPIServerConfig(defaultApiServerConfig *APIServerConfig, configFile string) (*APIModeConfig, error) {
+	var config ConfigFile
+	data, err := os.ReadFile(configFile)
+	if err == nil {
+		if err = yaml.Unmarshal(data, &config); err != nil {
+			return nil, fmt.Errorf("failed to parse rf.yml: %w", err)
+		}
+		if config.Host != "" {
+			var h string
+			var port int
+			h, port, err = parseHostPort(config.Host)
+			if err != nil {
+				return nil, fmt.Errorf("invalid host in config file: %w", err)
+			}
+			if defaultApiServerConfig.IP == "" {
+				defaultApiServerConfig.IP = h
+			}
+			if defaultApiServerConfig.Port == 0 {
+				defaultApiServerConfig.Port = port
+			}
+		}
+		if config.UserName != "" {
+			if defaultApiServerConfig.UserName == nil {
+				defaultApiServerConfig.UserName = &config.UserName
+			}
+		}
+		if config.Password != "" {
+			if defaultApiServerConfig.UserPassword == nil {
+				defaultApiServerConfig.UserPassword = &config.Password
+			}
+		}
+		if config.APIKey != "" {
+			if defaultApiServerConfig.APIKey == nil {
+				defaultApiServerConfig.APIKey = &config.APIKey
+			}
+		}
+	} else {
+		if configFile == "rf.yml" && os.IsNotExist(err) {
+		} else {
+			return nil, fmt.Errorf("failed to read %s: %w", configFile, err)
+		}
+	}
+
+	if defaultApiServerConfig.IP == "" {
+		defaultApiServerConfig.IP = "127.0.0.1"
+	}
+	if defaultApiServerConfig.Port == 0 {
+		defaultApiServerConfig.Port = 9380
+	}
+
+	APIClientConfig := &APIModeConfig{}
+
+	APIClientConfig.APIServerMap = config.APIServerMap
+	if APIClientConfig.APIServerMap == nil {
+		APIClientConfig.APIServerMap = make(map[string]*APIServerConfig)
+	}
+	if APIClientConfig.APIServerMap[DefaultAPIServer] != nil {
+		return nil, fmt.Errorf("'Default' API server config should be in api_servers")
+	}
+	APIClientConfig.APIServerMap[DefaultAPIServer] = defaultApiServerConfig
+	APIClientConfig.CurrentAPIServer = DefaultAPIServer
+
+	return APIClientConfig, nil
+}
+
 var Arguments *CommandLineConfig
 
 func ParseArgs(args []string) (*CommandLineConfig, error) {
 	commandLineConfig := &CommandLineConfig{
-		CLIMode:           APIMode,
+		CLIMode:           CommandMode,
 		AdminClientConfig: nil,
 		ShowHelp:          false,
 		ShowVersion:       false,
 		Verbose:           false,
-		Interactive:       true,
-		OutputFormat:      OutputFormatTable,
+		Interactive:       false,
+		OutputFormat:      OutputFormatPlain,
 		Command:           nil,
 	}
 	for i := 0; i < len(args); i++ {
@@ -139,8 +207,26 @@ func ParseArgs(args []string) (*CommandLineConfig, error) {
 			}
 		case "-v", "--verbose":
 			commandLineConfig.Verbose = true
-		case "--admin", "-admin":
+		case "--api":
+			commandLineConfig.CLIMode = APIMode
+			commandLineConfig.Interactive = true
+			commandLineConfig.OutputFormat = OutputFormatTable
+		case "--admin":
 			commandLineConfig.CLIMode = AdminMode
+			commandLineConfig.Interactive = true
+			commandLineConfig.OutputFormat = OutputFormatTable
+		case "--ingestor":
+			commandLineConfig.CLIMode = IngestorMode
+			commandLineConfig.Interactive = true
+			commandLineConfig.OutputFormat = OutputFormatTable
+		case "--chatter":
+			commandLineConfig.CLIMode = ChatterMode
+			commandLineConfig.Interactive = true
+			commandLineConfig.OutputFormat = OutputFormatTable
+		case "--syncer":
+			commandLineConfig.CLIMode = SyncerMode
+			commandLineConfig.Interactive = true
+			commandLineConfig.OutputFormat = OutputFormatTable
 		case "--help", "-help":
 			commandLineConfig.ShowHelp = true
 		case "--version", "-V":
@@ -156,6 +242,25 @@ func ParseArgs(args []string) (*CommandLineConfig, error) {
 	var foundCommand bool
 
 	switch commandLineConfig.CLIMode {
+	case CommandMode:
+		for i := 0; i < len(args); i++ {
+			arg := args[i]
+			commandArgs = append(commandArgs, arg)
+		}
+
+		defaultApiServerConfig := &APIServerConfig{
+			UserName:     nil,
+			UserPassword: nil,
+			APIKey:       nil,
+		}
+
+		configFile := "rf.yml"
+		APIClientConfig, err := ReadAPIServerConfig(defaultApiServerConfig, configFile)
+		if err != nil {
+			return nil, err
+		}
+
+		commandLineConfig.APIClientConfig = APIClientConfig
 	case APIMode:
 		defaultApiServerConfig := &APIServerConfig{
 			UserName:     nil,
@@ -241,64 +346,12 @@ func ParseArgs(args []string) (*CommandLineConfig, error) {
 			}
 		}
 
-		var config ConfigFile
-		data, err := os.ReadFile(configFile)
-		if err == nil {
-			if err = yaml.Unmarshal(data, &config); err != nil {
-				return nil, fmt.Errorf("failed to parse rf.yml: %w", err)
-			}
-			if config.Host != "" {
-				var h string
-				var port int
-				h, port, err = parseHostPort(config.Host)
-				if err != nil {
-					return nil, fmt.Errorf("invalid host in config file: %w", err)
-				}
-				if defaultApiServerConfig.IP == "" {
-					defaultApiServerConfig.IP = h
-				}
-				if defaultApiServerConfig.Port == 0 {
-					defaultApiServerConfig.Port = port
-				}
-			}
-			if config.UserName != "" {
-				if defaultApiServerConfig.UserName == nil {
-					defaultApiServerConfig.UserName = &config.UserName
-				}
-			}
-			if config.Password != "" {
-				if defaultApiServerConfig.UserPassword == nil {
-					defaultApiServerConfig.UserPassword = &config.Password
-				}
-			}
-			if config.APIKey != "" {
-				if defaultApiServerConfig.APIKey == nil {
-					defaultApiServerConfig.APIKey = &config.APIKey
-				}
-			}
-		} else {
-			if configFile == "rf.yml" && os.IsNotExist(err) {
-			} else {
-				return nil, fmt.Errorf("failed to read %s: %w", configFile, err)
-			}
+		APIClientConfig, err := ReadAPIServerConfig(defaultApiServerConfig, configFile)
+		if err != nil {
+			return nil, err
 		}
 
-		if defaultApiServerConfig.IP == "" {
-			defaultApiServerConfig.IP = "127.0.0.1"
-		}
-		if defaultApiServerConfig.Port == 0 {
-			defaultApiServerConfig.Port = 9380
-		}
-
-		commandLineConfig.APIClientConfig.APIServerMap = config.APIServerMap
-		if commandLineConfig.APIClientConfig.APIServerMap == nil {
-			commandLineConfig.APIClientConfig.APIServerMap = make(map[string]*APIServerConfig)
-		}
-		if commandLineConfig.APIClientConfig.APIServerMap[DefaultAPIServer] != nil {
-			return nil, fmt.Errorf("'Default' API server config should be in api_servers")
-		}
-		commandLineConfig.APIClientConfig.APIServerMap[DefaultAPIServer] = defaultApiServerConfig
-		commandLineConfig.APIClientConfig.CurrentAPIServer = DefaultAPIServer
+		commandLineConfig.APIClientConfig = APIClientConfig
 	case AdminMode:
 		AdminConfig := &AdminModeConfig{
 			AdminHost: "127.0.0.1",
@@ -367,6 +420,8 @@ func ParseArgs(args []string) (*CommandLineConfig, error) {
 			}
 		}
 		commandLineConfig.AdminClientConfig = AdminConfig
+	default:
+		return nil, fmt.Errorf("invalid mode: %s", commandLineConfig.CLIMode)
 	}
 
 	commandArgsLen := len(commandArgs)
@@ -382,57 +437,19 @@ func ParseArgs(args []string) (*CommandLineConfig, error) {
 	return commandLineConfig, nil
 }
 
-// LoadDefaultConfigFile reads the rf.yml file from current directory if it exists
-func LoadDefaultConfigFile() (*ConfigFile, error) {
-	// Try to read rf.yml from current directory
-	data, err := os.ReadFile("rf.yml")
-	if err != nil {
-		// File doesn't exist, return nil without error
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var config ConfigFile
-	if err = yaml.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse rf.yml: %w", err)
-	}
-
-	return &config, nil
-}
-
-// LoadConfigFileFromPath reads a config file from the specified path
-func LoadConfigFileFromPath(path string) (*ConfigFile, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read config file %s: %w", path, err)
-	}
-
-	var config ConfigFile
-	if err = yaml.Unmarshal(data, &config); err != nil {
-		return nil, fmt.Errorf("failed to parse config file %s: %w", path, err)
-	}
-
-	return &config, nil
-}
-
 // parseHostPort parses a host:port string and returns host and port
 func parseHostPort(hostPort string) (string, int, error) {
 	if hostPort == "" {
 		return "", -1, nil
 	}
 
-	// Split host and port
-	parts := strings.Split(hostPort, ":")
-	if len(parts) != 2 {
+	host, portText, err := net.SplitHostPort(hostPort)
+	if err != nil {
 		return "", -1, fmt.Errorf("invalid host format, expected host:port, got: %s", hostPort)
 	}
-
-	host := parts[0]
-	port, err := strconv.Atoi(parts[1])
+	port, err := strconv.Atoi(portText)
 	if err != nil {
-		return "", -1, fmt.Errorf("invalid port number: %s", parts[1])
+		return "", -1, fmt.Errorf("invalid port number: %s", portText)
 	}
 
 	return host, port, nil
@@ -518,7 +535,8 @@ func NewCLIWithConfig(commandLineConfig *CommandLineConfig) (*CLI, error) {
 		Config: commandLineConfig,
 	}
 
-	if commandLineConfig.CLIMode == APIMode {
+	switch commandLineConfig.CLIMode {
+	case APIMode, CommandMode:
 		apiServerConfig := commandLineConfig.APIClientConfig.APIServerMap[commandLineConfig.APIClientConfig.CurrentAPIServer]
 		httpClient := NewHTTPClient()
 		httpClient.Host = apiServerConfig.IP
@@ -539,7 +557,7 @@ func NewCLIWithConfig(commandLineConfig *CommandLineConfig) (*CLI, error) {
 		}
 
 		cli.setFilesystemClient(httpClient)
-	} else if commandLineConfig.CLIMode == AdminMode {
+	case AdminMode:
 		httpClient := NewHTTPClient()
 		httpClient.Host = commandLineConfig.AdminClientConfig.AdminHost
 		httpClient.Port = commandLineConfig.AdminClientConfig.AdminPort
@@ -553,8 +571,7 @@ func NewCLIWithConfig(commandLineConfig *CommandLineConfig) (*CLI, error) {
 				return nil, fmt.Errorf("auto-login failed: %w", err)
 			}
 		}
-
-	} else {
+	default:
 		return nil, fmt.Errorf("invalid CLI mode: %s", commandLineConfig.CLIMode)
 	}
 
@@ -800,20 +817,14 @@ func (c *CLI) handleMetaCommand(commandCount int, cmd *Command) error {
 	return nil
 }
 
-func (c *CLI) printHelp() {
-	help := `
+const helpText = `
 RAGFlow CLI Help
 ================
 
 Meta Commands:
-  \admin        - Switch to ADMIN mode (port 9381)
-  \user         - Switch to USER mode (port 9380)
-  \host [ip]    - Show or set server host (default: 127.0.0.1)
-  \port [num]   - Show or set server port (default: 9380 for user, 9381 for admin)
-  \status       - Show current connection status
   \? or \h      - Show this help
+  \pwd          - Show current working directory
   \q or \quit   - Exit CLI
-  \c or \clear  - Clear screen
 
 Commands (User Mode):
   LOGIN USER 'email';                                    - Login as user
@@ -824,28 +835,43 @@ Commands (User Mode):
   LIST DATASETS;                                         - List user datasets
   LIST AGENTS;                                           - List user agents
   LIST CHATS;                                            - List user chats
-  LIST MODEL PROVIDERS;                                  - List model providers
+  LIST PROVIDERS;                                        - List model providers
   LIST DEFAULT MODELS;                                   - List default models
-  LIST TOKENS;                                           - List API tokens
-  LIST PROVIDERS;                                        - List available LLM providers
-  CREATE TOKEN;                                          - Create new API token
+  LIST KEYS;                                             - List API keys
+  LIST AVAILABLE PROVIDERS;                              - List available LLM providers
+  CREATE KEY;                                            - Create new API key
   ADD PROVIDER 'name';                                   - Create a provider without API key
-  ADD PROVIDER 'name' 'api_key';                         - Create a provider with API key
-  DROP TOKEN 'token_value';                              - Delete an API token
+  ADD PROVIDER 'name' INSTANCE 'instance' KEY 'api_key'; - Create a provider instance with API key
+  DROP KEY 'api_key';                                    - Delete an API key
   DELETE PROVIDER 'name';                                - Delete a provider
-  SET TOKEN 'token_value';                               - Set and validate API token
-  SHOW TOKEN;                                            - Show current API token
+  SET KEY 'api_key';                                     - Set and validate API key
+  SHOW KEY;                                              - Show current API key
   SHOW PROVIDER 'name';                                  - Show provider details
-  SHOW CURRENT MODEL;                                    - Show current model settings
-  UNSET TOKEN;                                           - Remove current API token
-  ALTER PROVIDER 'name' NAME 'new_name';                 - Rename a provider
-  USE MODEL 'provider/instance/model';                   - Set current model for chat
-  CHAT 'message';                                        - Chat using current model
-  CHAT 'provider/instance/model' 'message';              - Chat with specified model
+  SHOW CURRENT;                                          - Show current model settings
+  RESET KEY;                                             - Remove current API key
+  ALTER PROVIDER 'name' INSTANCE 'instance' NAME 'new_name';
+                                                         - Rename a provider instance
+  USE MODEL 'model@instance@provider';                   - Set current model for chat
+  CHAT MESSAGE 'message';                                - Chat using current model
+  CHAT WITH 'model@instance@provider' MESSAGE 'message'; - Chat with specified model
   OPENAI_CHAT 'chat_id' 'message' [options] ;            - OpenAI-compatible chat
                                                            (run openai_chat -h for detailed options)
   CHAT COMPLETIONS 'question' [options] ;                - Chat completions via /api/v1/chat/completions
                                                            (run chat completions -h for detailed options)
+
+Commands (Admin Mode):
+  LIST USERS;                                            - List the first page of users
+  LIST USERS WITH keyword 'alice' status 'active' order 'create_time' sort 'asc' page 1 page_size 10;
+                                                         - Search, filter, sort, and paginate users
+  User list sorting supports create_time and last_login_time.
+  LIST USERS WITH role 'Reader' plan 'Pro' quota 80 days 30 page 2 page_size 10;
+                                                         - Enterprise filters with pagination
+  LIST USERS STORAGE TOP 20;                             - Enterprise storage ranking, top results
+  LIST USERS DOCUMENTS PAGE 2 PAGE_SIZE 10;               - Enterprise document ranking, paginated
+  LIST USERS INDEX TOP 20;                               - Enterprise index ranking (individual indices)
+  Only storage, documents and index support top. Do not combine top with page or page_size.
+  In EE user filters, days limits recent logins.
+  WITH text values must be quoted. JSON output includes users and total.
 
 Filesystem Commands (no quotes):
   ls [path]                    - List resources
@@ -861,15 +887,18 @@ Filesystem Commands (no quotes):
                                  Note: cat datasets or cat datasets/kb1 will error
 
 Examples:
-  ragflow-cli -f rf.yml "LIST USERS"           # SQL mode (with quotes)
+  ragflow-cli -f rf.yml "LIST DATASETS"        # SQL mode (with quotes)
   ragflow-cli -f rf.yml ls datasets            # Filesystem mode (no quotes)
   ragflow-cli -f rf.yml ls files               # List files in root
   ragflow-cli -f rf.yml cat datasets           # Error: datasets is a directory
   ragflow-cli -f rf.yml ls files/myfolder      # List folder contents
 
 For more information, see documentation.
+
 `
-	fmt.Println(help)
+
+func (c *CLI) printHelp() {
+	fmt.Print(helpText)
 }
 
 // Cleanup performs cleanup before exit

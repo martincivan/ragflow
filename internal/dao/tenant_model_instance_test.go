@@ -1,3 +1,19 @@
+//
+//  Copyright 2026 The InfiniFlow Authors. All Rights Reserved.
+//
+//  Licensed under the Apache License, Version 2.0 (the "License");
+//  you may not use this file except in compliance with the License.
+//  You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+//  Unless required by applicable law or agreed to in writing, software
+//  distributed under the License is distributed on an "AS IS" BASIS,
+//  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+//  See the License for the specific language governing permissions and
+//  limitations under the License.
+//
+
 package dao
 
 import (
@@ -63,5 +79,42 @@ func TestTenantModelInstanceDAOGetAllInstancesByProviderIDOrdersByCreateTimeDesc
 		if names[i] != want[i] {
 			t.Fatalf("expected instance order %v, got %v", want, names)
 		}
+	}
+}
+
+func TestTenantModelInstanceDAOCreateUsesCallerTransaction(t *testing.T) {
+	db := setupTenantModelInstanceDAOTestDB(t)
+	dao := NewTenantModelInstanceDAO()
+	instance := &entity.TenantModelInstance{
+		ID: "transactional-instance", InstanceName: "transactional", ProviderID: "provider-1",
+		APIKey: "key", Status: "active", Extra: "{}",
+	}
+
+	tx := db.Begin()
+	if tx.Error != nil {
+		t.Fatalf("begin transaction: %v", tx.Error)
+	}
+	if err := dao.Create(t.Context(), tx, instance); err != nil {
+		t.Fatalf("create instance inside caller transaction: %v", err)
+	}
+	if err := tx.Rollback().Error; err != nil {
+		t.Fatalf("rollback caller transaction: %v", err)
+	}
+	var count int64
+	if err := db.Model(&entity.TenantModelInstance{}).Where("id = ?", instance.ID).Count(&count).Error; err != nil {
+		t.Fatalf("count created instances: %v", err)
+	}
+	if count != 0 {
+		t.Fatalf("instance count after rollback = %d, want 0", count)
+	}
+
+	if err := dao.Create(t.Context(), db, instance); err != nil {
+		t.Fatalf("create instance with DAO-managed transaction: %v", err)
+	}
+	if err := db.Model(&entity.TenantModelInstance{}).Where("id = ?", instance.ID).Count(&count).Error; err != nil {
+		t.Fatalf("count committed instances: %v", err)
+	}
+	if count != 1 {
+		t.Fatalf("instance count after DAO transaction = %d, want 1", count)
 	}
 }

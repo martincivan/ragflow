@@ -13,6 +13,8 @@ import (
 	"ragflow/internal/permission"
 	permissionresponse "ragflow/internal/permission/response"
 	"ragflow/internal/service"
+	"ragflow/internal/service/billing"
+	"ragflow/internal/service/datasetversion"
 	"ragflow/internal/storage"
 
 	"gorm.io/gorm"
@@ -80,9 +82,6 @@ func (s *DocumentService) DownloadDocument(ctx context.Context, datasetID, docID
 	if err != nil {
 		return nil, err
 	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("this document is empty")
-	}
 
 	fileName := ""
 	if doc.Name != nil {
@@ -133,6 +132,9 @@ func (s *DocumentService) UpdateDocument(ctx context.Context, id string, req *Up
 
 	if req.Name == nil {
 		return common.CodeSuccess, nil
+	}
+	if code, err := s.validateDocumentName(ctx, document, *req.Name); err != nil {
+		return code, err
 	}
 	kb, err := s.kbDAO.GetByID(ctx, dao.DB, document.KbID)
 	if err != nil {
@@ -211,22 +213,53 @@ func (s *DocumentService) UpdateRunState(ctx context.Context, docID string, prog
 
 // DeleteDocument delete document — delegates to full cleanup logic.
 func (s *DocumentService) DeleteDocument(ctx context.Context, id string) error {
-	return s.deleteDocumentFull(ctx, id)
+	// The dataset is resolved before the delete: once the document row is gone
+	// there is nothing left to read the owning dataset from, and the version
+	// would have nowhere to attach. Its name is captured here for the same
+	// reason.
+	doc, kb, err := s.resolveDocAndKB(ctx, id)
+	if err != nil {
+		return err
+	}
+	change := documentVersionChange(entity.DatasetVersionChangeActionDelete, doc)
+	if err = s.deleteDocumentFull(ctx, id); err != nil {
+		return err
+	}
+	// The history is part of the delete: a version that cannot be stored fails
+	// the request, so a removal is never silent to a restore.
+	if _, err = datasetversion.RecordContentVersionChangesOwnTx(ctx, kb.ID, entity.DatasetVersionKindDelete,
+		[]entity.DatasetVersionChange{change}); err != nil {
+		return err
+	}
+	return nil
 }
 
 // DeleteDocuments deletes multiple documents under a dataset.
 //
 //	ids: specific document IDs; deleteAll: delete all docs in the dataset.
 //	Returns the number of successfully deleted documents.
-func (s *DocumentService) DeleteDocuments(ctx context.Context, ids []string, deleteAll bool, datasetID, userID string) (int, error) {
-	// 1. Check dataset is accessible by the user
-	if err := service.CheckDatasetAccess(ctx, permission.Subject{UserID: userID}, datasetID, permission.OperationDeleteContent); err != nil {
-		_, permissionErr := permissionresponse.Normalize(err)
-		return 0, permissionErr
-	}
+func (s *DocumentService) DeleteDocuments(ctx context.Context, ids []string, deleteAll bool, datasetID string) (int, error) {
+	return s.deleteDocuments(ctx, ids, deleteAll, datasetID, true)
+}
 
-	// 2. Resolve document IDs
+// DeleteDocumentsForRestore removes documents as part of a content restore
+// rather than because the user asked to. The restore records the whole
+// transition in its own version, so a delete version here would put a
+// "documents deleted" entry in the history that no one requested, describing an
+// intermediate state that never existed outside the restore. The documents are
+// still removed, so the checkpoint the restore wrote can bring them back.
+func (s *DocumentService) DeleteDocumentsForRestore(ctx context.Context, ids []string, datasetID string) (int, error) {
+	return s.deleteDocuments(ctx, ids, false, datasetID, false)
+}
+
+func (s *DocumentService) deleteDocuments(ctx context.Context, ids []string, deleteAll bool, datasetID string, recordVersion bool) (int, error) {
+	// Deleting the entire dataset requires dataset-level access; deleting
+	// explicit documents also accepts direct document grants.
 	if deleteAll {
+		if err := permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID}, permission.OperationDeleteContent); err != nil {
+			_, permissionErr := permissionresponse.Normalize(err)
+			return 0, permissionErr
+		}
 		if err := dao.DB.Model(&entity.Document{}).
 			Where("kb_id = ?", datasetID).
 			Pluck("id", &ids).Error; err != nil {
@@ -236,25 +269,57 @@ func (s *DocumentService) DeleteDocuments(ctx context.Context, ids []string, del
 	if len(ids) == 0 {
 		return 0, nil
 	}
+	if err := permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID}, permission.OperationDeleteContent); err != nil &&
+		!errors.Is(err, permission.ErrPermissionDenied) && !errors.Is(err, permission.ErrMembershipNotFound) {
+		_, permissionErr := permissionresponse.Normalize(err)
+		return 0, permissionErr
+	}
 
 	// 3. Deduplicate (before validation so dup count doesn't matter)
 	ids = common.Deduplicate(ids)
 
-	// 4. Validate IDs belong to this dataset (only for explicit ids; deleteAll is already scoped)
+	// Validate IDs and permissions before mutating any document.
 	if !deleteAll {
-		if _, err := s.validateDocsInDataset(ctx, ids, datasetID); err != nil {
+		documents, err := s.validateDocsInDataset(ctx, ids, datasetID)
+		if err != nil {
 			return 0, err
+		}
+		for _, doc := range documents {
+			if err := service.CheckDocumentAccess(ctx, doc.ID, datasetID, permission.OperationDeleteContent); err != nil {
+				_, permissionErr := permissionresponse.Normalize(err)
+				return 0, permissionErr
+			}
 		}
 	}
 
 	// 5. Delete each document (non-critical failures are tolerated per doc)
+	// The names are read before the rows go: the version's change set shows
+	// which documents were removed, and a removed row has no name left to read.
+	names := documentNamesByID(ctx, ids)
 	deleted := 0
+	changes := make([]entity.DatasetVersionChange, 0, len(ids))
 	for _, docID := range ids {
 		if err := s.deleteDocumentFull(ctx, docID); err != nil {
 			common.Warn(fmt.Sprintf("DeleteDocuments: failed to delete %s: %v", docID, err))
 			continue
 		}
 		deleted++
+		changes = append(changes, entity.DatasetVersionChange{
+			Entity: entity.DatasetVersionChangeEntityDocument,
+			Action: entity.DatasetVersionChangeActionDelete,
+			DocID:  docID,
+			Name:   names[docID],
+		})
+	}
+
+	// One version per request: the caller asked for one deletion, and the
+	// history records that the dataset's content changed; the change set names
+	// the documents it took with it. A restore-driven removal is skipped: the
+	// restore's own version already describes where the dataset ended up.
+	if recordVersion && deleted > 0 {
+		if _, err := datasetversion.RecordContentVersionChangesOwnTx(ctx, datasetID, entity.DatasetVersionKindDelete, changes); err != nil {
+			return deleted, err
+		}
 	}
 
 	return deleted, nil
@@ -268,33 +333,53 @@ func (s *DocumentService) deleteDocumentFull(ctx context.Context, docID string) 
 	if err != nil {
 		return err
 	}
+	unlock := lockDocumentParse(docID)
+	defer unlock()
 
-	// Delete tasks from DB
-	ingestionTask, err := s.ingestionTaskDAO.GetByDocumentID(ctx, dao.DB, docID)
+	// Keep the row and its files restorable before anything irreversible runs.
+	// A failure aborts the delete: the content history promises this document
+	// can be put back, and it cannot be if its row was never copied.
+	if err := recordDocumentRemovalEE(ctx, doc, kb); err != nil {
+		return err
+	}
+
+	// Settle and delete the task before purging its cache state. A conditional
+	// delete failure leaves the document and the newly active run intact.
+	if err := s.cleanupDocumentTask(ctx, docID, taskTerminalMessageDocumentDeleted); err != nil {
+		return err
+	}
+
+	// Release an uncommitted parse hold before the document disappears.
+	if billingService := billing.Get(); billingService != nil && billingService.Enabled() {
+		if releaseErr := billingService.ReleaseDocumentHold(ctx, docID); releaseErr != nil {
+			common.Warn(fmt.Sprintf("failed to release billing hold for doc %s: %v", docID, releaseErr))
+		}
+	}
+
+	variants, taskTypes, typeErr := s.documentKnowledgeCompileTypes(ctx, kb.TenantID, kb.ID, docID)
+	if typeErr != nil {
+		return fmt.Errorf("resolve knowledge compile types for document %s: %w", docID, typeErr)
+	}
+	if err := s.deleteDocEngineData(ctx, docID, kb.TenantID, doc.KbID, variants, taskTypes); err != nil {
+		return err
+	}
+	fileIDs, err := s.deleteDocRecordWithCounters(ctx, doc, kb.ID, true)
 	if err != nil {
-		common.Error(fmt.Sprintf("failed to get ingestion task by doc:%s", doc.ID), err)
-		return err
-	}
-	if ingestionTask != nil {
-		if err := s.purgeTaskStateForCleanup(ctx, ingestionTask.ID); err != nil {
-			return err
-		}
-		if _, err := s.ingestionTaskSvc.Remove(ctx, ingestionTask.ID, &ingestionTask.UserID); err != nil {
-			return err
-		}
-	}
-
-	if err := s.deleteDocEngineData(ctx, docID, kb.TenantID, doc.KbID); err != nil {
-		return err
-	}
-	if err = s.deleteDocRecordWithCounters(ctx, doc, kb.ID); err != nil {
 		return err
 	}
 
 	fileCleanupCtx := context.WithoutCancel(ctx)
-	if err = s.cleanupFileReferences(fileCleanupCtx, docID, doc.KbID); err != nil {
-		return fmt.Errorf("document deleted but file cleanup failed: %w", err)
-	}
+	// Preview artifacts are independent of the source-file cleanup. Remove them
+	// before the fallible file cleanup so a file cleanup failure cannot orphan
+	// them after the document row is gone.
+	cleanupPreviewArtifacts(fileCleanupCtx, doc)
+
+	// The mappings went with the document row, so what is left is best-effort:
+	// removing the file rows and blobs no mapping references any more. A failure
+	// here leaves an unreferenced file behind, which is recoverable; reporting an
+	// error would not be, because the document is already gone and the retry
+	// cannot reach it. EE keeps the blob for restore via keepFileBlobForDocumentRestore.
+	s.cleanupDocumentFiles(fileCleanupCtx, doc.KbID, fileIDs)
 
 	return nil
 }
@@ -304,26 +389,27 @@ func (s *DocumentService) deleteDocumentFull(ctx context.Context, docID string) 
 // deleting the underlying file record, its storage blob, or its file2document
 // mappings. Mirrors Python DocumentService.remove_document — the caller is
 // responsible for cleaning up the file2document mappings separately.
+//
+// Chunk + metadata cleanup is delegated to deleteDocEngineData so the keep-
+// file path matches deleteDocumentFull. The doc_deleted event is published
+// from inside deleteDocEngineData; no separate PublishDeleted is needed here.
 func (s *DocumentService) RemoveDocumentKeepFile(ctx context.Context, docID string) error {
 	doc, kb, err := s.resolveDocAndKB(ctx, docID)
 	if err != nil {
 		return err
 	}
+	unlock := lockDocumentParse(docID)
+	defer unlock()
+
 	variants, taskTypes, typeErr := s.documentKnowledgeCompileTypes(ctx, kb.TenantID, kb.ID, docID)
 	if typeErr != nil {
 		return fmt.Errorf("resolve knowledge compile types for document %s: %w", docID, typeErr)
 	}
-	ingestionTask, err := s.ingestionTaskDAO.GetByDocumentID(ctx, dao.DB, docID)
-	if err != nil {
-		return fmt.Errorf("failed to get ingestion task for %s: %w", docID, err)
-	}
-	if ingestionTask != nil {
-		if err := s.purgeTaskStateForCleanup(ctx, ingestionTask.ID); err != nil {
-			return err
-		}
-		if _, err := s.ingestionTaskSvc.Remove(ctx, ingestionTask.ID, nil); err != nil {
-			return fmt.Errorf("remove ingestion task for document %s: %w", docID, err)
-		}
+
+	// Settle and delete the task before purging its cache state. Active workers
+	// must be stopped before this path can run.
+	if err := s.cleanupDocumentTask(ctx, docID, taskTerminalMessageDocumentRemoved); err != nil {
+		return err
 	}
 	if _, delErr := s.taskDAO.DeleteByDocIDs(ctx, dao.DB, []string{docID}); delErr != nil {
 		if errors.Is(delErr, context.Canceled) || errors.Is(delErr, context.DeadlineExceeded) {
@@ -331,20 +417,19 @@ func (s *DocumentService) RemoveDocumentKeepFile(ctx context.Context, docID stri
 		}
 		common.Warn(fmt.Sprintf("RemoveDocumentKeepFile: failed to delete tasks for %s: %v", docID, delErr))
 	}
-	if err := s.deleteDocRecordWithCounters(ctx, doc, kb.ID); err != nil {
+	if err := s.deleteDocEngineData(ctx, docID, kb.TenantID, doc.KbID, variants, taskTypes); err != nil {
 		return err
 	}
-	if len(variants) == 0 {
-		return nil
+	// The mappings stay: the caller is expected to remove them separately, and
+	// this path keeps the file row and blob alive.
+	if _, err := s.deleteDocRecordWithCounters(ctx, doc, kb.ID, false); err != nil {
+		return err
 	}
-	// File replacement/deletion uses this path instead of deleteDocumentFull.
-	// Publish the same deletion event so the dataset-level consumer removes the
-	// deleted document's contribution in both paths.
-	pubCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
-	defer cancel()
-	if err := knowledge_compile.PublishDeleted(pubCtx, kb.TenantID, kb.ID, docID, variants, taskTypes); err != nil {
-		common.Warn(fmt.Sprintf("RemoveDocumentKeepFile: publish doc_deleted for %s failed: %v", docID, err))
+	if _, err := datasetversion.RecordContentVersionChangesOwnTx(ctx, kb.ID, entity.DatasetVersionKindDelete,
+		[]entity.DatasetVersionChange{documentVersionChange(entity.DatasetVersionChangeActionDelete, doc)}); err != nil {
+		return err
 	}
+	cleanupPreviewArtifacts(context.WithoutCancel(ctx), doc)
 	return nil
 }
 
@@ -352,8 +437,11 @@ func (s *DocumentService) RemoveDocumentKeepFile(ctx context.Context, docID stri
 // counter in a single transaction. Mirrors Python DocumentService.insert, which
 // updates dataset/document counters on insert. The document's ID and timestamps
 // are populated by the caller / model hooks before insertion.
-func (s *DocumentService) InsertDocument(doc *entity.Document) error {
-	return dao.DB.Transaction(func(tx *gorm.DB) error {
+func (s *DocumentService) InsertDocument(ctx context.Context, doc *entity.Document) error {
+	if doc.UserID == "" {
+		doc.UserID = doc.CreatedBy
+	}
+	return dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(doc).Error; err != nil {
 			return fmt.Errorf("failed to create document: %w", err)
 		}
@@ -371,6 +459,20 @@ func (s *DocumentService) InsertDocument(doc *entity.Document) error {
 		if result.RowsAffected == 0 {
 			return fmt.Errorf("knowledgebase %s not found", doc.KbID)
 		}
+		if err := grantDocumentOwnerEE(ctx, tx, doc); err != nil {
+			return fmt.Errorf("grant document owner: %w", err)
+		}
+		// The settings the document is created with are its first recorded state:
+		// without them a restore to a version that predates the next edit would
+		// have nothing to put back. They are parked for the upload version this
+		// flow records at the end - written here, inside the insert transaction,
+		// they would have no number to carry.
+		parkDocumentParserSettingStates(ctx, tx, []*entity.Document{doc})
+		// The metadata is the other half of that first state, and it is empty: a
+		// document is created without values, so a restore to the version that
+		// added it has to put an empty map back instead of leaving whatever a
+		// later edit wrote.
+		parkDocumentMetadataState(ctx, []*entity.Document{doc})
 		return nil
 	})
 }
@@ -380,7 +482,7 @@ func (s *DocumentService) InsertDocument(doc *entity.Document) error {
 // Returns an error when the existing-name lookup fails so callers never write
 // blind and risk duplicated document names.
 func (s *DocumentService) UniqueDocumentName(ctx context.Context, kbID, name string) (string, error) {
-	return common.UniqueFileName(name, 255, func(candidate string) (bool, error) {
+	return common.UniqueFileName(name, common.NameLimit255, func(candidate string) (bool, error) {
 		return s.documentDAO.NameExistsInKB(ctx, dao.DB, kbID, candidate)
 	})
 }
@@ -400,26 +502,36 @@ func (s *DocumentService) resolveDocAndKB(ctx context.Context, docID string) (*e
 }
 
 // deleteDocEngineData removes chunks and metadata from the document engine.
-// No-op when the engine is nil.
-func (s *DocumentService) deleteDocEngineData(ctx context.Context, docID, tenantID, kbID string) error {
+// No-op when the engine is nil. Callers pass the resolved compile variants and
+// task types so the file-delete hot path does not search for them twice.
+func (s *DocumentService) deleteDocEngineData(ctx context.Context, docID, tenantID, kbID string, variants, taskTypes []string) error {
 	if s.docEngine == nil {
 		return nil
 	}
 	indexName := fmt.Sprintf("ragflow_%s", tenantID)
-	variants, taskTypes, typeErr := s.documentKnowledgeCompileTypes(ctx, tenantID, kbID, docID)
-	if typeErr != nil {
-		return fmt.Errorf("resolve knowledge compile types for document %s: %w", docID, typeErr)
-	}
 	deleteCtx, cancel := context.WithTimeout(ctx, cleanupBatchTimeout)
 	_, delErr := s.docEngine.DeleteChunks(deleteCtx, map[string]interface{}{"doc_id": docID}, indexName, kbID)
+	if delErr != nil && deleteCtx.Err() == nil {
+		// Retry once under a fresh deadline: reusing deleteCtx would start the
+		// second attempt with whatever time the first attempt left over.
+		retryCtx, retryCancel := context.WithTimeout(ctx, cleanupBatchTimeout)
+		_, delErr = s.docEngine.DeleteChunks(retryCtx, map[string]interface{}{"doc_id": docID}, indexName, kbID)
+		retryCancel()
+	}
 	cancel()
 	if delErr != nil {
 		common.Warn(fmt.Sprintf("deleteDocEngineData: failed to delete chunks for %s: %v", docID, delErr))
 		return fmt.Errorf("delete chunks for document %s: %w", docID, delErr)
 	}
+	// The chunk history is deliberately kept: a content version recorded before
+	// this delete can put the document back, and the chunks it restores are read
+	// from that history. The removed-document cleanup drops both when the owner
+	// deletes the removal row.
 	if len(variants) == 0 {
 		if s.metadataSvc != nil {
-			_ = s.DeleteDocumentAllMetadata(ctx, docID) // logs internally
+			if err := s.DeleteDocumentAllMetadata(ctx, docID); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
@@ -436,7 +548,9 @@ func (s *DocumentService) deleteDocEngineData(ctx context.Context, docID, tenant
 		common.Warn(fmt.Sprintf("deleteDocEngineData: publish doc_deleted for %s failed: %v", docID, err))
 	}
 	if s.metadataSvc != nil {
-		_ = s.DeleteDocumentAllMetadata(ctx, docID) // logs internally
+		if err := s.DeleteDocumentAllMetadata(ctx, docID); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -445,78 +559,103 @@ func (s *DocumentService) deleteDocEngineData(ctx context.Context, docID, tenant
 // KB counters in a single transaction. Counters are only decremented when a
 // document row was actually removed (RowsAffected > 0), guarding against
 // double-decrement on retries or concurrent deletes.
-func (s *DocumentService) deleteDocRecordWithCounters(ctx context.Context, doc *entity.Document, kbID string) error {
-	return dao.DB.Transaction(func(tx *gorm.DB) error {
+//
+// When dropMappings is set, the document's file2document rows are deleted in
+// the same transaction and the referenced file ids are returned for the
+// caller's best-effort cleanup. The mappings belong in this transaction because
+// they are the only thing that keeps the file rows and their blobs reachable:
+// deleting them after the document row has already committed turned a mapping
+// failure into "the delete reports an error although the document is gone",
+// and the retry cannot do anything about it because the row is gone.
+func (s *DocumentService) deleteDocRecordWithCounters(ctx context.Context, doc *entity.Document, kbID string, dropMappings bool) ([]string, error) {
+	var fileIDs []string
+	err := dao.DB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		fileIDs = nil
+		if dropMappings {
+			mappings, mapErr := s.file2DocumentDAO.GetByDocumentID(ctx, tx, doc.ID)
+			if mapErr != nil {
+				return fmt.Errorf("load the file mappings of document %s: %w", doc.ID, mapErr)
+			}
+			fileIDs = uniqueFileIDs(mappings)
+		}
+
 		result := tx.Where("id = ?", doc.ID).Delete(&entity.Document{})
 		if result.Error != nil {
 			return fmt.Errorf("failed to delete document %s: %w", doc.ID, result.Error)
 		}
-		if result.RowsAffected == 0 {
-			return nil // already deleted by a concurrent request — skip counters
+
+		if result.RowsAffected > 0 {
+			result = tx.Model(&entity.Knowledgebase{}).
+				Where("id = ?", kbID).
+				Updates(map[string]interface{}{
+					"doc_num":   gorm.Expr("doc_num - 1"),
+					"chunk_num": gorm.Expr("chunk_num - ?", doc.ChunkNum),
+					"token_num": gorm.Expr("token_num - ?", doc.TokenNum),
+				})
+			if result.Error != nil {
+				return fmt.Errorf("failed to decrement counters for KB %s: %w", kbID, result.Error)
+			}
+			if result.RowsAffected == 0 {
+				return fmt.Errorf("knowledgebase %s not found", kbID)
+			}
 		}
 
-		result = tx.Model(&entity.Knowledgebase{}).
-			Where("id = ?", kbID).
-			Updates(map[string]interface{}{
-				"doc_num":   gorm.Expr("doc_num - 1"),
-				"chunk_num": gorm.Expr("chunk_num - ?", doc.ChunkNum),
-				"token_num": gorm.Expr("token_num - ?", doc.TokenNum),
-			})
-		if result.Error != nil {
-			return fmt.Errorf("failed to decrement counters for KB %s: %w", kbID, result.Error)
-		}
-		if result.RowsAffected == 0 {
-			return fmt.Errorf("knowledgebase %s not found", kbID)
+		if dropMappings {
+			// Idempotent, and still right when the row was already gone: the
+			// mappings have to go either way, otherwise nothing references the
+			// file rows and nothing can find them again.
+			if delErr := s.file2DocumentDAO.DeleteByDocumentID(ctx, tx, doc.ID); delErr != nil {
+				return fmt.Errorf("delete the file mappings of document %s: %w", doc.ID, delErr)
+			}
 		}
 		return nil
 	})
+	if err != nil {
+		return nil, err
+	}
+	return fileIDs, nil
 }
 
 func (s *DocumentService) rollbackAddFileFromKBError(ctx context.Context, doc *entity.Document, kbID string, err error) error {
-	if cleanupErr := s.deleteDocRecordWithCounters(ctx, doc, kbID); cleanupErr != nil {
+	// The rollback runs before the mapping is created, so there is nothing to
+	// drop beyond the document row and its counters.
+	if _, cleanupErr := s.deleteDocRecordWithCounters(ctx, doc, kbID, false); cleanupErr != nil {
 		return fmt.Errorf("%w; rollback cleanup failed: %w", err, cleanupErr)
 	}
 	return err
 }
 
-// cleanupFileReferences deletes file2document mappings for docID, and for each
-// referenced file, only hard-deletes the file record and its storage blob when
-// the file is a knowledgebase-owned upload (source_type == knowledgebase) and
-// no other document still references the same file_id. Files linked from file
-// management are only unlinked — the file record and blob stay intact.
-func (s *DocumentService) cleanupFileReferences(ctx context.Context, docID, kbID string) error {
-	mappings, mapErr := s.file2DocumentDAO.GetByDocumentID(ctx, dao.DB, docID)
-	if mapErr != nil {
-		common.Warn(fmt.Sprintf("cleanupFileReferences: failed to get f2d mappings for %s: %v", docID, mapErr))
-		return mapErr
-	}
-	if len(mappings) == 0 {
-		return nil
-	}
-
-	// Collect unique file_ids
-	seen := make(map[string]bool)
-	var fileIDs []string
+// uniqueFileIDs lists the distinct file ids a document's mappings point at.
+func uniqueFileIDs(mappings []*entity.File2Document) []string {
+	seen := make(map[string]bool, len(mappings))
+	fileIDs := make([]string, 0, len(mappings))
 	for _, m := range mappings {
-		if m.FileID == nil || seen[*m.FileID] {
+		if m == nil || m.FileID == nil || seen[*m.FileID] {
 			continue
 		}
 		seen[*m.FileID] = true
 		fileIDs = append(fileIDs, *m.FileID)
 	}
+	return fileIDs
+}
 
-	// Delete all file2document rows for this document
-	if delErr := s.file2DocumentDAO.DeleteByDocumentID(ctx, dao.DB, docID); delErr != nil {
-		common.Warn(fmt.Sprintf("cleanupFileReferences: failed to delete f2d for %s: %v", docID, delErr))
-		return delErr
-	}
-
+// cleanupDocumentFiles drops the file rows and storage blobs of files no
+// document references any more. It receives the ids read while the document's
+// mappings were deleted inside the delete transaction, so the mappings are
+// already gone and every step here is best-effort: a failure leaves an
+// unreferenced file behind, which a later sweep can collect, instead of a
+// document that reports a failed delete while being gone.
+//
+// A file is only hard-deleted when it is a knowledgebase-owned upload
+// (source_type == knowledgebase); files linked from file management keep their
+// row and blob, only the mapping is removed.
+func (s *DocumentService) cleanupDocumentFiles(ctx context.Context, kbID string, fileIDs []string) {
 	// For each file, only delete the record and blob when it is a
 	// knowledgebase-owned upload and no other doc references it
 	for _, fileID := range fileIDs {
 		remaining, remErr := s.file2DocumentDAO.GetByFileID(ctx, dao.DB, fileID)
 		if remErr != nil {
-			common.Warn(fmt.Sprintf("cleanupFileReferences: failed to check remaining f2d for %s: %v", fileID, remErr))
+			common.Warn(fmt.Sprintf("Document file cleanup: failed to check remaining f2d for %s: %v", fileID, remErr))
 			continue
 		}
 		if len(remaining) > 0 {
@@ -526,26 +665,28 @@ func (s *DocumentService) cleanupFileReferences(ctx context.Context, docID, kbID
 		fileDAO := dao.NewFileDAO()
 		file, fErr := fileDAO.GetByID(ctx, dao.DB, fileID)
 		if fErr != nil || file == nil {
-			common.Warn(fmt.Sprintf("cleanupFileReferences: file not found %s: %v", fileID, fErr))
+			common.Warn(fmt.Sprintf("Document file cleanup: file not found %s: %v", fileID, fErr))
 			continue
 		}
 		if entity.FileSource(file.SourceType) != entity.FileSourceKnowledgebase {
 			continue // linked from file management — unlink only, keep the file
 		}
 		if _, delErr := fileDAO.DeleteByIDs(ctx, dao.DB, []string{fileID}); delErr != nil {
-			common.Warn(fmt.Sprintf("cleanupFileReferences: failed to delete file %s: %v", fileID, delErr))
+			common.Warn(fmt.Sprintf("Document file cleanup: failed to delete file %s: %v", fileID, delErr))
 			continue // keep the blob so the live file row still has its object
 		}
-		if file.Location != nil && *file.Location != "" {
+		// An edition that keeps content history leaves the blob in storage: the
+		// removal row records where it lives, and removing the removed document
+		// deletes it.
+		if file.Location != nil && *file.Location != "" && !keepFileBlobForDocumentRestore() {
 			storageImpl := storage.GetStorageFactory().GetStorage()
 			if storageImpl != nil {
 				// Dataset uploads use the KB ID; ParentID is the file-manager folder.
-				rmErr := removeObjectBestEffort(ctx, storageImpl, kbID, *file.Location)
+				rmErr := storage.RemoveBlob(ctx, storageImpl, kbID, *file.Location)
 				if rmErr != nil {
-					common.Warn(fmt.Sprintf("cleanupFileReferences: failed to remove blob %s/%s: %v", kbID, *file.Location, rmErr))
+					common.Warn(fmt.Sprintf("Document file cleanup: failed to remove blob %s/%s: %v", kbID, *file.Location, rmErr))
 				}
 			}
 		}
 	}
-	return nil
 }

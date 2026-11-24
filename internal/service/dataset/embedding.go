@@ -16,6 +16,8 @@ import (
 	"ragflow/internal/service"
 
 	enginetypes "ragflow/internal/engine/types"
+
+	"go.uber.org/zap"
 )
 
 // embeddingCheckSample is one sampled chunk with its stored vector, used by the
@@ -37,11 +39,11 @@ type embeddingCheckSample struct {
 // CheckEmbedding verifies that a candidate embedding model is compatible with a
 // dataset's existing vectors (the standard "switch embedding model" validation).
 // It is independent of the retired RunIndex/graph_rag_queue scheduling path.
-func (d *DatasetService) CheckEmbedding(ctx context.Context, userID, datasetID string, req *service.CheckEmbeddingRequest) (*service.EmbeddingCheckResponse, common.ErrorCode, error) {
+func (d *DatasetService) CheckEmbedding(ctx context.Context, datasetID string, req *service.CheckEmbeddingRequest) (*service.EmbeddingCheckResponse, common.ErrorCode, error) {
 	if datasetID == "" {
 		return nil, common.CodeDataError, errors.New(`lack of "Dataset ID"`)
 	}
-	if err := service.CheckDatasetAccess(ctx, permission.Subject{UserID: userID}, datasetID, permission.OperationUse); err != nil {
+	if err := permission.NewDatabaseChecker(dao.DB).CheckResource(ctx, permission.ResourceRef{Kind: permission.ResourceKindDataset, ID: datasetID}, permission.OperationUse); err != nil {
 		code, permissionErr := permissionresponse.Normalize(err)
 		return nil, code, permissionErr
 	}
@@ -62,7 +64,7 @@ func (d *DatasetService) CheckEmbedding(ctx context.Context, userID, datasetID s
 		return nil, common.CodeServerError, errors.New("doc engine not initialized")
 	}
 
-	embeddingModel, err := service.NewModelFactory().NewEmbeddingModel(ctx, service.ModelAccess{TenantID: kb.TenantID}, embeddingID)
+	embeddingModel, err := service.NewModelFactory().NewEmbeddingModel(permission.WithTenantID(ctx, kb.TenantID), embeddingID)
 	if err != nil {
 		return nil, common.CodeDataError, err
 	}
@@ -179,6 +181,148 @@ func (d *DatasetService) CheckEmbedding(ctx context.Context, userID, datasetID s
 	return response, common.CodeNotEffective, errors.New("Embedding model switch failed: the average similarity between old and new vectors is below 0.9, indicating incompatible vector spaces.")
 }
 
+// embeddingSwitchProbeText is the input the switch check encodes to learn the
+// candidate model's dimension. Only a non-empty string is required: the vector
+// length is a property of the model, not of the text.
+const embeddingSwitchProbeText = "dimension probe"
+
+// embeddingDimensionProbe measures the vector a candidate model produces. It is
+// a package variable so a test can answer without reaching a provider; the
+// production implementation resolves the tenant's model the same way
+// CheckEmbedding does.
+var embeddingDimensionProbe = probeEmbeddingDimension
+
+func probeEmbeddingDimension(ctx context.Context, tenantID, embeddingID string) (int, error) {
+	embeddingModel, err := service.NewModelFactory().NewEmbeddingModel(permission.WithTenantID(ctx, tenantID), embeddingID)
+	if err != nil {
+		return 0, err
+	}
+	vectors, err := datasetEncodeEmbedding(ctx, embeddingModel, []string{embeddingSwitchProbeText})
+	if err != nil {
+		return 0, err
+	}
+	if len(vectors) == 0 || len(vectors[0]) == 0 {
+		return 0, fmt.Errorf("embedding model %q returned no vector", embeddingID)
+	}
+	return len(vectors[0]), nil
+}
+
+// embeddingSwitchNeedsCheck reports whether a request replaces the embedding
+// model of a dataset that already holds chunks, i.e. whether a switch could
+// strand stored vectors.
+func embeddingSwitchNeedsCheck(kb *entity.Knowledgebase, candidateID string) bool {
+	return kb != nil && kb.ChunkNum > 0 && candidateID != "" && candidateID != kb.EmbdID
+}
+
+// validateEmbeddingSwitch rejects a model switch that would strand the vectors
+// a dataset already stores.
+//
+// The chunk vector is keyed by its dimension (q_<dim>_vec), so switching to a
+// model with a different dimension does not migrate anything: later writes land
+// in a column of their own while every existing chunk stays reachable only
+// through the old one, and retrieval — which builds the column name from the
+// current model — silently stops matching them. The console already asks the
+// user to run CheckEmbedding before switching; this repeats the dimension half
+// of that check inside the write path, where an API client cannot skip it.
+//
+// Only the dimension is compared here: the sample costs one engine round trip
+// and one provider call, which is affordable on every model change, while the
+// similarity half costs tens of provider calls and stays an explicit action.
+//
+// The guard is skipped, deliberately, when there is nothing at risk:
+//   - the dataset holds no chunk yet (its vectors do not exist);
+//   - the request repeats the model the dataset already uses;
+//   - no sampled chunk carries a vector, so no stored dimension can be lost.
+func (d *DatasetService) validateEmbeddingSwitch(ctx context.Context, kb *entity.Knowledgebase, candidateID string) (common.ErrorCode, error) {
+	if kb == nil || kb.ChunkNum <= 0 {
+		return common.CodeSuccess, nil
+	}
+	if candidateID == "" || candidateID == kb.EmbdID {
+		return common.CodeSuccess, nil
+	}
+	if d.docEngine == nil {
+		// Nothing to check against. The switch itself still succeeds; a
+		// deployment without a document engine holds no chunk vectors.
+		common.Warn("Dataset update: skipping the embedding dimension check, the document engine is not initialized",
+			zap.String("dataset_id", kb.ID))
+		return common.CodeSuccess, nil
+	}
+
+	storedDim, storedField, err := d.storedVectorDimension(ctx, kb.TenantID, kb.ID)
+	if err != nil {
+		// Fail closed: an unreadable sample means the switch cannot be proven
+		// safe, and letting it through is exactly the silent breakage this
+		// check exists to stop.
+		return common.CodeServerError, fmt.Errorf("failed to read a stored chunk vector of dataset %s: %w", kb.ID, err)
+	}
+	if storedDim == 0 {
+		return common.CodeSuccess, nil
+	}
+
+	candidateDim, err := embeddingDimensionProbe(ctx, kb.TenantID, candidateID)
+	if err != nil {
+		return common.CodeDataError, err
+	}
+	if candidateDim == storedDim {
+		return common.CodeSuccess, nil
+	}
+	return common.CodeDataError, fmt.Errorf(
+		"embedding model switch rejected: the dataset stores %d-dimensional vectors in %s from %s, "+
+			"but the candidate model %s produces %d-dimensional vectors. The existing chunks would no longer be "+
+			"reachable by vector search; rebuild the dataset's vectors with the new model instead of switching in place",
+		storedDim, storedField, kb.EmbdID, candidateID, candidateDim,
+	)
+}
+
+// storedVectorDimension returns the dimension of the vector one stored chunk of
+// the dataset carries, together with the column it lives in. A dimension of 0
+// means no chunk of the dataset holds a vector.
+//
+// A dataset that somehow carries several vector columns answers with whichever
+// column the engine enumerates first: the columns can only disagree after a
+// switch this check let through, and any of them still tells whether the
+// candidate lands in the space the dataset is indexed in.
+func (d *DatasetService) storedVectorDimension(ctx context.Context, tenantID, datasetID string) (int, string, error) {
+	indexName := fmt.Sprintf("ragflow_%s", tenantID)
+	found, err := d.docEngine.Search(ctx, &enginetypes.SearchRequest{
+		IndexNames: []string{indexName},
+		KbIDs:      []string{datasetID},
+		Offset:     0,
+		Limit:      1,
+		Filter: map[string]interface{}{
+			"kb_id":         datasetID,
+			"available_int": 1,
+		},
+	})
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to sample a chunk: %w", err)
+	}
+	if found == nil || len(found.Chunks) == 0 {
+		return 0, "", nil
+	}
+	chunkID := datasetChunkID(found.Chunks[0])
+	if chunkID == "" {
+		return 0, "", nil
+	}
+
+	// The search returns the projected fields only, so the vector column is
+	// read from the chunk itself.
+	raw, err := d.docEngine.GetChunk(ctx, indexName, chunkID, []string{datasetID})
+	if err != nil {
+		return 0, "", fmt.Errorf("failed to load chunk %s: %w", chunkID, err)
+	}
+	chunk := datasetMap(raw)
+	field := datasetGuessVecField(chunk)
+	if field == "" {
+		return 0, "", nil
+	}
+	vector := datasetAsFloatVec(chunk[field])
+	if len(vector) == 0 {
+		return 0, "", nil
+	}
+	return len(vector), field, nil
+}
+
 func (d *DatasetService) sampleRandomChunksWithVectors(ctx context.Context, tenantID, datasetID string, n int) ([]embeddingCheckSample, error) {
 	indexName := fmt.Sprintf("ragflow_%s", tenantID)
 	totalResult, err := d.docEngine.Search(ctx, &enginetypes.SearchRequest{
@@ -281,8 +425,8 @@ func (d *DatasetService) sampleRandomChunksWithVectors(ctx context.Context, tena
 	return samples, nil
 }
 
-func (d *DatasetService) verifyEmbeddingAvailability(ctx context.Context, embdID string, access service.ModelAccess) (bool, string) {
-	_, err := service.NewModelFactory().ResolveInfo(ctx, access, entity.ModelTypeEmbedding, embdID)
+func (d *DatasetService) verifyEmbeddingAvailability(ctx context.Context, embdID, tenantID string) (bool, string) {
+	_, err := service.NewModelFactory().ResolveInfo(permission.WithTenantID(ctx, tenantID), entity.ModelTypeEmbedding, embdID)
 	if err != nil {
 		return false, err.Error()
 	}
